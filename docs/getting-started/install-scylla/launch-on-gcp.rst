@@ -19,11 +19,12 @@ Launching ScyllaDB on GCP
 
    Other instance types will work, but with lesser performance. If you choose an instance type other than the recommended ones, make sure to run the :ref:`scylla_setup <system-configuration-scripts>` script.
 
-#. Go to `ScyllaDB for GCP <https://www.scylladb.com/download/?platform=gcp#open-source>`_ in ScyllaDB's download center to obtain the image information:
+#. See the following table to obtain image information for the latest patch release. 
+   For earlier releases, see :doc:`GCP Images </reference/gcp-images/>`
 
-   * image name
-   * image id
-   * project name
+   .. scylladb_gcp_images_template::
+      :exclude: rc,dev
+      :only_latest:
 
 #. Launch a ScyllaDB instance on GCP with ``gcloud`` using the information from the previous step. Use the following syntax:
 
@@ -37,7 +38,7 @@ Launching ScyllaDB on GCP
    
         gcloud compute instances create scylla-node1 --image scylladb-5-2-1 --image-project scylla-images --local-ssd interface=nvme --machine-type=n1-highmem-8
    
-   To add more storage to the VM, add multiple ``--local-ssd interface=nvm`` options to the command. For example, the following 
+   To add more storage to the VM, add multiple ``--local-ssd interface=nvme`` options to the command. For example, the following 
    command will launch a VM with 4 SSD, and 1.5TB of data (4 * `375 GB <https://cloud.google.com/compute/docs/disks/local-ssd>`_):
 
    .. code-block:: console
@@ -62,7 +63,7 @@ Launching ScyllaDB on GCP
         
         gcloud compute ssh scylla-node1
    
-   To check that the ScyllaDB server and the JMX component are running, run:
+   To check that the ScyllaDB server is running, run:
 
      .. code-block:: console
       

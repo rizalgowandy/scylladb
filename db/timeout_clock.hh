@@ -3,14 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/semaphore.hh>
-#include <chrono>
 
 namespace db {
 using timeout_clock = seastar::lowres_clock;

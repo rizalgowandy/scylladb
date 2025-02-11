@@ -5,13 +5,14 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
+#include <fmt/core.h>
 #include "seastarx.hh"
 #include "bytes.hh"
 
@@ -38,10 +39,13 @@ public:
     sstring get_string_type_name() const;
 
     sstring to_cql_string() const;
-
-    friend std::ostream& operator<<(std::ostream& os, const ut_name& n) {
-        return os << n.to_cql_string();
-    }
 };
 
 }
+
+template <> struct fmt::formatter<cql3::ut_name> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const cql3::ut_name& n, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", n.to_cql_string());
+    }
+};

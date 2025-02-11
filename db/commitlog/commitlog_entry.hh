@@ -3,11 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include <optional>
 
 #include "commitlog_types.hh"
@@ -33,6 +34,7 @@ namespace detail {
     public:
         sector_split_iterator(const sector_split_iterator&) noexcept;
         sector_split_iterator(base_iterator i, base_iterator e, size_t sector_size);
+        sector_split_iterator(base_iterator i, base_iterator e, size_t sector_size, size_t overhead);
         sector_split_iterator();
 
         char* get_write() const {
@@ -100,8 +102,9 @@ public:
     {}
 
     void set_with_schema(bool value) {
-        _with_schema = value;
-        compute_size();
+        if (std::exchange(_with_schema, value) != value || _size == std::numeric_limits<size_t>::max()) {
+            compute_size();
+        }
     }
     bool with_schema() const {
         return _with_schema;
@@ -111,7 +114,7 @@ public:
     }
 
     size_t size() const {
-        assert(_size != std::numeric_limits<size_t>::max());
+        SCYLLA_ASSERT(_size != std::numeric_limits<size_t>::max());
         return _size;
     }
 

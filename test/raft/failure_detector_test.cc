@@ -3,9 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include <ranges>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/sleep.hh>
@@ -20,7 +21,7 @@ future<> ping_shards() {
         return seastar::yield();
     }
 
-    return parallel_for_each(boost::irange(0u, smp::count), [] (shard_id s) {
+    return parallel_for_each(std::views::iota(0u, smp::count), [] (shard_id s) {
         return smp::submit_to(s, [](){});
     });
 }
@@ -128,7 +129,7 @@ SEASTAR_TEST_CASE(failure_detector_test) {
     test_pinger pinger;
     test_clock clock;
     sharded<direct_failure_detector::failure_detector> fd;
-    co_await fd.start(std::ref(pinger), std::ref(clock), 10);
+    co_await fd.start(std::ref(pinger), std::ref(clock), 10, 30);
 
     test_listener l1, l2;
     auto sub1 = co_await fd.local().register_listener(l1, 95);

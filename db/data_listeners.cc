@@ -3,13 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "db/data_listeners.hh"
 #include "replica/database.hh"
 #include "readers/filtering.hh"
-#include "db_clock.hh"
 
 #include <tuple>
 
@@ -31,8 +30,8 @@ bool data_listeners::exists(data_listener* listener) const {
     return _listeners.contains(listener);
 }
 
-flat_mutation_reader_v2 data_listeners::on_read(const schema_ptr& s, const dht::partition_range& range,
-        const query::partition_slice& slice, flat_mutation_reader_v2&& rd) {
+mutation_reader data_listeners::on_read(const schema_ptr& s, const dht::partition_range& range,
+        const query::partition_slice& slice, mutation_reader&& rd) {
     for (auto&& li : _listeners) {
         rd = li->on_read(s, range, slice, std::move(rd));
     }
@@ -65,8 +64,8 @@ future<> toppartitions_data_listener::stop() {
     return make_ready_future<>();
 }
 
-flat_mutation_reader_v2 toppartitions_data_listener::on_read(const schema_ptr& s, const dht::partition_range& range,
-        const query::partition_slice& slice, flat_mutation_reader_v2&& rd) {
+mutation_reader toppartitions_data_listener::on_read(const schema_ptr& s, const dht::partition_range& range,
+        const query::partition_slice& slice, mutation_reader&& rd) {
     bool include_all = _table_filters.empty() && _keyspace_filters.empty();
 
     if (include_all || _keyspace_filters.contains(s->ks_name()) || _table_filters.contains({s->ks_name(), s->cf_name()})) {

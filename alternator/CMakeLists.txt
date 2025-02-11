@@ -15,6 +15,7 @@ target_sources(alternator
     conditions.cc
     auth.cc
     streams.cc
+    consumed_capacity.cc
     ttl.cc
     ${cql_grammar_srcs})
 target_include_directories(alternator
@@ -24,10 +25,13 @@ target_include_directories(alternator
   PRIVATE
     ${RAPIDJSON_INCLUDE_DIRS})
 target_link_libraries(alternator
-  cql3
-  idl
-  Seastar::seastar
-  xxHash::xxhash)
+  PUBLIC
+    Seastar::seastar
+    xxHash::xxhash
+  PRIVATE
+    cql3
+    idl
+    absl::headers)
 
 check_headers(check-headers alternator
   GLOB_RECURSE ${CMAKE_CURRENT_SOURCE_DIR}/*.hh)

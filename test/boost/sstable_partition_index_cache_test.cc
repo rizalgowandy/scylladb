@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <boost/test/unit_test.hpp>
@@ -87,8 +87,8 @@ SEASTAR_THREAD_TEST_CASE(test_caching) {
         lru.evict_all();
     });
 
-    partition_index_cache::entry_ptr ptr0 = f0.get0();
-    partition_index_cache::entry_ptr ptr1 = f1.get0();
+    partition_index_cache::entry_ptr ptr0 = f0.get();
+    partition_index_cache::entry_ptr ptr1 = f1.get();
 
     r.full_compaction();
     with_allocator(r.allocator(), [&] {
@@ -131,7 +131,7 @@ SEASTAR_THREAD_TEST_CASE(test_caching) {
     }
 
     {
-        auto ptr4 = cache.get_or_load(0, page0_loader).get0();
+        auto ptr4 = cache.get_or_load(0, page0_loader).get();
         has_page0(ptr4);
 
         BOOST_REQUIRE_EQUAL(stats.misses, old_stats.misses + 2);
@@ -177,7 +177,7 @@ SEASTAR_THREAD_TEST_CASE(test_exception_while_loading) {
         f1.get();
     });
 
-    auto ptr = cache.get_or_load(0, page0_loader).get0();
+    auto ptr = cache.get_or_load(0, page0_loader).get();
     has_page0(ptr);
 }
 

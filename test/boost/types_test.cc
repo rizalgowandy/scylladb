@@ -3,14 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <string_view>
 #include "test/lib/scylla_test_case.hh"
 #include <seastar/net/inet_address.hh>
 #include "utils/UUID_gen.hh"
-#include <boost/asio/ip/address_v4.hpp>
 #include <seastar/net/ip.hh>
 #include <boost/multiprecision/cpp_int.hpp>
 #include "types/types.hh"
@@ -23,7 +22,9 @@
 #include "types/map.hh"
 #include "types/list.hh"
 #include "types/set.hh"
+#include "types/vector.hh"
 #include "test/lib/exception_utils.hh"
+#include "test/lib/test_utils.hh"
 
 using namespace std::literals::chrono_literals;
 using namespace std::literals::string_view_literals;
@@ -161,7 +162,7 @@ BOOST_AUTO_TEST_CASE(test_long_type_string_conversions) {
 
 BOOST_AUTO_TEST_CASE(test_timeuuid_type_string_conversions) {
     auto now = utils::UUID_gen::get_time_UUID();
-    BOOST_REQUIRE(timeuuid_type->equal(timeuuid_type->from_string(now.to_sstring()), timeuuid_type->decompose(now)));
+    BOOST_REQUIRE(timeuuid_type->equal(timeuuid_type->from_string(fmt::to_string(now)), timeuuid_type->decompose(now)));
     auto uuid = utils::UUID(sstring("d2177dd0-eaa2-11de-a572-001b779c76e3"));
     BOOST_REQUIRE(timeuuid_type->equal(timeuuid_type->from_string("D2177dD0-EAa2-11de-a572-001B779C76e3"), timeuuid_type->decompose(uuid)));
 
@@ -169,7 +170,7 @@ BOOST_AUTO_TEST_CASE(test_timeuuid_type_string_conversions) {
     test_parsing_fails(timeuuid_type, "D2177dD0-EAa2-11de-a572-001B779C76e3a");
     test_parsing_fails(timeuuid_type, "D2177dD0-EAa2-11de-a572001-B779C76e3");
     test_parsing_fails(timeuuid_type, "D2177dD0EAa211dea572001B779C76e3");
-    test_parsing_fails(timeuuid_type, utils::make_random_uuid().to_sstring());
+    test_parsing_fails(timeuuid_type, fmt::to_string(utils::make_random_uuid()));
 }
 
 BOOST_AUTO_TEST_CASE(test_simple_date_type_string_conversions) {
@@ -232,9 +233,9 @@ BOOST_AUTO_TEST_CASE(test_uuid_type_comparison) {
 
 BOOST_AUTO_TEST_CASE(test_uuid_type_string_conversions) {
     auto now = utils::UUID_gen::get_time_UUID();
-    BOOST_REQUIRE(uuid_type->equal(uuid_type->from_string(now.to_sstring()), uuid_type->decompose(now)));
+    BOOST_REQUIRE(uuid_type->equal(uuid_type->from_string(fmt::to_string(now)), uuid_type->decompose(now)));
     auto random = utils::make_random_uuid();
-    BOOST_REQUIRE(uuid_type->equal(uuid_type->from_string(random.to_sstring()), uuid_type->decompose(random)));
+    BOOST_REQUIRE(uuid_type->equal(uuid_type->from_string(fmt::to_string(random)), uuid_type->decompose(random)));
     auto uuid = utils::UUID(sstring("d2177dd0-eaa2-11de-a572-001b779c76e3"));
     BOOST_REQUIRE(uuid_type->equal(uuid_type->from_string("D2177dD0-EAa2-11de-a572-001B779C76e3"), uuid_type->decompose(uuid)));
 
@@ -574,6 +575,41 @@ BOOST_AUTO_TEST_CASE(test_tuple) {
     test_string_conversion({10, {}, "a@@:b:c"}, "10:@:a\\@\\@\\:b\\:c");
 }
 
+BOOST_AUTO_TEST_CASE(test_vector) {
+    auto t = vector_type_impl::get_instance(int32_type, 3);
+    using native_type = vector_type_impl::native_type;
+    using c_type = std::array<int32_t, 3>;
+    auto native_to_c = [] (native_type v) {
+        return std::array<int32_t, 3>{value_cast<int32_t>(v[0]), value_cast<int32_t>(v[1]), value_cast<int32_t>(v[2])};
+    };
+    auto c_to_native = [] (c_type v) {
+        return native_type({std::get<0>(v), std::get<1>(v), std::get<2>(v)});
+    };
+    auto native_to_bytes = [t] (native_type v) {
+        return t->decompose(make_vector_value(t, v));
+    };
+    auto bytes_to_native = [t] (bytes v) {
+        return value_cast<native_type>(t->deserialize(v));
+    };
+    auto c_to_bytes = [=] (c_type v) {
+        return native_to_bytes(c_to_native(v));
+    };
+    auto bytes_to_c = [=] (bytes v) {
+        return native_to_c(bytes_to_native(v));
+    };
+    auto round_trip = [=] (c_type v) {
+        return bytes_to_c(c_to_bytes(v));
+    };
+    auto v1 = c_type({1, 2, 3});
+    BOOST_REQUIRE(v1 == round_trip(v1));
+    auto v2 = c_type({1, 2, 0});
+    BOOST_REQUIRE(v2 == round_trip(v2));
+    auto b1 = c_to_bytes(v1);
+    auto b2 = c_to_bytes(v2);
+    BOOST_REQUIRE(t->compare(b1, b2) > 0);
+    BOOST_REQUIRE(t->compare(b2, b2) == 0);
+}
+
 void test_validation_fails(const shared_ptr<const abstract_type>& type, bytes_view v)
 {
     try {
@@ -696,6 +732,17 @@ BOOST_AUTO_TEST_CASE(test_parse_valid_tuple) {
 
 BOOST_AUTO_TEST_CASE(test_parse_invalid_tuple) {
     auto parser = db::marshal::type_parser("org.apache.cassandra.db.marshal.TupleType()");
+    BOOST_REQUIRE_THROW(parser.parse(), exceptions::configuration_exception);
+}
+
+BOOST_AUTO_TEST_CASE(test_parse_valid_vector) {
+    auto parser = db::marshal::type_parser("org.apache.cassandra.db.marshal.VectorType(org.apache.cassandra.db.marshal.Int32Type,5)");
+    auto type = parser.parse();
+    BOOST_REQUIRE(type->as_cql3_type().to_string() == "vector<int, 5>");
+}
+
+BOOST_AUTO_TEST_CASE(test_parse_invalid_vector) {
+    auto parser = db::marshal::type_parser("org.apache.cassandra.db.marshal.VectorType()");
     BOOST_REQUIRE_THROW(parser.parse(), exceptions::configuration_exception);
 }
 

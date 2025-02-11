@@ -5,19 +5,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
-#include <tuple>
-#include <unordered_map>
-
 #include "cql3/functions/function.hh"
-#include "cql3/functions/abstract_function.hh"
-#include "exceptions/exceptions.hh"
-#include <seastar/core/print.hh>
-#include "cql3/cql3_type.hh"
+#include <seastar/core/format.hh>
 
 namespace cql3 {
 namespace functions {

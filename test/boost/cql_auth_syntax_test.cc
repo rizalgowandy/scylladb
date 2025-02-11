@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #define BOOST_TEST_MODULE core
@@ -132,7 +132,7 @@ using modifier_rule_ptr = void (cql3_parser::CqlParser::*)(T&);
 template <typename T>
 static T test_valid(std::string_view cql_fragment, producer_rule_ptr<T> rule) {
     T v;
-    BOOST_REQUIRE_NO_THROW(v = cql3::util::do_with_parser(cql_fragment, std::mem_fn(rule)));
+    BOOST_REQUIRE_NO_THROW(v = cql3::util::do_with_parser(cql_fragment, cql3::dialect{}, std::mem_fn(rule)));
     return v;
 }
 
@@ -143,7 +143,7 @@ static T test_valid(std::string_view cql_fragment, producer_rule_ptr<T> rule) {
 template <typename T>
 void test_valid(std::string_view cql_fragment, modifier_rule_ptr<T> rule, T& v) {
     BOOST_REQUIRE_NO_THROW(
-            cql3::util::do_with_parser(cql_fragment, [rule, &v](cql3_parser::CqlParser& parser) {
+            cql3::util::do_with_parser(cql_fragment, cql3::dialect{}, [rule, &v](cql3_parser::CqlParser& parser) {
                 (parser.*rule)(v);
                  // Any non-`void` value will do.
                  return 0;
@@ -179,7 +179,7 @@ BOOST_AUTO_TEST_CASE(user_name) {
 
     // Not worth generalizing `test_valid`.
     BOOST_REQUIRE_THROW(
-            (cql3::util::do_with_parser("\"Ring-bearer\"", std::mem_fn(&cql3_parser::CqlParser::username))),
+            (cql3::util::do_with_parser("\"Ring-bearer\"", cql3::dialect{}, std::mem_fn(&cql3_parser::CqlParser::username))),
             exceptions::syntax_exception);
 }
 
@@ -319,4 +319,38 @@ BOOST_AUTO_TEST_CASE(grant_role) {
 
 BOOST_AUTO_TEST_CASE(revoke_role) {
     test_valid("REVOKE soldier FROM boromir;");
+}
+
+BOOST_AUTO_TEST_CASE(create_role_with_hashed_password) {
+    test_valid("CREATE ROLE adam WITH HASHED PASSWORD = 'something';");
+}
+
+BOOST_AUTO_TEST_CASE(create_role_with_hashed) {
+    BOOST_REQUIRE_THROW(
+        cql3::util::do_with_parser("CREATE ROLE jane WITH HASHED = 'something';", cql3::dialect{}, std::mem_fn(&cql3_parser::CqlParser::query)),
+        exceptions::syntax_exception);
+}
+
+BOOST_AUTO_TEST_CASE(create_role_with_hashed_underscore_password) {
+    BOOST_REQUIRE_THROW(
+        cql3::util::do_with_parser("CREATE ROLE jane WITH HASHED_PASSWORD = 'something';", cql3::dialect{}, std::mem_fn(&cql3_parser::CqlParser::query)),
+        exceptions::syntax_exception);
+}
+
+BOOST_AUTO_TEST_CASE(create_role_with_hash) {
+    BOOST_REQUIRE_THROW(
+        cql3::util::do_with_parser("CREATE ROLE jane WITH HASH = 'something';", cql3::dialect{}, std::mem_fn(&cql3_parser::CqlParser::query)),
+        exceptions::syntax_exception);
+}
+
+BOOST_AUTO_TEST_CASE(create_role_with_hashed_password_double_quotation_marks) {
+    BOOST_REQUIRE_THROW(
+        cql3::util::do_with_parser("CREATE ROLE jane WITH HASHED PASSWORD = \"something\";", cql3::dialect{}, std::mem_fn(&cql3_parser::CqlParser::query)),
+        exceptions::syntax_exception);
+}
+
+BOOST_AUTO_TEST_CASE(create_role_with_hashed_no_quotation_marks) {
+    BOOST_REQUIRE_THROW(
+        cql3::util::do_with_parser("CREATE ROLE jane WITH HASHED = something;", cql3::dialect{}, std::mem_fn(&cql3_parser::CqlParser::query)),
+        exceptions::syntax_exception);
 }

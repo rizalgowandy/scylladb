@@ -1,13 +1,15 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for the ReturnValues parameter for the different update operations
 # (PutItem, UpdateItem, DeleteItem).
 
 import pytest
 from botocore.exceptions import ClientError
-from util import random_string
+
+from test.alternator.util import random_string
+
 
 # Test trivial support for the ReturnValues parameter in PutItem, UpdateItem
 # and DeleteItem - test that "NONE" works (and changes nothing), while a

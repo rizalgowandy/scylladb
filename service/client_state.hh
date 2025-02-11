@@ -5,25 +5,20 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include "auth/service.hh"
 #include "exceptions/exceptions.hh"
-#include "unimplemented.hh"
 #include "timeout_config.hh"
 #include "timestamp.hh"
-#include "db_clock.hh"
 #include "replica/database_fwd.hh"
 #include "auth/authenticated_user.hh"
 #include "auth/authenticator.hh"
 #include "auth/permission.hh"
-#include "tracing/tracing.hh"
-#include "tracing/trace_state.hh"
 
-#include "enum_set.hh"
 #include "transport/cql_protocol_extension.hh"
 #include "service/qos/service_level_controller.hh"
 
@@ -55,22 +50,28 @@ public:
     private:
         const client_state* _cs;
         seastar::sharded<auth::service>* _auth_service;
-        client_state_for_another_shard(const client_state* cs, seastar::sharded<auth::service>* auth_service) : _cs(cs), _auth_service(auth_service) {}
+        seastar::sharded<qos::service_level_controller>* _sl_controller;
+        client_state_for_another_shard(const client_state* cs,
+            seastar::sharded<auth::service>* auth_service,
+            seastar::sharded<qos::service_level_controller>* sl_controller)
+            : _cs(cs), _auth_service(auth_service), _sl_controller(sl_controller) {}
         friend client_state;
     public:
         client_state get() const {
-            return client_state(_cs, _auth_service);
+            return client_state(_cs, _auth_service, _sl_controller);
         }
     };
 private:
-    client_state(const client_state* cs, seastar::sharded<auth::service>* auth_service)
+    client_state(const client_state* cs,
+        seastar::sharded<auth::service>* auth_service,
+        seastar::sharded<qos::service_level_controller>* sl_controller)
             : _keyspace(cs->_keyspace)
             , _user(cs->_user)
             , _auth_state(cs->_auth_state)
             , _is_internal(cs->_is_internal)
-            , _is_thrift(cs->_is_thrift)
             , _remote_address(cs->_remote_address)
             , _auth_service(auth_service ? &auth_service->local() : nullptr)
+            , _sl_controller(sl_controller ? &sl_controller->local() : nullptr)
             , _default_timeout_config(cs->_default_timeout_config)
             , _timeout_config(cs->_timeout_config)
             , _enabled_protocol_extensions(cs->_enabled_protocol_extensions)
@@ -108,7 +109,6 @@ private:
     // isInternal is used to mark ClientState as used by some internal component
     // that should have an ability to modify system keyspace.
     bool _is_internal;
-    bool _is_thrift;
 
     // The biggest timestamp that was returned by getTimestamp/assigned to a query
     static thread_local api::timestamp_type _last_timestamp_micros;
@@ -160,10 +160,8 @@ public:
                  auth::service& auth_service,
                  qos::service_level_controller* sl_controller,
                  timeout_config timeout_config,
-                 const socket_address& remote_address = socket_address(),
-                 bool thrift = false)
+                 const socket_address& remote_address = socket_address())
             : _is_internal(false)
-            , _is_thrift(thrift)
             , _remote_address(remote_address)
             , _auth_service(&auth_service)
             , _sl_controller(sl_controller)
@@ -177,7 +175,7 @@ public:
     gms::inet_address get_client_address() const {
         return gms::inet_address(_remote_address);
     }
-    
+
     ::in_port_t get_client_port() const {
         return _remote_address.port();
     }
@@ -200,7 +198,6 @@ public:
     client_state(internal_tag, const timeout_config& config)
             : _keyspace("system")
             , _is_internal(true)
-            , _is_thrift(false)
             , _default_timeout_config(config)
             , _timeout_config(config)
     {}
@@ -209,7 +206,6 @@ public:
         : _user(auth::authenticated_user(username))
         , _auth_state(auth_state::READY)
         , _is_internal(true)
-        , _is_thrift(false)
         , _auth_service(&auth_service)
         , _sl_controller(&sl_controller)
     {}
@@ -220,12 +216,8 @@ public:
     ///
     /// `nullptr` for internal instances.
     ///
-    const auth::service* get_auth_service() const {
+    auth::service* get_auth_service() const {
         return _auth_service;
-    }
-
-    bool is_thrift() const {
-        return _is_thrift;
     }
 
     bool is_internal() const {
@@ -354,6 +346,7 @@ public:
     future<bool> check_has_permission(auth::command_desc) const;
     future<> ensure_has_permission(auth::command_desc) const;
     future<> maybe_update_per_service_level_params();
+    void update_per_service_level_params(qos::service_level_options& slo);
 
     /**
      * Returns an exceptional future with \ref exceptions::invalid_request_exception if the resource does not exist.
@@ -382,7 +375,9 @@ public:
     }
 
     client_state_for_another_shard move_to_other_shard() {
-        return client_state_for_another_shard(this, _auth_service ? &_auth_service->container() : nullptr);
+        return client_state_for_another_shard(this,
+            _auth_service ? &_auth_service->container() : nullptr,
+            _sl_controller ? &_sl_controller->container() : nullptr);
     }
 
 #if 0

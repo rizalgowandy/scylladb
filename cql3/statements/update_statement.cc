@@ -5,9 +5,10 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
+#include "utils/assert.hh"
 #include "update_statement.hh"
 #include "cql3/expr/expression.hh"
 #include "cql3/expr/evaluate.hh"
@@ -21,12 +22,17 @@
 
 #include "cql3/operation_impl.hh"
 #include "cql3/type_json.hh"
+#include "cql3/lists.hh"
+#include "cql3/maps.hh"
+#include "cql3/sets.hh"
+#include "cql3/user_types.hh"
+#include "types/list.hh"
 #include "types/map.hh"
 #include "types/set.hh"
-#include "types/list.hh"
 #include "types/user.hh"
 #include "concrete_types.hh"
 #include "validation.hh"
+#include "dht/i_partitioner.hh"
 #include <optional>
 
 namespace cql3 {
@@ -80,13 +86,16 @@ parse(const sstring& json_string, const std::vector<column_definition>& expected
 namespace statements {
 
 update_statement::update_statement(
+        audit::audit_info_ptr&& audit_info,
         statement_type type,
         uint32_t bound_terms,
         schema_ptr s,
         std::unique_ptr<attributes> attrs,
         cql_stats& stats)
     : modification_statement{type, bound_terms, std::move(s), std::move(attrs), stats}
-{ }
+{
+    set_audit_info(std::move(audit_info));
+}
 
 bool update_statement::require_full_clustering_key() const {
     return true;
@@ -117,7 +126,7 @@ void update_statement::add_update_for_key(mutation& m, const query::clustering_r
         auto rb = s->regular_begin();
         if (rb->name().empty() || rb->type == empty_type) {
             // There is no column outside the PK. So no operation could have passed through validation
-            assert(_column_operations.empty());
+            SCYLLA_ASSERT(_column_operations.empty());
             constants::setter(*s->regular_begin(), expr::constant(cql3::raw_value::make_value(bytes()), empty_type)).execute(m, prefix, params);
         } else {
             // dense means we don't have a row marker, so don't accept to set only the PK. See CASSANDRA-5648.
@@ -373,7 +382,7 @@ insert_statement::insert_statement(cf_name name,
 insert_statement::prepare_internal(data_dictionary::database db, schema_ptr schema,
     prepare_context& ctx, std::unique_ptr<attributes> attrs, cql_stats& stats) const
 {
-    auto stmt = ::make_shared<cql3::statements::update_statement>(statement_type::INSERT, ctx.bound_variables_size(), schema, std::move(attrs), stats);
+    auto stmt = ::make_shared<cql3::statements::update_statement>(audit_info(), statement_type::INSERT, ctx.bound_variables_size(), schema, std::move(attrs), stats);
 
     // Created from an INSERT
     if (stmt->is_counter()) {
@@ -434,12 +443,12 @@ insert_json_statement::prepare_internal(data_dictionary::database db, schema_ptr
 {
     // FIXME: handle _if_not_exists. For now, mark it used to quiet the compiler. #8682
     (void)_if_not_exists;
-    assert(expr::is<cql3::expr::untyped_constant>(_json_value) || expr::is<cql3::expr::bind_variable>(_json_value));
+    SCYLLA_ASSERT(expr::is<cql3::expr::untyped_constant>(_json_value) || expr::is<cql3::expr::bind_variable>(_json_value));
     auto json_column_placeholder = ::make_shared<column_identifier>("", true);
     auto prepared_json_value = prepare_expression(_json_value, db, "", nullptr, make_lw_shared<column_specification>("", "", json_column_placeholder, utf8_type));
     expr::verify_no_aggregate_functions(prepared_json_value, "JSON clause");
     expr::fill_prepare_context(prepared_json_value, ctx);
-    auto stmt = ::make_shared<cql3::statements::insert_prepared_json_statement>(ctx.bound_variables_size(), schema, std::move(attrs), stats, std::move(prepared_json_value), _default_unset);
+    auto stmt = ::make_shared<cql3::statements::insert_prepared_json_statement>(audit_info(), ctx.bound_variables_size(), schema, std::move(attrs), stats, std::move(prepared_json_value), _default_unset);
     prepare_conditions(db, *schema, ctx, *stmt);
     return stmt;
 }
@@ -458,7 +467,7 @@ update_statement::update_statement(cf_name name,
 update_statement::prepare_internal(data_dictionary::database db, schema_ptr schema,
     prepare_context& ctx, std::unique_ptr<attributes> attrs, cql_stats& stats) const
 {
-    auto stmt = ::make_shared<cql3::statements::update_statement>(statement_type::UPDATE, ctx.bound_variables_size(), schema, std::move(attrs), stats);
+    auto stmt = ::make_shared<cql3::statements::update_statement>(audit_info(), statement_type::UPDATE, ctx.bound_variables_size(), schema, std::move(attrs), stats);
 
     // FIXME: quadratic
     for (size_t i = 0; i < _updates.size(); ++i) {

@@ -5,17 +5,19 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include <cmath>
 #include <algorithm>
 #include <vector>
 #include <chrono>
+#include <fmt/ostream.h>
 #include <seastar/core/metrics_types.hh>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include "seastarx.hh"
 #include <seastar/core/bitops.hh>
 #include <limits>
@@ -377,6 +379,10 @@ struct estimated_histogram {
     int64_t _count = 0;
     int64_t _sample_sum = 0;
 
+    estimated_histogram(std::vector<int64_t> bucket_offsets, std::vector<int64_t> buckets)
+        : bucket_offsets(std::move(bucket_offsets)), buckets(std::move(buckets))
+    { }
+
     estimated_histogram(int bucket_count = 90) {
 
         new_offsets(bucket_count);
@@ -553,7 +559,7 @@ public:
      * @return estimated value at given percentile
      */
     int64_t percentile(double perc) const {
-        assert(perc >= 0 && perc <= 1.0);
+        SCYLLA_ASSERT(perc >= 0 && perc <= 1.0);
         auto last_bucket = buckets.size() - 1;
 
         auto c = count();

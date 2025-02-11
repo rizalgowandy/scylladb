@@ -3,12 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "partition_version.hh"
+
+#ifdef SEASTAR_DEBUG
+#include "utils/assert.hh"
+#endif
 
 // Double-ended chained list of partition_version objects
 // utilizing partition_version's intrinsic anchorless_list_base_hook.
@@ -29,13 +33,13 @@ public:
             }
             _head = partition_version_ref(v, true);
 #ifdef SEASTAR_DEBUG
-            assert(!_head->is_referenced_from_entry());
+            SCYLLA_ASSERT(!_head->is_referenced_from_entry());
 #endif
         } else {
             v.insert_after(*_tail);
             _tail = partition_version_ref(v, true);
 #ifdef SEASTAR_DEBUG
-            assert(!_tail->is_referenced_from_entry());
+            SCYLLA_ASSERT(!_tail->is_referenced_from_entry());
 #endif
         }
     }
@@ -63,7 +67,7 @@ public:
         if (next) {
             _head = partition_version_ref(*next, true);
 #ifdef SEASTAR_DEBUG
-            assert(!_head->is_referenced_from_entry());
+            SCYLLA_ASSERT(!_head->is_referenced_from_entry());
 #endif
         }
     }

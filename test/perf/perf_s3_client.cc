@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <chrono>
@@ -32,13 +32,7 @@ class tester {
         s3::endpoint_config cfg;
         cfg.port = 443;
         cfg.use_https = true;
-        cfg.aws.emplace();
-        cfg.aws->access_key_id = tests::getenv_safe("AWS_ACCESS_KEY_ID");
-        cfg.aws->secret_access_key = tests::getenv_safe("AWS_SECRET_ACCESS_KEY");
-        if (auto token = ::getenv("AWS_SESSION_TOKEN"); token) {
-            cfg.aws->session_token = token;
-        }
-        cfg.aws->region = tests::getenv_safe("AWS_DEFAULT_REGION");
+        cfg.region = tests::getenv_safe("AWS_DEFAULT_REGION");
 
         return make_lw_shared<s3::endpoint_config>(std::move(cfg));
     }
@@ -99,7 +93,7 @@ private:
 
 public:
     future<> run() {
-        co_await coroutine::parallel_for_each(boost::irange(0u, _parallel), [this] (auto fnr) -> future<> {
+        co_await coroutine::parallel_for_each(std::views::iota(0u, _parallel), [this] (auto fnr) -> future<> {
             plog.debug("Running {} fiber", fnr);
             co_await seastar::sleep(std::chrono::milliseconds(fnr)); // make some discrepancy
             co_await do_run();

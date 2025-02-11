@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -27,12 +27,16 @@ private:
 private:
     template<typename Writer>
     static void write_serialized(Writer&& out, const schema&, const mutation_partition&);
+    template<typename Writer>
+    static future<> write_serialized_gently(Writer&& out, const schema&, const mutation_partition&);
 public:
     using count_type = uint32_t;
     mutation_partition_serializer(const schema&, const mutation_partition&);
 public:
     void write(bytes_ostream&) const;
     void write(ser::writer_of_mutation_partition<bytes_ostream>&&) const;
+    future<> write_gently(bytes_ostream&) const;
+    future<> write_gently(ser::writer_of_mutation_partition<bytes_ostream>&&) const;
 };
 
 void serialize_mutation_fragments(const schema& s, tombstone partition_tombstone,

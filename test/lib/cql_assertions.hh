@@ -4,11 +4,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include "test/lib/cql_test_env.hh"
 #include "transport/messages/result_message_base.hh"
 #include "bytes.hh"
@@ -45,23 +46,23 @@ public:
 
 result_msg_assertions assert_that(shared_ptr<cql_transport::messages::result_message> msg);
 
-template<typename... T>
-void assert_that_failed(future<T...>& f)
+template<typename T>
+void assert_that_failed(future<T>& f)
 {
     try {
         f.get();
-        assert(f.failed());
+        SCYLLA_ASSERT(f.failed());
     }
     catch (...) {
     }
 }
 
-template<typename... T>
-void assert_that_failed(future<T...>&& f)
+template<typename T>
+void assert_that_failed(future<T>&& f)
 {
     try {
         f.get();
-        assert(f.failed());
+        SCYLLA_ASSERT(f.failed());
     }
     catch (...) {
     }
@@ -73,19 +74,19 @@ void assert_that_failed(future<T...>&& f)
 /// \note Should be called from a seastar::thread context, as it awaits the CQL result.
 shared_ptr<cql_transport::messages::result_message> cquery_nofail(
         cql_test_env& env,
-        sstring_view query,
+        std::string_view query,
         std::unique_ptr<cql3::query_options>&& qo = nullptr,
         const seastar::compat::source_location& loc = seastar::compat::source_location::current());
 
 /// Asserts that cquery_nofail(e, qstr) contains expected rows, in any order.
 void require_rows(cql_test_env& e,
-                  sstring_view qstr,
+                  std::string_view qstr,
                   const std::vector<std::vector<bytes_opt>>& expected,
                   const seastar::compat::source_location& loc = seastar::compat::source_location::current());
 
 /// Like require_rows, but wraps assertions in \c eventually.
 void eventually_require_rows(
-        cql_test_env& e, sstring_view qstr, const std::vector<std::vector<bytes_opt>>& expected,
+        cql_test_env& e, std::string_view qstr, const std::vector<std::vector<bytes_opt>>& expected,
         const seastar::compat::source_location& loc = seastar::compat::source_location::current());
 
 /// Asserts that e.execute_prepared(id, values) contains expected rows, in any order.

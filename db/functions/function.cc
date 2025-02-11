@@ -1,5 +1,5 @@
 // Copyright (C) 2023-present ScyllaDB
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 #include "aggregate_function.hh"
 
@@ -87,7 +87,7 @@ aggregate_function::column_name(const std::vector<sstring>& column_names) const 
     if (_agg.column_name_override) {
         return *_agg.column_name_override;
     }
-    return format("{}({})", _agg.name, fmt::join(column_names, ", "));
+    return seastar::format("{}({})", _agg.name, fmt::join(column_names, ", "));
 }
 
 }

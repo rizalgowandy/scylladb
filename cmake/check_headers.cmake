@@ -22,7 +22,7 @@ function (check_headers check_headers_target target)
     file(GLOB_RECURSE sources
       LIST_DIRECTORIES false
       RELATIVE ${CMAKE_SOURCE_DIR}
-      "${parsed_args_RECURSIVE}")
+      "${parsed_args_GLOB_RECURSE}")
   else()
     message(FATAL_ERROR "Please specify GLOB or GLOB_RECURSE.")
   endif()
@@ -35,7 +35,6 @@ function (check_headers check_headers_target target)
 
   foreach(fn ${sources})
     get_filename_component(file_dir ${fn} DIRECTORY)
-    list(APPEND includes "${CMAKE_SOURCE_DIR}/${file_dir}")
     set(src_dir "${CMAKE_BINARY_DIR}/check-headers/${file_dir}")
     file(MAKE_DIRECTORY "${src_dir}")
     get_filename_component(file_name ${fn} NAME)
@@ -44,10 +43,7 @@ function (check_headers check_headers_target target)
     add_custom_command(
       OUTPUT ${src}
       DEPENDS ${CMAKE_SOURCE_DIR}/${fn}
-      # silence "-Wpragma-once-outside-header"
-      COMMAND sed
-            -e "s/^#pragma once//"
-            "${fn}" > "${src}"
+      COMMAND ${CMAKE_COMMAND} -E echo "#include \"${fn}\"" > "${src}"
       WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
       VERBATIM)
     list(APPEND srcs "${src}")

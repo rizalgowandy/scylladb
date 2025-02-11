@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -11,10 +11,13 @@
 #include <boost/intrusive/parent_from_member.hpp>
 #include <boost/heap/binomial_heap.hpp>
 #include <seastar/core/condition-variable.hh>
+#include <seastar/core/expiring_fifo.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/core/semaphore.hh>
+#include "db/timeout_clock.hh"
 #include "replica/database_fwd.hh"
+#include "utils/assert.hh"
 #include "utils/logalloc.hh"
 
 class test_region_group;
@@ -110,7 +113,7 @@ public:
 private:
     template <typename Func>
     struct concrete_allocating_function : public allocating_function {
-        using futurator = futurize<std::result_of_t<Func()>>;
+        using futurator = futurize<std::invoke_result_t<Func>>;
         typename futurator::promise_type pr;
         Func func;
     public:
@@ -257,7 +260,7 @@ public:
         // If we set a throttle threshold, we'd be postponing many operations. So shutdown must be
         // called.
         if (reclaimer_can_block()) {
-            assert(_shutdown_requested);
+            SCYLLA_ASSERT(_shutdown_requested);
         }
     }
     region_group& operator=(const region_group&) = delete;
@@ -311,7 +314,7 @@ public:
     // We disallow future-returning functions here, because otherwise memory may be available
     // when we start executing it, but no longer available in the middle of the execution.
     requires (!is_future<std::invoke_result_t<Func>>::value)
-    futurize_t<std::result_of_t<Func()>> run_when_memory_available(Func&& func, db::timeout_clock::time_point timeout);
+    futurize_t<std::invoke_result_t<Func>> run_when_memory_available(Func&& func, db::timeout_clock::time_point timeout);
 
     // returns a pointer to the largest region (in terms of memory usage) that sits below this
     // region group. This includes the regions owned by this region group as well as all of its
@@ -328,7 +331,10 @@ public:
 private:
     // Returns true if and only if constraints of this group are not violated.
     // That's taking into account any constraints imposed by enclosing (parent) groups.
-    bool execution_permitted() noexcept;
+    bool execution_permitted() noexcept {
+        return !under_unspooled_pressure() && !_under_real_pressure;
+    }
+
 
     uint64_t top_region_evictable_space() const noexcept;
 
@@ -561,14 +567,9 @@ template <typename Func>
 // We disallow future-returning functions here, because otherwise memory may be available
 // when we start executing it, but no longer available in the middle of the execution.
 requires (!is_future<std::invoke_result_t<Func>>::value)
-futurize_t<std::result_of_t<Func()>>
+futurize_t<std::invoke_result_t<Func>>
 region_group::run_when_memory_available(Func&& func, db::timeout_clock::time_point timeout) {
-    bool blocked = 
-        !_blocked_requests.empty()
-        || under_unspooled_pressure()
-        || _under_real_pressure;
-
-    if (!blocked) {
+    if (_blocked_requests.empty() && execution_permitted()) {
         return futurize_invoke(func);
     }
 

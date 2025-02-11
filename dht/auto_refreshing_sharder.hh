@@ -3,13 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include "dht/sharder.hh"
-#include "replica/database.hh"
+#include "dht/token-sharding.hh"
+#include "locator/abstract_replication_strategy.hh"
+
+#include <seastar/core/abort_source.hh>
+#include <seastar/core/shared_ptr.hh>
+
+namespace replica {
+class table;
+}
 
 namespace dht {
 
@@ -26,34 +33,21 @@ class auto_refreshing_sharder : public dht::sharder {
     locator::effective_replication_map_ptr _erm;
     const dht::sharder* _sharder;
     optimized_optional<seastar::abort_source::subscription> _callback;
+    std::optional<write_replica_set_selector> _sel;
 private:
-    void refresh() {
-        _erm = _table->get_effective_replication_map();
-        _sharder = &_erm->get_sharder(*_table->schema());
-        _callback = _erm->get_validity_abort_source().subscribe([this] () noexcept {
-            refresh();
-        });
-    }
+    void refresh();
 public:
-    auto_refreshing_sharder(lw_shared_ptr<replica::table> table)
-        : _table(std::move(table))
-    {
-        refresh();
-    }
+    auto_refreshing_sharder(lw_shared_ptr<replica::table> table, std::optional<write_replica_set_selector> sel = std::nullopt);
 
-    virtual ~auto_refreshing_sharder() = default;
+    virtual ~auto_refreshing_sharder();
 
-    virtual unsigned shard_of(const dht::token& token) const override {
-        return _sharder->shard_of(token);
-    }
+    virtual unsigned shard_for_reads(const token& t) const override;
 
-    virtual std::optional<dht::shard_and_token> next_shard(const dht::token& t) const override {
-        return _sharder->next_shard(t);
-    }
+    virtual dht::shard_replica_set shard_for_writes(const token& t, std::optional<write_replica_set_selector> sel) const override;
 
-    virtual dht::token token_for_next_shard(const dht::token& t, shard_id shard, unsigned spans = 1) const override {
-        return _sharder->token_for_next_shard(t, shard, spans);
-    }
+    virtual std::optional<dht::shard_and_token> next_shard_for_reads(const dht::token& t) const override;
+
+    virtual dht::token token_for_next_shard_for_reads(const dht::token& t, shard_id shard, unsigned spans = 1) const override;
 };
 
 } // namespace dht

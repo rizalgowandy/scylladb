@@ -4,7 +4,7 @@ Upscale a Cluster
 
 Upcaling your cluster involves moving the cluster to a larger instance. With this procedure, it can be done without downtime.
 
-Scylla was designed with big servers and multi-cores in mind. In most cases, it is better to run a smaller cluster on a bigger machine instance than a larger cluster on a small machine instance.
+ScyllaDB was designed with big servers and multi-cores in mind. In most cases, it is better to run a smaller cluster on a bigger machine instance than a larger cluster on a small machine instance.
 However, there may be cases where you started with a small cluster, and you now you want to upscale.
 
 There are a few alternatives to do this:
@@ -28,19 +28,26 @@ This procedure can be used to either upscale an entire cluster or to upscale a s
 Upscale Nodes by Adding CPUs
 ----------------------------
 
+.. note::
+
+   Upscaling a cluster by adding CPUs requires at least a quorum of nodes in a cluster to be available. 
+   If the quorum is lost, it must be restored before a node is upscaled. 
+   See :doc:`Handling Node Failures </troubleshooting/handling-node-failures>` for details. 
+
 This procedure is only useful for entire clusters, not individual nodes.
-Do the following on each node in the cluster:
+Do the following on each node in the cluster, making sure the nodes are restarted **sequentially** 
+to avoid interrupting the availability of your application:
 
 #. Run :doc:`nodetool drain </operating-scylla/nodetool-commands/drain/>` to stop traffic to the node.
-#. Stop the service
+#. Stop the service.
 
    .. include:: /rst_include/scylla-commands-stop-index.rst
 
 #. Add cores
-#. Run ``scylla_setup`` to set Scylla to the new HW configuration.
+#. Run ``scylla_setup`` to set ScyllaDB to the new HW configuration.
 #. Start the service
 
    .. include:: /rst_include/scylla-commands-start-index.rst
 
 
-.. note:: Updating the number of cores will cause Scylla to reshard the SSTables to match the new core number. This is done by compacting all of the data on disk at startup.
+.. note:: Updating the number of cores will cause ScyllaDB to reshard the SSTables to match the new core number. This is done by compacting all of the data on disk at startup.

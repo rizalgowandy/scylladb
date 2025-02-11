@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "test/lib/scylla_test_case.hh"
@@ -31,7 +31,7 @@ static future<> broken_sst(sstring dir, sstables::generation_type::int_t generat
     sstable_version_types version = la) {
   return sstables::test_env::do_with_async([=] (sstables::test_env& env) {
     try {
-        sstable_ptr sstp = env.reusable_sst(s, dir, generation, version).get0();
+        sstable_ptr sstp = env.reusable_sst(s, dir, generation, version).get();
         auto r = sstp->make_reader(s, env.make_reader_permit(), query::full_partition_range, s->full_slice());
         auto close_r = deferred_close(r);
         r.consume(my_consumer{}).get();
@@ -49,7 +49,7 @@ static future<> broken_sst(sstring dir, sstables::generation_type::int_t generat
 static future<> broken_sst(sstring dir, sstables::generation_type::int_t generation, sstring msg, std::optional<sstring> sst_name = std::nullopt) {
     // Using an empty schema for this function, which is only about loading
     // a malformed component and checking that it fails.
-    auto s = make_shared_schema({}, "ks", "cf", {}, {}, {}, {}, utf8_type);
+    auto s = schema_builder("ks", "cf", {}, utf8_type).build();
     return broken_sst(dir, generation, s, msg, sst_name);
 }
 
@@ -62,7 +62,7 @@ SEASTAR_TEST_CASE(test_empty_index) {
                  .set_compressor_params(compression_parameters::no_compression())
                  .build();
     future<sstable_ptr> fut = env.reusable_sst(s, "test/resource/sstables/empty_index", 36, sstable_version_types::mc);
-    BOOST_REQUIRE_EXCEPTION(fut.get0(), malformed_sstable_exception, exception_predicate::message_matches(
+    BOOST_REQUIRE_EXCEPTION(fut.get(), malformed_sstable_exception, exception_predicate::message_matches(
         "index_consume_entry_context \\(state=.*\\): cannot finish parsing current entry, no more data in sstable test/resource/sstables/empty_index/mc-36-big-Index.db"));
   });
 }

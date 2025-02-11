@@ -1,6 +1,7 @@
 add_library(mutation STATIC)
 target_sources(mutation
   PRIVATE
+    async_utils.cc
     atomic_cell.cc
     canonical_mutation.cc
     frozen_mutation.cc
@@ -21,7 +22,9 @@ target_link_libraries(mutation
   PUBLIC
     idl
     Seastar::seastar
-    xxHash::xxhash)
+    xxHash::xxhash
+  PRIVATE
+    absl::headers)
 
 check_headers(check-headers mutation
   GLOB_RECURSE ${CMAKE_CURRENT_SOURCE_DIR}/*.hh)

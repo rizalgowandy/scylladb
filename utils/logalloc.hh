@@ -3,21 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <memory>
 #include <seastar/core/memory.hh>
-#include <seastar/core/condition-variable.hh>
-#include <seastar/core/smp.hh>
+#include <seastar/core/shard_id.hh>
 #include <seastar/core/shared_ptr.hh>
-#include <seastar/core/shared_future.hh>
-#include <seastar/core/expiring_fifo.hh>
 #include "allocation_strategy.hh"
 #include "seastarx.hh"
-#include "db/timeout_clock.hh"
+#include "utils/assert.hh"
 #include "utils/entangled.hh"
 #include "utils/memory_limit_reached.hh"
 
@@ -73,6 +70,7 @@ public:
         uint64_t memory_freed;
         uint64_t memory_compacted;
         uint64_t memory_evicted;
+        uint64_t num_allocations;
 
         friend stats operator+(const stats& s1, const stats& s2) {
             stats result(s1);
@@ -91,6 +89,7 @@ public:
             memory_freed += other.memory_freed;
             memory_compacted += other.memory_compacted;
             memory_evicted += other.memory_evicted;
+            num_allocations += other.num_allocations;
             return *this;
         }
         stats& operator-=(const stats& other) {
@@ -100,6 +99,7 @@ public:
             memory_freed -= other.memory_freed;
             memory_compacted -= other.memory_compacted;
             memory_evicted -= other.memory_evicted;
+            num_allocations -= other.num_allocations;
             return *this;
         }
     };
@@ -287,8 +287,6 @@ public:
     explicit operator bool() const noexcept {
         return _total_space > 0;
     }
-
-    friend std::ostream& operator<<(std::ostream&, const occupancy_stats&);
 };
 
 class basic_region_impl : public allocation_strategy {
@@ -303,7 +301,7 @@ public:
     tracker& get_tracker() { return _tracker; }
 
     void set_reclaiming_enabled(bool enabled) noexcept {
-        assert(this_shard_id() == _cpu);
+        SCYLLA_ASSERT(this_shard_id() == _cpu);
         _reclaiming_enabled = enabled;
     }
 
@@ -493,7 +491,7 @@ public:
     //
     template<typename Func>
     decltype(auto) with_reclaiming_disabled(logalloc::region& r, Func&& fn) {
-        assert(r.reclaiming_enabled());
+        SCYLLA_ASSERT(r.reclaiming_enabled());
         maybe_decay_reserve();
         while (true) {
             try {
@@ -540,3 +538,10 @@ future<> prime_segment_pool(size_t available_memory, size_t min_free_memory);
 future<> use_standard_allocator_segment_pool_backend(size_t available_memory);
 
 }
+
+template <> struct fmt::formatter<logalloc::occupancy_stats> : fmt::formatter<string_view> {
+    auto format(const logalloc::occupancy_stats& stats, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{:.2f}%, {:d} / {:d} [B]",
+                              stats.used_fraction() * 100, stats.used_space(), stats.total_space());
+    }
+};

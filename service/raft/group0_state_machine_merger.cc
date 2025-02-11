@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #include "db/config.hh"
 #include "db/system_keyspace.hh"
@@ -27,7 +27,7 @@ size_t group0_state_machine_merger::cmd_size(group0_command& cmd) {
     if (holds_alternative<broadcast_table_query>(cmd.change)) {
         return 0;
     }
-    auto r = get_command_mutations(cmd) | boost::adaptors::transformed([] (const canonical_mutation& m) { return m.representation().size(); });
+    auto r = get_command_mutations(cmd) | std::views::transform([] (const canonical_mutation& m) { return m.representation().size(); });
     return std::accumulate(std::begin(r), std::end(r), size_t(0));
 }
 
@@ -76,6 +76,9 @@ std::vector<canonical_mutation>& group0_state_machine_merger::get_command_mutati
             on_internal_error(slogger, "trying to merge broadcast table command");
         },
         [] (topology_change& chng) -> std::vector<canonical_mutation>& {
+            return chng.mutations;
+        },
+        [] (mixed_change& chng) -> std::vector<canonical_mutation>& {
             return chng.mutations;
         },
         [] (write_mutations& muts) -> std::vector<canonical_mutation>& {

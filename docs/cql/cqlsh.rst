@@ -173,7 +173,7 @@ SHOW VERSION
 This command is useful if you want to check which Cassandra version is compatible with your ScyllaDB version.
 Note that the two standards are not 100% identical and this command is simply a comparison tool.
 
-If you want to display your current ScyllaDB version, refer to :ref:`Check your current version of Scylla <check-your-current-version-of-scylla>`.
+If you want to display your current ScyllaDB version, refer to :ref:`Check your current version of ScyllaDB <check-your-current-version-of-scylla>`.
 
 The display shows:
 
@@ -399,8 +399,11 @@ The ``DESCRIBE CLUSTER`` command prints the cluster name and partitioner::
     Cluster: Test Cluster
     Partitioner: Murmur3Partitioner
 
-The ``DESCRIBE SCHEMA`` command prints the DDL statements needed to recreate the entire schema.  This is especially
-useful for dumping the schema in order to clone a cluster or restore from a backup.
+The ``DESCRIBE SCHEMA`` command prints the DDL statements needed to recreate the entire schema. The higher tiers of the statement
+can also include information that can be used to restore authentication/authorization and service levels. This is especially
+useful for cloning a cluster or restoring its state from a backup.
+
+See :doc:`a dedicated article </cql/describe-schema>` to learn more.
 
 .. _cqlsh-copy-to:
 
@@ -539,7 +542,7 @@ Options that are common to both ``COPY TO`` and ``COPY FROM``.
 
 See also:
 
-CQLSH `lesson <https://university.scylladb.com/courses/data-modeling/lessons/basic-data-modeling-2/topic/cql-cqlsh-and-basic-cql-syntax/>`_ on Scylla University
+CQLSH `lesson <https://university.scylladb.com/courses/data-modeling/lessons/basic-data-modeling-2/topic/cql-cqlsh-and-basic-cql-syntax/>`_ on ScyllaDB University
 
 * :doc:`Apache Cassandra Query Language (CQL) Reference </cql/index>`
 

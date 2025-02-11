@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/aligned_buffer.hh>
@@ -11,15 +11,16 @@
 // We need to use experimental features of the zstd library (to allocate compression/decompression context),
 // which are available only when the library is linked statically.
 #define ZSTD_STATIC_LINKING_ONLY
-#include "zstd.h"
+#include <zstd.h>
 
 #include "compress.hh"
+#include "exceptions/exceptions.hh"
 #include "utils/class_registrator.hh"
 #include "utils/reusable_buffer.hh"
 #include <concepts>
 
 static const sstring COMPRESSION_LEVEL = "compression_level";
-static const sstring COMPRESSOR_NAME = compressor::namespace_prefix + "ZstdCompressor";
+static const sstring COMPRESSOR_NAME = compressor::make_name("ZstdCompressor");
 static const size_t DCTX_SIZE = ZSTD_estimateDCtxSize();
 
 class zstd_processor : public compressor {

@@ -3,26 +3,30 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <boost/test/unit_test.hpp>
+#include <boost/test/framework.hpp>
 #include "replica/database.hh"
 #include "db/config.hh"
+#include "utils/assert.hh"
 #include "utils/UUID_gen.hh"
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include "schema/schema_builder.hh"
 #include <seastar/util/closeable.hh>
 #include "service/migration_manager.hh"
 
+#include <fmt/ranges.h>
 #include <seastar/core/thread.hh>
 #include "replica/memtable.hh"
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
 #include "test/lib/mutation_source_test.hh"
 #include "test/lib/mutation_assertions.hh"
-#include "test/lib/flat_mutation_reader_assertions.hh"
+#include "test/lib/mutation_reader_assertions.hh"
 #include "test/lib/data_model.hh"
 #include "test/lib/eventually.hh"
 #include "test/lib/random_utils.hh"
@@ -35,6 +39,11 @@
 #include "utils/error_injection.hh"
 #include "db/commitlog/commitlog.hh"
 #include "test/lib/make_random_string.hh"
+#include "db/extensions.hh"
+#include "db/config.hh"
+#include "service/storage_service.hh"
+
+BOOST_AUTO_TEST_SUITE(memtable_test)
 
 using namespace std::literals::chrono_literals;
 
@@ -44,11 +53,11 @@ static api::timestamp_type next_timestamp() {
 }
 
 static bytes make_unique_bytes() {
-    return to_bytes(utils::UUID_gen::get_time_UUID().to_sstring());
+    return to_bytes(fmt::to_string(utils::UUID_gen::get_time_UUID()));
 }
 
 static void set_column(mutation& m, const sstring& column_name) {
-    assert(m.schema()->get_column_definition(to_bytes(column_name))->type == bytes_type);
+    SCYLLA_ASSERT(m.schema()->get_column_definition(to_bytes(column_name))->type == bytes_type);
     auto value = data_value(make_unique_bytes());
     m.set_clustered_cell(clustering_key::make_empty(), to_bytes(column_name), value, next_timestamp());
 }
@@ -82,9 +91,9 @@ static future<> test_memtable(void (*run_tests)(populate_fn_ex, bool)) {
     return seastar::async([run_tests] {
         tests::reader_concurrency_semaphore_wrapper semaphore;
         lw_shared_ptr<replica::memtable> mt;
-        std::vector<flat_mutation_reader_v2> readers;
+        std::vector<mutation_reader> readers;
         auto clear_readers = [&readers] {
-            parallel_for_each(readers, [] (flat_mutation_reader_v2& rd) {
+            parallel_for_each(readers, [] (mutation_reader& rd) {
                 return rd.close();
             }).finally([&readers] {
                 readers.clear();
@@ -164,9 +173,9 @@ SEASTAR_TEST_CASE(test_memtable_flush_reader) {
     return seastar::async([] {
         tests::reader_concurrency_semaphore_wrapper semaphore;
 
-        auto make_memtable = [] (replica::dirty_memory_manager& mgr, logalloc::allocating_section& read_section, logalloc::allocating_section& allocating_section, replica::table_stats& tbl_stats, std::vector<mutation> muts) {
-            assert(!muts.empty());
-            auto mt = make_lw_shared<replica::memtable>(muts.front().schema(), mgr, read_section, allocating_section, tbl_stats);
+        auto make_memtable = [] (replica::dirty_memory_manager& mgr, replica::memtable_table_shared_data& table_shared_data, replica::table_stats& tbl_stats, std::vector<mutation> muts) {
+            SCYLLA_ASSERT(!muts.empty());
+            auto mt = make_lw_shared<replica::memtable>(muts.front().schema(), mgr, table_shared_data, tbl_stats);
             for (auto& m : muts) {
                 mt->apply(m);
             }
@@ -176,8 +185,7 @@ SEASTAR_TEST_CASE(test_memtable_flush_reader) {
         auto test_random_streams = [&] (random_mutation_generator&& gen) {
             for (auto i = 0; i < 4; i++) {
                 replica::table_stats tbl_stats;
-                logalloc::allocating_section read_section;
-                logalloc::allocating_section allocating_section;
+                replica::memtable_table_shared_data table_shared_data;
                 replica::dirty_memory_manager mgr;
                 const auto muts = gen(4);
                 const auto now = gc_clock::now();
@@ -187,7 +195,7 @@ SEASTAR_TEST_CASE(test_memtable_flush_reader) {
                 }
 
                 testlog.info("Simple read");
-                auto mt = make_memtable(mgr, read_section, allocating_section, tbl_stats, muts);
+                auto mt = make_memtable(mgr, table_shared_data, tbl_stats, muts);
 
                 assert_that(mt->make_flush_reader(gen.schema(), semaphore.make_permit()))
                     .produces_compacted(compacted_muts[0], now)
@@ -197,7 +205,7 @@ SEASTAR_TEST_CASE(test_memtable_flush_reader) {
                     .produces_end_of_stream();
 
                 testlog.info("Read with next_partition() calls between partition");
-                mt = make_memtable(mgr, read_section, allocating_section, tbl_stats, muts);
+                mt = make_memtable(mgr, table_shared_data, tbl_stats, muts);
                 assert_that(mt->make_flush_reader(gen.schema(), semaphore.make_permit()))
                     .next_partition()
                     .produces_compacted(compacted_muts[0], now)
@@ -211,7 +219,7 @@ SEASTAR_TEST_CASE(test_memtable_flush_reader) {
                     .produces_end_of_stream();
 
                 testlog.info("Read with next_partition() calls inside partitions");
-                mt = make_memtable(mgr, read_section, allocating_section, tbl_stats, muts);
+                mt = make_memtable(mgr, table_shared_data, tbl_stats, muts);
                 assert_that(mt->make_flush_reader(gen.schema(), semaphore.make_permit()))
                     .produces_compacted(compacted_muts[0], now)
                     .produces_partition_start(muts[1].decorated_key(), muts[1].partition().partition_tombstone())
@@ -290,11 +298,10 @@ SEASTAR_TEST_CASE(test_unspooled_dirty_accounting_on_flush) {
         tests::reader_concurrency_semaphore_wrapper semaphore;
 
         replica::dirty_memory_manager mgr;
-        logalloc::allocating_section read_section;
-        logalloc::allocating_section allocating_section;
+        replica::memtable_table_shared_data table_shared_data;
         replica::table_stats tbl_stats;
 
-        auto mt = make_lw_shared<replica::memtable>(s, mgr, read_section, allocating_section, tbl_stats);
+        auto mt = make_lw_shared<replica::memtable>(s, mgr, table_shared_data, tbl_stats);
 
         std::vector<mutation> ring = make_ring(s, 3);
         std::vector<mutation> current_ring;
@@ -308,7 +315,7 @@ SEASTAR_TEST_CASE(test_unspooled_dirty_accounting_on_flush) {
         }
 
         // Create a reader which will cause many partition versions to be created
-        flat_mutation_reader_v2_opt rd1 = mt->make_flat_reader(s, semaphore.make_permit());
+        mutation_reader_opt rd1 = mt->make_flat_reader(s, semaphore.make_permit());
         auto close_rd1 = deferred_close(*rd1);
         rd1->set_max_buffer_size(1);
         rd1->fill_buffer().get();
@@ -331,7 +338,7 @@ SEASTAR_TEST_CASE(test_unspooled_dirty_accounting_on_flush) {
         flush_reader_check.produces_partition(current_ring[1]);
         unspooled_dirty_values.push_back(mgr.unspooled_dirty_memory());
 
-        while ((*rd1)().get0()) ;
+        while ((*rd1)().get()) ;
         close_rd1.close_now();
 
         logalloc::shard_tracker().full_compaction();
@@ -427,11 +434,10 @@ SEASTAR_TEST_CASE(test_segment_migration_during_flush) {
         tests::reader_concurrency_semaphore_wrapper semaphore;
 
         replica::table_stats tbl_stats;
-        logalloc::allocating_section read_section;
-        logalloc::allocating_section allocating_section;
+        replica::memtable_table_shared_data table_shared_data;
         replica::dirty_memory_manager mgr;
 
-        auto mt = make_lw_shared<replica::memtable>(s, mgr, read_section, allocating_section, tbl_stats);
+        auto mt = make_lw_shared<replica::memtable>(s, mgr, table_shared_data, tbl_stats);
 
         const int rows_per_partition = 300;
         const int partitions = 3;
@@ -450,17 +456,17 @@ SEASTAR_TEST_CASE(test_segment_migration_during_flush) {
         auto close_rd = deferred_close(rd);
 
         for (int i = 0; i < partitions; ++i) {
-            auto mfopt = rd().get0();
+            auto mfopt = rd().get();
             BOOST_REQUIRE(bool(mfopt));
             BOOST_REQUIRE(mfopt->is_partition_start());
             while (!mfopt->is_end_of_partition()) {
                 logalloc::shard_tracker().full_compaction();
-                mfopt = rd().get0();
+                mfopt = rd().get();
             }
             BOOST_REQUIRE_LE(mgr.unspooled_dirty_memory(), mgr.real_dirty_memory());
         }
 
-        BOOST_REQUIRE(!rd().get0());
+        BOOST_REQUIRE(!rd().get());
     });
 }
 
@@ -677,7 +683,7 @@ SEASTAR_THREAD_TEST_CASE(test_tombstone_merging_with_mvcc_and_preemption) {
     }
     mt->apply(m0);
 
-    std::optional<flat_mutation_reader_v2> rd0 = mt->make_flat_reader(
+    std::optional<mutation_reader> rd0 = mt->make_flat_reader(
             s, semaphore.make_permit(), pr, s->full_slice(),
             nullptr, streamed_mutation::forwarding::no, mutation_reader::forwarding::no);
     auto close_rd0 = defer([&] { rd0->close().get(); });
@@ -691,7 +697,7 @@ SEASTAR_THREAD_TEST_CASE(test_tombstone_merging_with_mvcc_and_preemption) {
     ss.delete_range(m1, ss.make_ckey_range(k1, k2));
     mt->apply(m1);
 
-    std::optional<flat_mutation_reader_v2> rd1 = mt->make_flat_reader(
+    std::optional<mutation_reader> rd1 = mt->make_flat_reader(
             s, semaphore.make_permit(), pr, s->full_slice(),
             nullptr, streamed_mutation::forwarding::no, mutation_reader::forwarding::no);
     auto close_rd1 = defer([&] { rd1->close().get(); });
@@ -810,8 +816,8 @@ SEASTAR_TEST_CASE(test_hash_is_cached) {
         {
             auto rd = mt->make_flat_reader(s, semaphore.make_permit());
             auto close_rd = deferred_close(rd);
-            rd().get0()->as_partition_start();
-            clustering_row row = std::move(*rd().get0()).as_clustering_row();
+            rd().get()->as_partition_start();
+            clustering_row row = std::move(*rd().get()).as_clustering_row();
             BOOST_REQUIRE(!row.cells().cell_hash_for(0));
         }
 
@@ -820,16 +826,16 @@ SEASTAR_TEST_CASE(test_hash_is_cached) {
             slice.options.set<query::partition_slice::option::with_digest>();
             auto rd = mt->make_flat_reader(s, semaphore.make_permit(), query::full_partition_range, slice);
             auto close_rd = deferred_close(rd);
-            rd().get0()->as_partition_start();
-            clustering_row row = std::move(*rd().get0()).as_clustering_row();
+            rd().get()->as_partition_start();
+            clustering_row row = std::move(*rd().get()).as_clustering_row();
             BOOST_REQUIRE(row.cells().cell_hash_for(0));
         }
 
         {
             auto rd = mt->make_flat_reader(s, semaphore.make_permit());
             auto close_rd = deferred_close(rd);
-            rd().get0()->as_partition_start();
-            clustering_row row = std::move(*rd().get0()).as_clustering_row();
+            rd().get()->as_partition_start();
+            clustering_row row = std::move(*rd().get()).as_clustering_row();
             BOOST_REQUIRE(row.cells().cell_hash_for(0));
         }
 
@@ -839,8 +845,8 @@ SEASTAR_TEST_CASE(test_hash_is_cached) {
         {
             auto rd = mt->make_flat_reader(s, semaphore.make_permit());
             auto close_rd = deferred_close(rd);
-            rd().get0()->as_partition_start();
-            clustering_row row = std::move(*rd().get0()).as_clustering_row();
+            rd().get()->as_partition_start();
+            clustering_row row = std::move(*rd().get()).as_clustering_row();
             BOOST_REQUIRE(!row.cells().cell_hash_for(0));
         }
 
@@ -849,16 +855,16 @@ SEASTAR_TEST_CASE(test_hash_is_cached) {
             slice.options.set<query::partition_slice::option::with_digest>();
             auto rd = mt->make_flat_reader(s, semaphore.make_permit(), query::full_partition_range, slice);
             auto close_rd = deferred_close(rd);
-            rd().get0()->as_partition_start();
-            clustering_row row = std::move(*rd().get0()).as_clustering_row();
+            rd().get()->as_partition_start();
+            clustering_row row = std::move(*rd().get()).as_clustering_row();
             BOOST_REQUIRE(row.cells().cell_hash_for(0));
         }
 
         {
             auto rd = mt->make_flat_reader(s, semaphore.make_permit());
             auto close_rd = deferred_close(rd);
-            rd().get0()->as_partition_start();
-            clustering_row row = std::move(*rd().get0()).as_clustering_row();
+            rd().get()->as_partition_start();
+            clustering_row row = std::move(*rd().get()).as_clustering_row();
             BOOST_REQUIRE(row.cells().cell_hash_for(0));
         }
     });
@@ -887,7 +893,8 @@ SEASTAR_THREAD_TEST_CASE(test_collecting_encoding_stats) {
 
     auto md2 = tests::data_model::mutation_description({ to_bytes("pk2") });
     auto md2_ttl = gc_clock::duration(std::chrono::seconds(1));
-    md2.add_clustered_row_marker({ to_bytes("ck1") }, -10);
+    api::timestamp_type md2_timestamp = -10;
+    md2.add_clustered_row_marker({ to_bytes("ck1") }, md2_timestamp);
     md2.add_clustered_cell({ to_bytes("ck1") }, "v1", random_int32_value());
     md2.add_clustered_cell({ to_bytes("ck2") }, "v2",
             tests::data_model::mutation_description::atomic_value(random_int32_value(), tests::data_model::data_timestamp, md2_ttl, now + md2_ttl));
@@ -900,30 +907,61 @@ SEASTAR_THREAD_TEST_CASE(test_collecting_encoding_stats) {
             tests::data_model::mutation_description::atomic_value(random_int32_value(), tests::data_model::data_timestamp, md3_ttl, md3_expiry_point));
     auto m3 = md3.build(s);
 
+    auto md4 = tests::data_model::mutation_description({ to_bytes("pk1") });
+    auto md4_tombstone = tombstone(md2_timestamp - 10, now - std::chrono::hours(9));
+    md4.set_partition_tombstone(md4_tombstone);
+    auto m4 = md4.build(s);
+
     auto mt = make_lw_shared<replica::memtable>(s);
 
     auto stats = mt->get_encoding_stats();
     BOOST_CHECK(stats.min_local_deletion_time == gc_clock::time_point::max());
     BOOST_CHECK_EQUAL(stats.min_timestamp, api::max_timestamp);
     BOOST_CHECK(stats.min_ttl == gc_clock::duration::max());
+    BOOST_CHECK_EQUAL(mt->get_min_timestamp(), 0);
+    BOOST_CHECK_EQUAL(mt->get_max_timestamp(), 0);
+    BOOST_CHECK_EQUAL(mt->get_min_live_timestamp(), api::max_timestamp);
+    BOOST_CHECK_EQUAL(mt->get_min_live_row_marker_timestamp(), api::max_timestamp);
 
     mt->apply(m1);
     stats = mt->get_encoding_stats();
     BOOST_CHECK(stats.min_local_deletion_time == gc_clock::time_point::max());
     BOOST_CHECK_EQUAL(stats.min_timestamp, tests::data_model::data_timestamp);
     BOOST_CHECK(stats.min_ttl == gc_clock::duration::max());
+    BOOST_CHECK_EQUAL(mt->get_min_timestamp(), tests::data_model::data_timestamp);
+    BOOST_CHECK_EQUAL(mt->get_max_timestamp(), tests::data_model::data_timestamp);
+    BOOST_CHECK_EQUAL(mt->get_min_live_timestamp(), tests::data_model::data_timestamp);
+    BOOST_CHECK_EQUAL(mt->get_min_live_row_marker_timestamp(), tests::data_model::data_timestamp);
 
     mt->apply(m2);
     stats = mt->get_encoding_stats();
     BOOST_CHECK(stats.min_local_deletion_time == now + md2_ttl);
-    BOOST_CHECK_EQUAL(stats.min_timestamp, -10);
+    BOOST_CHECK_EQUAL(stats.min_timestamp, md2_timestamp);
     BOOST_CHECK(stats.min_ttl == md2_ttl);
+    BOOST_CHECK_EQUAL(mt->get_min_timestamp(), md2_timestamp);
+    BOOST_CHECK_EQUAL(mt->get_max_timestamp(), tests::data_model::data_timestamp);
+    BOOST_CHECK_EQUAL(mt->get_min_live_timestamp(), md2_timestamp);
+    BOOST_CHECK_EQUAL(mt->get_min_live_row_marker_timestamp(), md2_timestamp);
 
     mt->apply(m3);
     stats = mt->get_encoding_stats();
     BOOST_CHECK(stats.min_local_deletion_time == md3_expiry_point);
-    BOOST_CHECK_EQUAL(stats.min_timestamp, -10);
+    BOOST_CHECK_EQUAL(stats.min_timestamp, md2_timestamp);
     BOOST_CHECK(stats.min_ttl == md2_ttl);
+    BOOST_CHECK_EQUAL(mt->get_min_timestamp(), md2_timestamp);
+    BOOST_CHECK_EQUAL(mt->get_max_timestamp(), tests::data_model::data_timestamp);
+    BOOST_CHECK_EQUAL(mt->get_min_live_timestamp(), md2_timestamp);
+    BOOST_CHECK_EQUAL(mt->get_min_live_row_marker_timestamp(), md2_timestamp);
+
+    mt->apply(m4);
+    stats = mt->get_encoding_stats();
+    BOOST_CHECK(stats.min_local_deletion_time == md4_tombstone.deletion_time);
+    BOOST_CHECK_EQUAL(stats.min_timestamp, md4_tombstone.timestamp);
+    BOOST_CHECK(stats.min_ttl == md2_ttl);
+    BOOST_CHECK_EQUAL(mt->get_min_timestamp(), md4_tombstone.timestamp);
+    BOOST_CHECK_EQUAL(mt->get_max_timestamp(), tests::data_model::data_timestamp);
+    BOOST_CHECK_EQUAL(mt->get_min_live_timestamp(), md2_timestamp);
+    BOOST_CHECK_EQUAL(mt->get_min_live_row_marker_timestamp(), md2_timestamp);
 }
 
 
@@ -958,10 +996,55 @@ SEASTAR_TEST_CASE(memtable_flush_compresses_mutations) {
         // Flush to make sure all the modifications make it to disk
         t.flush().get();
 
-        // Treat the table as mutation_source and assert we get the expected mutation and end of stream
+        // Treat the table as mutation_source and SCYLLA_ASSERT we get the expected mutation and end of stream
         mutation_source ms = t.as_mutation_source();
         assert_that(ms.make_reader_v2(s, semaphore.make_permit()))
             .produces(m2)
+            .produces_end_of_stream();
+    }, db_config);
+}
+
+SEASTAR_TEST_CASE(memtable_flush_period) {
+    auto db_config = make_shared<db::config>();
+    db_config->enable_cache.set(false);
+    return do_with_cql_env_thread([](cql_test_env& env) {
+        // Create table and insert some data
+        char const* ks_name = "keyspace_name";
+        char const* table_name = "table_name";
+        env.execute_cql(format("CREATE KEYSPACE {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}};", ks_name)).get();
+        env.execute_cql(format("CREATE TABLE {}.{} (pk int, ck int, id int, PRIMARY KEY(pk, ck));", ks_name, table_name)).get();
+
+        replica::database& db = env.local_db();
+        replica::table& t = db.find_column_family(ks_name, table_name);
+        tests::reader_concurrency_semaphore_wrapper semaphore;
+
+        auto s1 = t.schema();
+
+        dht::decorated_key pk = dht::decorate_key(*s1, partition_key::from_single_value(*s1, serialized(1)));
+        clustering_key ck = clustering_key::from_single_value(*s1, serialized(2));
+
+        mutation m = mutation(s1, pk);
+        m.set_clustered_cell(ck, to_bytes("id"), data_value(3), api::new_timestamp());
+        t.apply(m);
+        BOOST_REQUIRE_EQUAL(t.sstables_count(), 0); // add mutation and check there are no sstables for this table
+
+        // change schema to set memtable flush period
+        // we use small value in this test but it is impossible to set the period less than 60000ms using ALTER TABLE construction
+        schema_builder b(t.schema());
+        b.set_memtable_flush_period(200);
+        schema_ptr s2 = b.build();
+        t.set_schema(s2);
+
+        sleep(500ms).get(); // wait until memtable flush starts at least once
+        BOOST_REQUIRE(t.sstables_count() == 1 || t.get_stats().pending_flushes > 0);    // flush started
+        BOOST_REQUIRE(eventually_true([&] { // wait until memtable will be flushed at least once
+            return t.sstables_count() == 1;
+        }));
+
+        // Check mutation presents in the table
+        mutation_source ms = t.as_mutation_source();
+        assert_that(ms.make_reader_v2(s2, semaphore.make_permit()))
+            .produces(m)
             .produces_end_of_stream();
     }, db_config);
 }
@@ -1025,10 +1108,10 @@ SEASTAR_TEST_CASE(sstable_compaction_does_not_resurrect_data) {
 
         // Trigger compaction. If all goes well, compaction should check if a relevant row is in the memtable
         // and should not purge the tombstone.
-        t.compact_all_sstables().get();
+        t.compact_all_sstables(tasks::task_info{}).get();
 
         // If we get additional row (1, 2, 4), that means the tombstone was purged and data was resurrected
-        assert_that(env.execute_cql(format("SELECT * FROM {}.{};", ks_name, table_name)).get0())
+        assert_that(env.execute_cql(format("SELECT * FROM {}.{};", ks_name, table_name)).get())
             .is_rows()
             .with_rows_ignore_order({
                 {serialized(1), serialized(3), serialized(3)}, 
@@ -1041,6 +1124,9 @@ SEASTAR_TEST_CASE(failed_flush_prevents_writes) {
     std::cerr << "Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n";
     return make_ready_future<>();
 #else
+    auto db_config = make_shared<db::config>();
+    db_config->unspooled_dirty_soft_limit.set(1.0);
+
     return do_with_cql_env_thread([](cql_test_env& env) {
         replica::database& db = env.local_db();
         service::migration_manager& mm = env.migration_manager().local();
@@ -1052,7 +1138,7 @@ SEASTAR_TEST_CASE(failed_flush_prevents_writes) {
         mm.announce(service::prepare_new_column_family_announcement(mm.get_storage_proxy(), s, ts).get(), std::move(group0_guard), "").get();
 
         replica::table& t = db.find_column_family("ks", "cf");
-        auto memtables = t.active_memtables();
+        auto memtables = active_memtables(t);
 
         // Insert something so that we have data in memtable to flush
         // it has to be somewhat large, as automatic flushing picks the
@@ -1062,6 +1148,9 @@ SEASTAR_TEST_CASE(failed_flush_prevents_writes) {
             ss.add_row(mt, ss.make_ckey(i), format("{}", i));
         }
         t.apply(mt);
+
+        BOOST_REQUIRE_LT(t.min_memtable_timestamp(), api::max_timestamp);
+        BOOST_REQUIRE_LT(t.min_memtable_live_timestamp(), api::max_timestamp);
 
         auto failed_memtables_flushes_count = db.cf_stats()->failed_memtables_flushes_count;
 
@@ -1073,22 +1162,25 @@ SEASTAR_TEST_CASE(failed_flush_prevents_writes) {
         // Trigger flush
         auto f = t.flush();
 
-        BOOST_ASSERT(eventually_true([&] {
+        BOOST_REQUIRE(eventually_true([&] {
             return db.cf_stats()->failed_memtables_flushes_count - failed_memtables_flushes_count >= 4;
         }));
 
         // The flush failed, make sure there is still data in memtable.
-        BOOST_ASSERT(t.min_memtable_timestamp() < api::max_timestamp);
+        BOOST_REQUIRE_LT(t.min_memtable_timestamp(), api::max_timestamp);
+        BOOST_REQUIRE_LT(t.min_memtable_live_timestamp(), api::max_timestamp);
         utils::get_local_injector().disable("table_seal_active_memtable_reacquire_write_permit");
 
-        BOOST_ASSERT(eventually_true([&] {
+        BOOST_REQUIRE(eventually_true([&] {
             // The error above is no longer being injected, so
             // seal_active_memtable retry loop should eventually succeed
-            return t.min_memtable_timestamp() == api::max_timestamp;
+            return t.min_memtable_timestamp() == api::max_timestamp
+                    && t.min_memtable_live_timestamp() == api::max_timestamp
+                    && t.min_memtable_live_row_marker_timestamp() == api::max_timestamp;
         }));
 
         std::move(f).get();
-    });
+    }, db_config);
 #endif
 }
 
@@ -1148,7 +1240,7 @@ SEASTAR_TEST_CASE(flushing_rate_is_reduced_if_compaction_doesnt_keep_up) {
                 replica::database& db = env.local_db();
                 replica::table& t = db.find_column_family(ks_name, cf_name);
 
-                for ([[maybe_unused]] int value : boost::irange<int>(0, num_flushes)) {
+                for ([[maybe_unused]] int value : std::views::iota(0, num_flushes)) {
                     ::usleep(sleep_ms * 1000);
                     co_await db.apply(t.schema(), freeze(gen()), tracing::trace_state_ptr(), db::commitlog::force_sync::yes, db::no_timeout);
                     co_await t.flush();
@@ -1159,7 +1251,7 @@ SEASTAR_TEST_CASE(flushing_rate_is_reduced_if_compaction_doesnt_keep_up) {
         };
 
         int sleep_ms = 2;
-        for ([[maybe_unused]] int i : boost::irange<int>(8)) {
+        for ([[maybe_unused]] int i : std::views::iota(0, 8)) {
             future<> f0 = smp::submit_to(0, flusher{.env=env, .num_flushes=100, .sleep_ms=0});
             future<> f1 = smp::submit_to(1, flusher{.env=env, .num_flushes=3, .sleep_ms=sleep_ms});
             co_await std::move(f0);
@@ -1169,3 +1261,230 @@ SEASTAR_TEST_CASE(flushing_rate_is_reduced_if_compaction_doesnt_keep_up) {
     });
 }
 
+static future<> exceptions_in_flush_helper(std::unique_ptr<sstables::file_io_extension> mep, bool& should_fail, const bool& did_fail, bool expect_isolate) {
+    auto ext = std::make_shared<db::extensions>();
+    auto cfg = seastar::make_shared<db::config>(ext);
+
+    ext->add_sstable_file_io_extension("test", std::move(mep));
+
+    co_await do_with_cql_env([&](cql_test_env& env) -> future<> {
+
+        co_await env.execute_cql(fmt::format("create table t0 (pk text primary key, v text)"));
+
+        should_fail = true;
+
+        int i = 0;
+
+        testlog.debug("Wait for fail");
+
+        auto f = make_ready_future<>();
+
+        while (!did_fail) {
+            std::string pk = "apa" + std::to_string(i++);
+            std::string v = "ko";
+            co_await env.execute_cql(fmt::format("insert into ks.t0 (pk, v) values ('{}', '{}')", pk, v));
+
+            f = f.then([&] {
+                return env.db().invoke_on_all([] (replica::database& db) {
+                    return db.flush_all_memtables();
+                });
+            });
+        }
+
+        BOOST_REQUIRE(did_fail);
+        testlog.debug("Reset fail trigger");
+
+        should_fail = false;
+
+        if (expect_isolate) {
+            bool isolated = false;
+            // can't use eventually_true here, because neither we nor the invoke on shard 0 is in seastar
+            // thread.
+            for (int i = 0; i < 10; ++i) {
+                isolated = co_await env.get_storage_service().invoke_on(0, [&](service::storage_service& ss) {
+                    return ss.is_isolated(); 
+                });
+                if (isolated) {
+                    break;
+                }
+                // isolation is not syncnronous;
+                co_await sleep(2s);
+            }
+
+            BOOST_REQUIRE(isolated);
+        }
+
+        testlog.debug("Trying to stop");
+
+        co_await std::move(f);
+    }, cfg);
+}
+
+static future<> exceptions_in_flush_on_sstable_write_helper(std::function<void()> throw_func, bool expect_isolate = true) {
+    class myext : public sstables::file_io_extension {
+    public:
+        bool should_fail = false;
+        bool did_fail = false;
+        std::function<void()> throw_func;
+
+        future<file> wrap_file(sstable& t, component_type type, file f, open_flags flags) override {
+            if (should_fail) {
+                class myimpl : public seastar::file_impl {
+                    file _file;
+                    myext& _myext;
+                public:
+                    myimpl(file f, myext& ext)
+                        : _file(std::move(f))
+                        , _myext(ext)
+                    {}
+                    void fail() const {
+                        if (_myext.should_fail) {
+                            _myext.did_fail = true;
+                            testlog.debug("Throwing exception");
+                            _myext.throw_func();
+                        }
+                    }
+                    future<size_t> write_dma(uint64_t pos, const void* buffer, size_t len, io_intent* intent) override {
+                        fail();
+                        return get_file_impl(_file)->write_dma(pos, buffer, len, intent);
+                    }
+                    future<size_t> write_dma(uint64_t pos, std::vector<iovec> iov, io_intent* intent) override {
+                        fail();
+                        return get_file_impl(_file)->write_dma(pos, std::move(iov), intent);
+                    }
+                    future<size_t> read_dma(uint64_t pos, void* buffer, size_t len, io_intent* intent) override {
+                        fail();
+                        return get_file_impl(_file)->read_dma(pos, buffer, len, intent);
+                    }
+                    future<size_t> read_dma(uint64_t pos, std::vector<iovec> iov, io_intent* intent) override {
+                        fail();
+                        return get_file_impl(_file)->read_dma(pos, std::move(iov), intent);
+                    }
+                    future<> flush(void) override {
+                        fail();
+                        return get_file_impl(_file)->flush();
+                    }
+                    future<struct stat> stat(void) override {
+                        fail();
+                        return get_file_impl(_file)->stat();
+                    }
+                    future<> truncate(uint64_t length) override {
+                        fail();
+                        return get_file_impl(_file)->truncate(length);
+                    }
+                    future<> discard(uint64_t offset, uint64_t length) override {
+                        fail();
+                        return get_file_impl(_file)->discard(offset, length);
+                    }
+                    future<> allocate(uint64_t position, uint64_t length) override {
+                        fail();
+                        return get_file_impl(_file)->allocate(position, length);
+                    }
+                    future<uint64_t> size(void) override {
+                        fail();
+                        return get_file_impl(_file)->size();
+                    }
+                    future<> close() override {
+                        fail();
+                        return get_file_impl(_file)->close();
+                    }
+                    std::unique_ptr<seastar::file_handle_impl> dup() override {
+                        fail();
+                        return get_file_impl(_file)->dup();
+                    }
+                    subscription<directory_entry> list_directory(std::function<future<> (directory_entry de)> next) override {
+                        fail();
+                        return get_file_impl(_file)->list_directory(std::move(next));
+                    }
+                    future<temporary_buffer<uint8_t>> dma_read_bulk(uint64_t offset, size_t range_size, io_intent* intent) override {
+                        fail();
+                        return get_file_impl(_file)->dma_read_bulk(offset, range_size, intent);
+                    }
+                };
+                co_return file(make_shared<myimpl>(std::move(f), *this));
+            }
+            co_return f;
+        }
+    };
+    auto mep = std::make_unique<myext>();
+    auto& me = *mep;
+    me.throw_func = std::move(throw_func);
+    co_await exceptions_in_flush_helper(std::move(mep), me.should_fail, me.did_fail, expect_isolate);
+}
+
+SEASTAR_TEST_CASE(test_exceptions_in_flush_on_sstable_write) {
+    co_await exceptions_in_flush_on_sstable_write_helper(
+        [] { throw std::system_error(EACCES, std::system_category()); }
+    );
+}
+
+SEASTAR_TEST_CASE(test_ext_permission_exceptions_in_flush_on_sstable_write) {
+    co_await exceptions_in_flush_on_sstable_write_helper(
+        [] { throw db::extension_storage_permission_error(get_name()); }
+    );
+}
+
+SEASTAR_TEST_CASE(test_ext_resource_exceptions_in_flush_on_sstable_write) {
+    co_await exceptions_in_flush_on_sstable_write_helper(
+        [] { throw db::extension_storage_resource_unavailable(get_name()); }
+        , false // equal no ENOENT
+    );
+}
+
+SEASTAR_TEST_CASE(test_ext_config_exceptions_in_flush_on_sstable_write) {
+    co_await exceptions_in_flush_on_sstable_write_helper(
+        [] { throw db::extension_storage_misconfigured(get_name()); }
+    );
+}
+
+static future<> exceptions_in_flush_on_sstable_open_helper(std::function<void()> throw_func, bool expect_isolate = true) {
+    auto ext = std::make_shared<db::extensions>();
+    auto cfg = seastar::make_shared<db::config>(ext);
+
+    class myext : public sstables::file_io_extension {
+    public:
+        bool should_fail = false;
+        bool did_fail = false;
+        std::function<void()> throw_func;
+
+        future<file> wrap_file(sstable& t, component_type type, file f, open_flags flags) override {
+            if (should_fail) {
+                did_fail = true;
+                testlog.debug("Throwing exception");
+                throw_func();
+            }
+            co_return f;
+        }
+    };
+    auto mep = std::make_unique<myext>();
+    auto& me = *mep;
+    me.throw_func = std::move(throw_func);;
+    co_await exceptions_in_flush_helper(std::move(mep), me.should_fail, me.did_fail, expect_isolate);
+}
+
+SEASTAR_TEST_CASE(test_exceptions_in_flush_on_sstable_open) {
+    co_await exceptions_in_flush_on_sstable_open_helper(
+        [] { throw std::system_error(EACCES, std::system_category()); }
+    );
+}
+
+SEASTAR_TEST_CASE(test_ext_permission_exceptions_in_flush_on_sstable_open) {
+    co_await exceptions_in_flush_on_sstable_open_helper(
+        [] { throw db::extension_storage_permission_error(get_name()); }
+    );
+}
+
+SEASTAR_TEST_CASE(test_ext_resource_exceptions_in_flush_on_sstable_open) {
+    co_await exceptions_in_flush_on_sstable_open_helper(
+        [] { throw db::extension_storage_resource_unavailable(get_name()); }
+        , false // equal no ENOENT
+    );
+}
+
+SEASTAR_TEST_CASE(test_ext_config_exceptions_in_flush_on_sstable_open) {
+    co_await exceptions_in_flush_on_sstable_open_helper(
+        [] { throw db::extension_storage_misconfigured(get_name()); }
+    );
+}
+
+BOOST_AUTO_TEST_SUITE_END()

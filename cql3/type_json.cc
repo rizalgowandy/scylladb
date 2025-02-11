@@ -3,12 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "cql3/type_json.hh"
 #include "concrete_types.hh"
 #include "counters.hh"
+#include "types/vector.hh"
 #include "utils/rjson.hh"
 #include "types/list.hh"
 #include "types/map.hh"
@@ -72,7 +73,7 @@ static sstring quote_json_string(const sstring& value) {
         }
     }
     oss.put('"');
-    return oss.str();
+    return std::move(oss).str();
 }
 
 
@@ -119,7 +120,27 @@ template <typename T> static T to_int(const rjson::value& value) {
                 "for int64 type: {} (it should not contain fractional part {})", value, fractional));
         }
 
-        if (std::numeric_limits<T>::min() > double_value || double_value > std::numeric_limits<T>::max()) {
+        // At this point we know that `double_value` is an integer.
+        // Now we only have to check that it's within the target type's limits.
+        //
+        // It's tempting to check that `double_value <= std::numeric_limits<T>::max()`,
+        // but that's wrong because the right side might not be exactly representable as a double,
+        // and can get rounded up. 
+        //
+        // For example, in the C++ expression `std::ldexp(1, 64) <= std::numeric_limits<uint64_t>::max()`,
+        // the right side will (most likely) be rounded up to `std::ldexp(1, 64)`, and the comparison
+        // will evaluate to `true` even though `std::ldexp(1, 64)` doesn't fit into `uint64_t`.
+        //
+        // So we have to be careful.
+        // Instead of `double_value <= std::numeric_limits<T>::max()`,
+        // we use `double_value < max_limit`, where `max_limit` is a `double` *mathematically*
+        // equal to `std::numeric_limits<T>::max() + 1`. This value is a power of 2, so it's
+        // exactly representable in `double`.
+        //
+        // The formula for `max_limit` is carefully constructed so that float arithmetic
+        // happens on powers of 2, without any rounding.
+        constexpr double max_limit = 2.0 * ((std::numeric_limits<T>::max() / 2) + 1);
+        if (std::numeric_limits<T>::min() > double_value || double_value >= max_limit) {
             throw marshal_exception(format("Value {} out of range", double_value));
         }
 
@@ -151,13 +172,15 @@ static bytes from_json_object_aux(const map_type_impl& t, const rjson::value& va
     std::map<bytes, bytes, serialized_compare> raw_map(t.get_keys_type()->as_less_comparator());
     for (auto it = value.MemberBegin(); it != value.MemberEnd(); ++it) {
         bytes value = from_json_object(*t.get_values_type(), it->value);
-        if (t.get_keys_type()->underlying_type() == ascii_type ||
-            t.get_keys_type()->underlying_type() == utf8_type) {
+        // For all native (non-collection, non-tuple) key types, they are
+        // represented as a string in JSON. For more elaborate types, they
+        // can also be a string representation of another JSON type, which
+        // needs to be reparsed as JSON. For example,
+        // map<frozen<list<int>>, int> will be represented as:
+        // { "[1, 3, 6]": 3, "[]": 0, "[1, 2]": 2 }
+        if (t.get_keys_type()->underlying_type()->is_native()) {
             raw_map.emplace(from_json_object(*t.get_keys_type(), it->name), std::move(value));
         } else {
-            // Keys in maps can only be strings in JSON, but they can also be a string representation
-            // of another JSON type, which needs to be reparsed. Example - map<frozen<list<int>>, int>
-            // will be represented like this: { "[1, 3, 6]": 3, "[]": 0, "[1, 2]": 2 }
             try {
                 rjson::value map_key = rjson::parse(rjson::to_string_view(it->name));
                 raw_map.emplace(from_json_object(*t.get_keys_type(), map_key), std::move(value));
@@ -208,6 +231,32 @@ static bytes from_json_object_aux(const tuple_type_impl& t, const rjson::value& 
     return t.build_value(std::move(raw_tuple));
 }
 
+static bytes from_json_object_aux(const vector_type_impl& t, const rjson::value& value) {
+    if (!value.IsArray()) {
+        throw marshal_exception("vector_type must be represented as JSON Array");
+    }
+    
+    if (value.Size() > t.get_dimension()) {
+        throw marshal_exception(
+                format("Too many values ({}) for vector with size {}", value.Size(), t.get_dimension()));
+    }
+    
+    if (value.Size() < t.get_dimension()) {
+        throw marshal_exception(
+                format("Too few values ({}) for vector with size {}", value.Size(), t.get_dimension()));
+    }
+
+    std::vector<bytes> raw_vector;
+    raw_vector.reserve(value.Size());
+
+    auto type = t.get_elements_type();
+
+    for (auto vi = value.Begin(); vi != value.End(); ++vi) {
+        raw_vector.emplace_back(from_json_object(*type, *vi));
+    }
+    return vector_type_impl::build_value(std::move(raw_vector), t.value_length_if_fixed());
+}
+
 static bytes from_json_object_aux(const user_type_impl& ut, const rjson::value& value) {
     if (!value.IsObject()) {
         throw marshal_exception("user_type must be represented as JSON Object");
@@ -231,7 +280,7 @@ static bytes from_json_object_aux(const user_type_impl& ut, const rjson::value& 
     }
 
     if (!remaining_names.empty()) {
-        throw marshal_exception(format(
+        throw marshal_exception(seastar::format(
                 "Extraneous field definition for user type {}: {}", ut.get_name_as_string(), *remaining_names.begin()));
     }
     return ut.build_value(std::move(raw_tuple));
@@ -332,6 +381,7 @@ struct from_json_object_visitor {
     bytes operator()(const set_type_impl& t) { return from_json_object_aux(t, value); }
     bytes operator()(const list_type_impl& t) { return from_json_object_aux(t, value); }
     bytes operator()(const tuple_type_impl& t) { return from_json_object_aux(t, value); }
+    bytes operator()(const vector_type_impl& t) { return from_json_object_aux(t, value); }
     bytes operator()(const user_type_impl& t) { return from_json_object_aux(t, value); }
 };
 }
@@ -374,7 +424,7 @@ static sstring to_json_string_aux(const map_type_impl& t, bytes_view bv) {
         out << to_json_string(*t.get_values_type(), vb);
     }
     out << '}';
-    return out.str();
+    return std::move(out).str();
 }
 
 static sstring to_json_string_aux(const set_type_impl& t, bytes_view bv) {
@@ -397,7 +447,7 @@ static sstring to_json_string_aux(const set_type_impl& t, bytes_view bv) {
         }
     });
     out << ']';
-    return out.str();
+    return std::move(out).str();
 }
 
 static sstring to_json_string_aux(const list_type_impl& t, bytes_view bv) {
@@ -419,7 +469,7 @@ static sstring to_json_string_aux(const list_type_impl& t, bytes_view bv) {
         }
     });
     out << ']';
-    return out.str();
+    return std::move(out).str();
 }
 
 static sstring to_json_string_aux(const tuple_type_impl& t, bytes_view bv) {
@@ -443,7 +493,25 @@ static sstring to_json_string_aux(const tuple_type_impl& t, bytes_view bv) {
     }
 
     out << ']';
-    return out.str();
+    return std::move(out).str();
+}
+
+static sstring to_json_string_aux(const vector_type_impl& t, bytes_view bv) {
+    std::ostringstream out;
+    auto fv = basic_single_fragmented_view<mutable_view::no>(bv);
+
+    out << '[';
+
+    for (size_t i = 0; i < t.get_dimension(); ++i) {
+        if (i != 0) {
+            out << ", ";
+        }
+
+        out << to_json_string(*t.get_elements_type(), read_vector_element(fv, *t.get_elements_type()->value_length_if_fixed()).current_fragment());
+    }
+
+    out << ']';
+    return std::move(out).str();
 }
 
 static sstring to_json_string_aux(const user_type_impl& t, bytes_view bv) {
@@ -470,7 +538,7 @@ static sstring to_json_string_aux(const user_type_impl& t, bytes_view bv) {
     }
 
     out << '}';
-    return out.str();
+    return std::move(out).str();
 }
 
 namespace {
@@ -500,6 +568,7 @@ struct to_json_string_visitor {
     sstring operator()(const set_type_impl& t) { return to_json_string_aux(t, bv); }
     sstring operator()(const list_type_impl& t) { return to_json_string_aux(t, bv); }
     sstring operator()(const tuple_type_impl& t) { return to_json_string_aux(t, bv); }
+    sstring operator()(const vector_type_impl& t) { return to_json_string_aux(t, bv); }
     sstring operator()(const user_type_impl& t) { return to_json_string_aux(t, bv); }
     sstring operator()(const simple_date_type_impl& t) { return quote_json_string(t.to_string(bv)); }
     sstring operator()(const time_type_impl& t) { return quote_json_string(t.to_string(bv)); }

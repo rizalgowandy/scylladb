@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -14,8 +14,6 @@
 #include <seastar/util/variant_utils.hh>
 #include <variant>
 #include "test/lib/log.hh"
-#include "utils/collection-concepts.hh"
-#include "utils/to_string.hh"
 
 template<typename Comparator, typename... T>
 class total_order_check {
@@ -33,7 +31,7 @@ private:
                         auto r = _cmp(a, b);
                         auto actual = r;
                         if (actual != order) {
-                            BOOST_FAIL(format("Expected cmp({}, {}) == {}, but got {}", a, b, order, actual));
+                            BOOST_FAIL(seastar::format("Expected cmp({}, {}) == {}, but got {}", a, b, order, actual));
                         }
                     });
                 });

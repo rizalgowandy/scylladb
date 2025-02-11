@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -40,6 +40,7 @@ public:
     virtual const db::extensions& get_extensions(database db) const = 0;
     virtual const gms::feature_service& get_features(database db) const = 0;
     virtual replica::database& real_database(database db) const = 0;
+    virtual replica::database* real_database_ptr(database db) const = 0;
 protected:
     // Tools for type erasing an unerasing
     static database make_database(const impl* i, const void* db) {

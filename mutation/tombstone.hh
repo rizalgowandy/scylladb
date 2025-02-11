@@ -3,12 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <functional>
 #include <compare>
 
 #include "timestamp.hh"
@@ -64,7 +63,7 @@ struct tombstone final {
 };
 
 template <>
-struct fmt::formatter<tombstone> : fmt::formatter<std::string_view> {
+struct fmt::formatter<tombstone> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const tombstone& t, FormatContext& ctx) const {
         if (t) {
@@ -78,7 +77,7 @@ struct fmt::formatter<tombstone> : fmt::formatter<std::string_view> {
      }
 };
 
-static inline std::ostream& operator<<(std::ostream& out, const tombstone& t) {
+inline std::ostream& operator<<(std::ostream& out, const tombstone& t) {
     fmt::print(out, "{}", t);
     return out;
 }
@@ -91,8 +90,3 @@ struct appending_hash<tombstone> {
         feed_hash(h, t.deletion_time);
     }
 };
-
-// Determines whether tombstone may be GC-ed.
-using can_gc_fn = std::function<bool(tombstone)>;
-
-extern can_gc_fn always_gc;

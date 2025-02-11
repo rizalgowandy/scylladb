@@ -3,21 +3,24 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/testing/on_internal_error.hh>
 #include "test/lib/cql_test_env.hh"
 #include <seastar/core/manual_clock.hh>
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include <seastar/rpc/rpc_types.hh>
 #include "utils/error_injection.hh"
 #include "db/timeout_clock.hh"
 #include "test/lib/cql_assertions.hh"
+#include "test/lib/test_utils.hh"
 #include "types/list.hh"
-#include "log.hh"
-#include "cql3/query_options.hh"
+#include "utils/log.hh"
 #include <chrono>
+
+BOOST_AUTO_TEST_SUITE(error_injection_test)
 
 using namespace std::literals::chrono_literals;
 
@@ -43,7 +46,7 @@ SEASTAR_TEST_CASE(test_inject_noop) {
     BOOST_REQUIRE(f.available() && !f.failed());
 
     errinj.enable("noop3");
-    f = errinj.inject_with_handler("noop3", [] (auto& handler) -> future<> {
+    f = errinj.inject("noop3", [] (auto& handler) -> future<> {
         throw std::runtime_error("shouldn't happen");
     });
 
@@ -93,7 +96,7 @@ SEASTAR_TEST_CASE(test_inject_sleep_duration) {
     errinj.enable("future_sleep");
     return errinj.inject("future_sleep", sleep_msec).then([start_time] {
         auto wait_time = std::chrono::duration_cast<milliseconds>(steady_clock::now() - start_time);
-        BOOST_REQUIRE_GE(wait_time.count(), sleep_msec.count());
+        BOOST_REQUIRE_GE(wait_time, sleep_msec);
         return make_ready_future<>();
     });
 }
@@ -106,7 +109,8 @@ SEASTAR_TEST_CASE(test_inject_sleep_deadline_steady_clock) {
         auto deadline = steady_clock::now() + sleep_msec;
         errinj.enable("future_deadline");
         errinj.inject("future_deadline", deadline).then([deadline] {
-            BOOST_REQUIRE_GE(std::chrono::duration_cast<std::chrono::milliseconds>(steady_clock::now() - deadline).count(), 0);
+            BOOST_REQUIRE_GE(steady_clock::now() - deadline,
+                             steady_clock::duration::zero());
             return make_ready_future<>();
         }).get();
     });
@@ -120,23 +124,8 @@ SEASTAR_TEST_CASE(test_inject_sleep_deadline_manual_clock) {
         auto deadline = seastar::manual_clock::now() + sleep_msec;
         errinj.enable("future_deadline");
         auto f = errinj.inject("future_deadline", deadline).then([deadline] {
-            BOOST_REQUIRE_GE(std::chrono::duration_cast<std::chrono::milliseconds>(seastar::manual_clock::now() - deadline).count(), 0);
-            return make_ready_future<>();
-        });
-        manual_clock::advance(sleep_msec);
-        f.get();
-    });
-}
-
-SEASTAR_TEST_CASE(test_inject_sleep_deadline_manual_clock_lambda) {
-    return do_with_cql_env_thread([] (cql_test_env& e) {
-        utils::error_injection<true> errinj;
-
-        // Inject sleep, deadline short-circuit
-        auto deadline = seastar::manual_clock::now() + sleep_msec;
-        errinj.enable("future_deadline");
-        auto f = errinj.inject("future_deadline", deadline, [deadline] {
-            BOOST_REQUIRE_GE(std::chrono::duration_cast<std::chrono::milliseconds>(seastar::manual_clock::now() - deadline).count(), 0);
+            BOOST_REQUIRE_GE(seastar::manual_clock::now() - deadline,
+                             seastar::manual_clock::duration::zero());
             return make_ready_future<>();
         });
         manual_clock::advance(sleep_msec);
@@ -152,7 +141,8 @@ SEASTAR_TEST_CASE(test_inject_sleep_deadline_db_clock) {
         auto deadline = db::timeout_clock::now() + sleep_msec;
         errinj.enable("future_deadline");
         errinj.inject("future_deadline", deadline).then([deadline] {
-            BOOST_REQUIRE_GE(std::chrono::duration_cast<std::chrono::milliseconds>(db::timeout_clock::now() - deadline).count(), 0);
+            BOOST_REQUIRE_GE(db::timeout_clock::now() - deadline,
+                             db::timeout_clock::duration::zero());
             return make_ready_future<>();
         }).get();
     });
@@ -163,8 +153,8 @@ SEASTAR_TEST_CASE(test_inject_future_disabled) {
 
     auto start_time = steady_clock::now();
     return errinj.inject("futid", sleep_msec).then([start_time] {
-        auto wait_time = std::chrono::duration_cast<milliseconds>(steady_clock::now() - start_time);
-        BOOST_REQUIRE_LT(wait_time.count(), sleep_msec.count());
+        auto wait_time = steady_clock::now() - start_time;
+        BOOST_REQUIRE_LT(wait_time, sleep_msec);
         return make_ready_future<>();
     });
 }
@@ -266,7 +256,7 @@ SEASTAR_TEST_CASE(test_inject_message) {
     errinj.enable("injection1");
     {
         // Test timeout
-        auto f = errinj.inject_with_handler("injection1", [] (auto& handler) {
+        auto f = errinj.inject("injection1", [] (auto& handler) {
             return handler.wait_for_message(db::timeout_clock::now());
         });
 
@@ -274,7 +264,7 @@ SEASTAR_TEST_CASE(test_inject_message) {
     }
     {
         // Test receiving multiple messages
-        auto f = errinj.inject_with_handler("injection1", std::bind_front([] (auto timeout, auto& handler) -> future<> {
+        auto f = errinj.inject("injection1", std::bind_front([] (auto timeout, auto& handler) -> future<> {
             for (size_t i = 0; i < 3; ++i) {
                 co_await handler.wait_for_message(timeout);
             }
@@ -293,7 +283,7 @@ SEASTAR_TEST_CASE(test_inject_message) {
         // Test receiving message before waiting for it
         errinj.receive_message("injection2");
 
-        auto f = errinj.inject_with_handler("injection2", [] (auto& handler) {
+        auto f = errinj.inject("injection2", [] (auto& handler) {
             return handler.wait_for_message(db::timeout_clock::now());
         });
         BOOST_REQUIRE_NO_THROW(co_await std::move(f));
@@ -303,10 +293,10 @@ SEASTAR_TEST_CASE(test_inject_message) {
     errinj.enable("multiple_injections");
     {
         // Test concurrent injections
-        auto f1 = errinj.inject_with_handler("multiple_injections", [timeout] (auto& handler) {
+        auto f1 = errinj.inject("multiple_injections", [timeout] (auto& handler) {
             return handler.wait_for_message(timeout);
         });
-        auto f2 = errinj.inject_with_handler("multiple_injections", [timeout] (auto& handler) {
+        auto f2 = errinj.inject("multiple_injections", [timeout] (auto& handler) {
             return handler.wait_for_message(timeout);
         });
         errinj.receive_message("multiple_injections");
@@ -318,10 +308,10 @@ SEASTAR_TEST_CASE(test_inject_message) {
     errinj.enable("one_shot", true);
     {
         // Test concurrent one shot injections
-        auto f1 = errinj.inject_with_handler("one_shot", [timeout] (auto& handler) {
+        auto f1 = errinj.inject("one_shot", [timeout] (auto& handler) {
             return handler.wait_for_message(timeout);
         });
-        auto f2 = errinj.inject_with_handler("one_shot", std::bind_front([] (auto timeout, auto& handler) -> future<> {
+        auto f2 = errinj.inject("one_shot", std::bind_front([] (auto timeout, auto& handler) -> future<> {
             co_await handler.wait_for_message(timeout);
             co_await handler.wait_for_message(timeout);
         }, timeout));
@@ -333,12 +323,108 @@ SEASTAR_TEST_CASE(test_inject_message) {
     }
 }
 
+SEASTAR_TEST_CASE(test_inject_unshared_message) {
+    testing::scoped_no_abort_on_internal_error abort_guard;
+    utils::error_injection<true> errinj;
+
+    auto timeout = db::timeout_clock::now() + 5s;
+
+    errinj.enable("injection1");
+    {
+        // Test receiving enough unshared messages
+        auto f1 = errinj.inject("injection1", std::bind_front([] (auto timeout, auto& handler) -> future<> {
+            co_await handler.wait_for_message(timeout);
+            co_await handler.wait_for_message(timeout);
+        }, timeout), false);
+        auto f2 = errinj.inject("injection1", std::bind_front([] (auto timeout, auto& handler) -> future<> {
+            co_await handler.wait_for_message(timeout);
+            co_await handler.wait_for_message(timeout);
+        }, timeout), false);
+
+        for (size_t i = 0; i < 4; ++i) {
+            errinj.receive_message("injection1");
+        }
+
+        BOOST_REQUIRE_NO_THROW(co_await std::move(f1));
+        BOOST_REQUIRE_NO_THROW(co_await std::move(f2));
+    }
+    errinj.disable("injection1");
+
+    errinj.enable("injection2");
+    {
+        // Test receiving enough unshared messages before waiting for them
+        errinj.receive_message("injection2");
+        errinj.receive_message("injection2");
+
+        auto f1 = errinj.inject("injection2", [timeout] (auto& handler) {
+            return handler.wait_for_message(timeout);
+        }, false);
+        auto f2 = errinj.inject("injection2", [timeout] (auto& handler) {
+            return handler.wait_for_message(timeout);
+        }, false);
+
+        BOOST_REQUIRE_NO_THROW(co_await std::move(f1));
+        BOOST_REQUIRE_NO_THROW(co_await std::move(f2));
+    }
+    errinj.disable("injection2");
+
+    errinj.enable("injection3");
+    {
+        // Test receiving not enough unshared messages
+        auto timeout_1s = db::timeout_clock::now() + 1s;
+
+        auto f1 = errinj.inject("injection3", std::bind_front([] (auto timeout, auto& handler) -> future<> {
+            co_await handler.wait_for_message(timeout);
+            co_await handler.wait_for_message(timeout);
+        }, timeout_1s), false);
+        auto f2 = errinj.inject("injection3", std::bind_front([] (auto timeout, auto& handler) -> future<> {
+            co_await handler.wait_for_message(timeout);
+            co_await handler.wait_for_message(timeout);
+        }, timeout_1s), false);
+
+        for (size_t i = 0; i < 3; ++i) {
+            errinj.receive_message("injection3");
+        }
+
+        BOOST_REQUIRE_THROW(co_await when_all_succeed(std::move(f1), std::move(f2)).discard_result(), std::runtime_error);
+    }
+    errinj.disable("injection3");
+
+    errinj.enable("injection4");
+    {
+        // Test handlers sharing messages are independent of the not sharing ones
+        auto f1 = errinj.inject("injection4", std::bind_front([] (auto timeout, auto& handler) -> future<> {
+            co_await handler.wait_for_message(timeout);
+            co_await handler.wait_for_message(timeout);
+        }, timeout), true);
+        auto f2 = errinj.inject("injection4", std::bind_front([] (auto timeout, auto& handler) -> future<> {
+            co_await handler.wait_for_message(timeout);
+            co_await handler.wait_for_message(timeout);
+        }, timeout), true);
+        auto f3 = errinj.inject("injection4", [timeout] (auto& handler) {
+            return handler.wait_for_message(timeout);
+        }, false);
+        auto f4 = errinj.inject("injection4", [timeout] (auto& handler) {
+            return handler.wait_for_message(timeout);
+        }, false);
+
+        errinj.receive_message("injection4");
+        errinj.receive_message("injection4");
+
+        BOOST_REQUIRE_NO_THROW(co_await std::move(f1));
+        BOOST_REQUIRE_NO_THROW(co_await std::move(f2));
+        BOOST_REQUIRE_NO_THROW(co_await std::move(f3));
+        BOOST_REQUIRE_NO_THROW(co_await std::move(f4));
+    }
+    errinj.disable("injection4");
+}
+
 SEASTAR_TEST_CASE(test_inject_with_parameters) {
     utils::error_injection<true> errinj;
 
     errinj.enable("injection", false, { { "x", "42" } });
 
-    auto f = errinj.inject_with_handler("injection", [] (auto& handler) {
+    auto f = errinj.inject("injection", [] (auto& handler) {
         auto x = handler.get("x");
         auto y = handler.get("y");
         BOOST_REQUIRE(x && *x == "42");
@@ -374,19 +460,19 @@ SEASTAR_TEST_CASE(test_inject_cql) {
             cquery_nofail(e, "insert into  error_name (name, one_shot) values ('test1', 'true')");
 
             // Check no error injections before injecting
-            auto ret0 = e.execute_cql("select enabled_injections() from error_name limit 1").get0();
+            auto ret0 = e.execute_cql("select enabled_injections() from error_name limit 1").get();
             assert_that(ret0).is_rows().with_rows({
                 {row_empty}
             });
 
             cquery_nofail(e, "select enable_injection(name, one_shot)  from error_name where name = 'test1'");
             // enabled_injections() returns a list all injections in one call, so limit 1
-            auto ret1 = e.execute_cql("select enabled_injections() from error_name limit 1").get0();
+            auto ret1 = e.execute_cql("select enabled_injections() from error_name limit 1").get();
             assert_that(ret1).is_rows().with_rows({
                 {row_test1}
             });
             utils::get_local_injector().inject("test1", [] {}); // Noop one-shot injection
-            auto ret2 = e.execute_cql("select enabled_injections() from error_name limit 1").get0();
+            auto ret2 = e.execute_cql("select enabled_injections() from error_name limit 1").get();
             assert_that(ret2).is_rows().with_rows({
                 // Empty list after one shot executed
                 {row_empty}
@@ -395,13 +481,13 @@ SEASTAR_TEST_CASE(test_inject_cql) {
             // Again (test1,one_shot=true) but disable with CQL API
             cquery_nofail(e, "select enable_injection(name, one_shot)  from error_name where name = 'test1'");
             // enabled_injections() returns a list all injections in one call, so limit 1
-            auto ret3 = e.execute_cql("select enabled_injections() from error_name limit 1").get0();
+            auto ret3 = e.execute_cql("select enabled_injections() from error_name limit 1").get();
             assert_that(ret3).is_rows().with_rows({
                 {row_test1}
             });
             // Disable
             cquery_nofail(e, "select disable_injection(name) from error_name where name = 'test1'");
-            auto ret4 = e.execute_cql("select enabled_injections() from error_name limit 1").get0();
+            auto ret4 = e.execute_cql("select enabled_injections() from error_name limit 1").get();
             assert_that(ret4).is_rows().with_rows({
                 // Empty list after one shot disabled
                 {row_empty}
@@ -410,10 +496,12 @@ SEASTAR_TEST_CASE(test_inject_cql) {
             cquery_nofail(e, "insert into  error_name (name, one_shot) values ('test2', 'false')");
             cquery_nofail(e, "select enable_injection(name, one_shot)  from error_name where name = 'test2'");
             utils::get_local_injector().inject("test2", [] {}); // Noop injection, doesn't disable
-            auto ret5 = e.execute_cql("select enabled_injections() from error_name limit 1").get0();
+            auto ret5 = e.execute_cql("select enabled_injections() from error_name limit 1").get();
             assert_that(ret5).is_rows().with_rows({
                 {row_test2}
             });
         });
     });
 }
+
+BOOST_AUTO_TEST_SUITE_END()

@@ -3,23 +3,22 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
-#include <exception>
+#include <algorithm>
+#include <iterator>
 #include <memory>
 #include <optional>
-#include <stdexcept>
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/range/algorithm/sort.hpp>
-#include <boost/range/iterator_range_core.hpp>
 
+#include "cdc/cdc_options.hh"
+#include "cdc/log.hh"
 #include "cql3/column_specification.hh"
 #include "cql3/functions/function_name.hh"
 #include "cql3/statements/prepared_statement.hh"
 #include "exceptions/exceptions.hh"
-#include "keys.hh"
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/coroutine/maybe_yield.hh>
+#include <seastar/coroutine/exception.hh>
 #include "service/client_state.hh"
 #include "types/types.hh"
 #include "cql3/query_processor.hh"
@@ -27,6 +26,7 @@
 #include "cql3/statements/raw/describe_statement.hh"
 #include "cql3/statements/describe_statement.hh"
 #include <seastar/core/shared_ptr.hh>
+#include <sstream>
 #include "transport/messages/result_message.hh"
 #include "transport/messages/result_message_base.hh"
 #include "service/query_state.hh"
@@ -34,18 +34,23 @@
 #include "data_dictionary/data_dictionary.hh"
 #include "service/storage_proxy.hh"
 #include "cql3/ut_name.hh"
-#include "cql3/util.hh"
 #include "types/map.hh"
 #include "types/list.hh"
 #include "cql3/functions/functions.hh"
 #include "types/user.hh"
 #include "view_info.hh"
+#include "validation.hh"
 #include "index/secondary_index_manager.hh"
 #include "cql3/functions/user_function.hh"
 #include "cql3/functions/user_aggregate.hh"
 #include "utils/overloaded_functor.hh"
-#include "data_dictionary/keyspace_element.hh"
+#include "db/config.hh"
 #include "db/system_keyspace.hh"
+#include "db/extensions.hh"
+#include "utils/sorting.hh"
+#include "replica/database.hh"
+#include "cql3/description.hh"
+#include "replica/schema_describe_helper.hh"
 
 static logging::logger dlogger("describe");
 
@@ -59,70 +64,26 @@ namespace cql3 {
 
 namespace statements {
 
-using keyspace_element = data_dictionary::keyspace_element;
-
 namespace {
 
-// Represents description of keyspace_element
-struct description {
-    sstring _keyspace;
-    sstring _type;
-    sstring _name;
-    std::optional<sstring> _create_statement;
-
-    // Description without create_statement
-    description(replica::database& db, const keyspace_element& element)
-        : _keyspace(util::maybe_quote(element.keypace_name()))
-        , _type(element.element_type(db))
-        , _name(util::maybe_quote(element.element_name()))
-        , _create_statement(std::nullopt) {}
-
-    // Description with create_statement
-    description(replica::database& db, const keyspace_element& element, bool with_internals)
-        : _keyspace(util::maybe_quote(element.keypace_name()))
-        , _type(element.element_type(db))
-        , _name(util::maybe_quote(element.element_name()))
-    {
-        std::ostringstream os;
-        element.describe(db, os, with_internals);
-        _create_statement = os.str();
+template <typename Range, typename Describer>
+    requires std::is_invocable_r_v<description, Describer, std::ranges::range_value_t<Range>>
+future<std::vector<description>> generate_descriptions(Range&& range, const Describer& describer, bool sort_by_name = true) {
+    std::vector<description> result{};
+    if constexpr (std::ranges::sized_range<Range>) {
+        result.reserve(std::ranges::size(range));
     }
 
-    std::vector<bytes_opt> serialize() const {
-        auto desc = std::vector<bytes_opt>{
-            {to_bytes(_keyspace)},
-            {to_bytes(_type)},
-            {to_bytes(_name)}
-        };
-
-        if (_create_statement) {
-            desc.push_back({to_bytes(*_create_statement)});
-        }
-
-        return desc;
-    }
-};
-
-future<std::vector<description>> generate_descriptions(
-    replica::database& db, 
-    std::vector<shared_ptr<const keyspace_element>> elements,
-    std::optional<bool> with_internals = std::nullopt) 
-{
-    std::vector<description> descs;
-    descs.reserve(elements.size());
-    boost::sort(elements, [] (const auto& a, const auto& b) {
-        return a->element_name() < b->element_name();
-    });
-
-    for (auto& e: elements) {
-        auto desc = (with_internals.has_value()) 
-            ? description(db, *e, *with_internals) 
-            : description(db, *e);
-        descs.push_back(desc);
-
+    for (const auto& element : range) {
+        result.push_back(describer(element));
         co_await coroutine::maybe_yield();
     }
-    co_return descs;
+
+    if (sort_by_name) {
+        std::ranges::sort(result, std::less<>{}, std::mem_fn(&description::name));
+    }
+
+    co_return result;
 }
 
 bool is_index(const data_dictionary::database& db, const schema_ptr& schema) {
@@ -145,12 +106,6 @@ bool is_index(const data_dictionary::database& db, const schema_ptr& schema) {
  *      since keyspace and name don't identify function uniquely
  */
 
-
-
-description keyspace(replica::database& db, const lw_shared_ptr<keyspace_metadata>& ks, bool with_stmt = false) {
-    return (with_stmt) ? description(db, *ks, true) : description(db, *ks);
-}
-
 description type(replica::database& db, const lw_shared_ptr<keyspace_metadata>& ks, const sstring& name) {
     auto udt_meta = ks->user_types();
     if (!udt_meta.has_type(to_bytes(name))) {
@@ -158,67 +113,95 @@ description type(replica::database& db, const lw_shared_ptr<keyspace_metadata>& 
     }
 
     auto udt = udt_meta.get_type(to_bytes(name));
-    return description(db, *udt, true);
+    return udt->describe(with_create_statement::yes);
 }
 
-future<std::vector<description>> types(replica::database& db, const lw_shared_ptr<keyspace_metadata>& ks, bool with_stmt = false) {
-    auto user_types_map = ks->user_types().get_all_types();
-    auto user_types = boost::copy_range<std::vector<shared_ptr<const keyspace_element>>>(user_types_map | boost::adaptors::transformed([] (const auto& e) {
-        // return static_pointer_cast<const keyspace_element>(e.second);
-        return e.second;
-    }));
+// Because UDTs can depend on each other, we need to sort them topologically
+future<std::vector<user_type>> get_sorted_types(const lw_shared_ptr<keyspace_metadata>& ks) {
+    struct udts_comparator {
+        inline bool operator()(const user_type& a, const user_type& b) const {
+            return a->get_name_as_string() < b->get_name_as_string();
+        }
+    };
 
-    co_return co_await generate_descriptions(db, user_types, (with_stmt) ? std::optional(true) : std::nullopt);
+    std::vector<user_type> all_udts;
+    std::multimap<user_type, user_type, udts_comparator> adjacency;
+
+    for (auto& [_, udt]: ks->user_types().get_all_types()) {
+        all_udts.push_back(udt);
+        for (auto& ref_udt: udt->get_all_referenced_user_types()) {
+            adjacency.insert({ref_udt, udt});
+        }
+    }
+
+    co_return co_await utils::topological_sort(all_udts, adjacency);
+}
+
+future<std::vector<description>> types(replica::database& db, const lw_shared_ptr<keyspace_metadata>& ks, with_create_statement with_stmt) {
+    auto udts = co_await get_sorted_types(ks);
+    auto describer = [with_stmt] (const user_type udt) -> cql3::description {
+        return udt->describe(with_stmt);
+    };
+    co_return co_await generate_descriptions(udts, describer, false);
 }
     
 future<std::vector<description>> function(replica::database& db, const sstring& ks, const sstring& name) {
-    auto fs = functions::functions::find(functions::function_name(ks, name));
+    auto fs = functions::instance().find(functions::function_name(ks, name));
     if (fs.empty()) {
         throw exceptions::invalid_request_exception(format("Function '{}' not found in keyspace '{}'", name, ks));
     }
 
-    auto udfs = boost::copy_range<std::vector<shared_ptr<const keyspace_element>>>(fs | boost::adaptors::transformed([] (const auto& f) {
-        return dynamic_pointer_cast<const functions::user_function>(f.second);
-    }) | boost::adaptors::filtered([] (const auto& f) {
+    auto udfs = fs | std::views::transform([] (const auto& f) {
+        const auto& [function_name, function_ptr] = f;
+        return dynamic_pointer_cast<const functions::user_function>(function_ptr);
+    }) | std::views::filter([] (shared_ptr<const functions::user_function> f) {
         return f != nullptr;
-    }));
+    });
     if (udfs.empty()) {
         throw exceptions::invalid_request_exception(format("Function '{}' not found in keyspace '{}'", name, ks));
     }
 
-    co_return co_await generate_descriptions(db, udfs, true);
+    auto describer = [] (shared_ptr<const functions::user_function> udf) {
+        return udf->describe(cql3::with_create_statement::yes);
+    };
+    co_return co_await generate_descriptions(udfs, describer, true);
 }
 
-future<std::vector<description>> functions(replica::database& db,const sstring& ks, bool with_stmt = false) {
-    auto udfs = cql3::functions::functions::get_user_functions(ks);
-    auto elements = boost::copy_range<std::vector<shared_ptr<const keyspace_element>>>(udfs);
-
-    co_return co_await generate_descriptions(db, elements, (with_stmt) ? std::optional(true) : std::nullopt);
+future<std::vector<description>> functions(replica::database& db,const sstring& ks, with_create_statement with_stmt) {
+    auto udfs = cql3::functions::instance().get_user_functions(ks);
+    auto describer = [with_stmt] (shared_ptr<const functions::user_function> udf) {
+        return udf->describe(with_stmt);
+    };
+    co_return co_await generate_descriptions(udfs, describer, true);
 }
 
 future<std::vector<description>> aggregate(replica::database& db, const sstring& ks, const sstring& name) {
-    auto fs = functions::functions::find(functions::function_name(ks, name));
+    auto fs = functions::instance().find(functions::function_name(ks, name));
     if (fs.empty()) {
         throw exceptions::invalid_request_exception(format("Aggregate '{}' not found in keyspace '{}'", name, ks));
     }
 
-    auto udas = boost::copy_range<std::vector<shared_ptr<const keyspace_element>>>(fs | boost::adaptors::transformed([] (const auto& f) {
+    auto udas = fs | std::views::transform([] (const auto& f) {
         return dynamic_pointer_cast<const functions::user_aggregate>(f.second);
-    }) | boost::adaptors::filtered([] (const auto& f) {
+    }) | std::views::filter([] (shared_ptr<const functions::user_aggregate> f) {
         return f != nullptr;
-    }));
+    });
     if (udas.empty()) {
         throw exceptions::invalid_request_exception(format("Aggregate '{}' not found in keyspace '{}'", name, ks));
     }
 
-    co_return co_await generate_descriptions(db, udas, true);
+    auto describer = [] (shared_ptr<const functions::user_aggregate> uda) {
+        return uda->describe(with_create_statement::yes);
+    };
+    co_return co_await generate_descriptions(udas, describer, true);
 }
 
-future<std::vector<description>> aggregates(replica::database& db, const sstring& ks, bool with_stmt = false) {
-    auto udas = functions::functions::get_user_aggregates(ks);
-    auto elements = boost::copy_range<std::vector<shared_ptr<const keyspace_element>>>(udas);
-
-    co_return co_await generate_descriptions(db, elements, (with_stmt) ? std::optional(true) : std::nullopt);
+future<std::vector<description>> aggregates(replica::database& db, const sstring& ks, with_create_statement with_stmt) {
+    auto udas = functions::instance().get_user_aggregates(ks);
+    auto describer = [with_stmt] (shared_ptr<const functions::user_aggregate> uda) {
+        return uda->describe(with_stmt);
+    };
+    co_return co_await generate_descriptions(udas, describer, true);
 }
 
 description view(const data_dictionary::database& db, const sstring& ks, const sstring& name, bool with_internals) {
@@ -227,7 +210,8 @@ description view(const data_dictionary::database& db, const sstring& ks, const s
         throw exceptions::invalid_request_exception(format("Materialized view '{}' not found in keyspace '{}'", name, ks));
     }
 
-    return description(db.real_database(), *view->schema(), with_internals);
+    replica::schema_describe_helper describe_helper{db};
+    return view->schema()->describe(describe_helper, with_internals ? describe_option::STMTS_AND_INTERNALS : describe_option::STMTS);
 }
 
 description index(const data_dictionary::database& db, const sstring& ks, const sstring& name, bool with_internals) {
@@ -245,13 +229,37 @@ description index(const data_dictionary::database& db, const sstring& ks, const 
         }
     }
 
-    return description(db.real_database(), **idx, with_internals);
+    replica::schema_describe_helper describe_helper{db};
+    return (**idx).describe(describe_helper, with_internals ? describe_option::STMTS_AND_INTERNALS : describe_option::STMTS);
+}
+
+// `base_name` should be a table with enabled cdc
+std::optional<description> describe_cdc_log_table(const data_dictionary::database& db, const sstring& ks, const sstring& base_name) {
+    auto table = db.try_find_table(ks, cdc::log_name(base_name));
+    if (!table) {
+        dlogger.warn("Couldn't find cdc log table for base table {}.{}", ks, base_name);
+        return std::nullopt;
+    }
+
+    std::ostringstream os;
+    auto schema = table->schema();
+    replica::schema_describe_helper describe_helper{db};
+    schema->describe_alter_with_properties(describe_helper, os);
+
+    auto schema_desc = schema->describe(describe_helper, describe_option::NO_STMTS);
+    schema_desc.create_statement = std::move(os).str();
+    return schema_desc;
 }
 
 future<std::vector<description>> table(const data_dictionary::database& db, const sstring& ks, const sstring& name, bool with_internals) {
     auto table = db.try_find_table(ks, name);
     if (!table) {
         throw exceptions::invalid_request_exception(format("Table '{}' not found in keyspace '{}'", name, ks));
+    }
+    
+    auto s = validation::validate_column_family(db, ks, name);
+    if (s->is_view()) { 
+        throw exceptions::invalid_request_exception("Cannot use DESC TABLE on materialized View");
     }
 
     auto schema = table->schema();
@@ -260,11 +268,23 @@ future<std::vector<description>> table(const data_dictionary::database& db, cons
     std::vector<description> result;
 
     // table
-    result.push_back(description(db.real_database(), *schema, with_internals));
+    replica::schema_describe_helper describe_helper{db};
+    auto table_desc = schema->describe(describe_helper, with_internals ? describe_option::STMTS_AND_INTERNALS : describe_option::STMTS);
+    if (cdc::is_log_for_some_table(db.real_database(), ks, name)) {
+        // If the table the user wants to describe is a CDC log table, we want to print it as a CQL comment.
+        // This way, the user learns about the internals of the table, but they're also told not to execute it.
+        table_desc.create_statement = seastar::format(
+                "/* Do NOT execute this statement! It's only for informational purposes.\n"
+                "   A CDC log table is created automatically when the base is created.\n"
+                "\n{}\n"
+                "*/",
+                *table_desc.create_statement);
+    }
+    result.push_back(std::move(table_desc));
 
     // indexes
-    boost::sort(idxs, [] (const auto& a, const auto& b) {
-        return a.metadata().name() < b.metadata().name();
+    std::ranges::sort(idxs, std::ranges::less(), [] (const auto& a) {
+        return a.metadata().name();
     });
     for (const auto& idx: idxs) {
         result.push_back(index(db, ks, idx.metadata().name(), with_internals));
@@ -272,9 +292,7 @@ future<std::vector<description>> table(const data_dictionary::database& db, cons
     }
 
     //views
-    boost::sort(views, [] (const auto& a, const auto& b) {
-        return a->cf_name() < b->cf_name();
-    });
+    std::ranges::sort(views, std::ranges::less(), std::mem_fn(&schema::cf_name));
     for (const auto& v: views) {
         if(!is_index(db, v)) {
             result.push_back(view(db, ks, v->cf_name(), with_internals));
@@ -282,14 +300,22 @@ future<std::vector<description>> table(const data_dictionary::database& db, cons
         co_await coroutine::maybe_yield();
     }
 
+    if (schema->cdc_options().enabled()) {
+        auto cdc_log_alter = describe_cdc_log_table(db, ks, name);
+        if (cdc_log_alter) {
+            result.push_back(*cdc_log_alter);
+        }
+    }
+
     co_return result;
 }
 
 future<std::vector<description>> tables(const data_dictionary::database& db, const lw_shared_ptr<keyspace_metadata>& ks, std::optional<bool> with_internals = std::nullopt) {
-    auto tables = ks->tables();
-    boost::sort(tables, [] (const auto& a, const auto& b) {
-        return a->cf_name() < b->cf_name();
-    });
+    auto& replica_db = db.real_database();
+    auto tables = ks->tables() | std::views::filter([&replica_db] (const schema_ptr& s) {
+        return !cdc::is_log_for_some_table(replica_db, s->ks_name(), s->cf_name());
+    }) | std::ranges::to<std::vector<schema_ptr>>();
+    std::ranges::sort(tables, std::ranges::less(), std::mem_fn(&schema::cf_name));
 
     if (with_internals) {
         std::vector<description> result;
@@ -302,10 +328,10 @@ future<std::vector<description>> tables(const data_dictionary::database& db, con
         co_return result;
     }
 
-    auto& replica_db = db.real_database();
-    co_return boost::copy_range<std::vector<description>>(tables | boost::adaptors::transformed([&replica_db] (auto&& t) {
-        return description(replica_db, *t);
-    }));
+    replica::schema_describe_helper describe_helper{db};
+    co_return tables | std::views::transform([&describe_helper] (auto&& t) {
+        return t->describe(describe_helper, describe_option::NO_STMTS);
+    }) | std::ranges::to<std::vector>();
 }
 
 // DESCRIBE UTILITY
@@ -327,9 +353,9 @@ lw_shared_ptr<keyspace_metadata> get_keyspace_metadata(const data_dictionary::da
 }
 
 /**
- *  Lists `keyspace_element` for given keyspace
+ *  Lists keyspace elements for given keyspace
  *
- *  @return vector of `description` for specified `keyspace_element` in specified keyspace.
+ *  @return vector of `description` for the specified keyspace element type in the specified keyspace.
             Descriptions don't contain create_statements.
  *  @throw `invalid_request_exception` if there is no such keyspace
  */
@@ -338,11 +364,11 @@ future<std::vector<description>> list_elements(const data_dictionary::database& 
     auto& replica_db = db.real_database();
 
     switch (element) {
-    case element_type::type:         co_return co_await types(replica_db, ks_meta);
-    case element_type::function:     co_return co_await functions(replica_db, ks);
-    case element_type::aggregate:    co_return co_await aggregates(replica_db, ks);
+    case element_type::type:         co_return co_await types(replica_db, ks_meta, with_create_statement::no);
+    case element_type::function:     co_return co_await functions(replica_db, ks, with_create_statement::no);
+    case element_type::aggregate:    co_return co_await aggregates(replica_db, ks, with_create_statement::no);
     case element_type::table:        co_return co_await tables(db, ks_meta);
-    case element_type::keyspace:     co_return std::vector{keyspace(replica_db, ks_meta)}; //std::vector{description(ks, "keyspace", ks)};
+    case element_type::keyspace:     co_return std::vector{ks_meta->describe(replica_db, with_create_statement::no)};
     case element_type::view:
     case element_type::index:
         on_internal_error(dlogger, "listing of views and indexes is unsupported");
@@ -351,9 +377,9 @@ future<std::vector<description>> list_elements(const data_dictionary::database& 
 
 
 /**
- *  Describe specified `keyspace_element` in given keyspace
+ *  Describe specified keyspace element type in given keyspace
  *
- *  @return `description` of specified `keyspace_element` in specified keyspace.
+ *  @return `description` of the specified keyspace element type in the specified keyspace.
             Description contains create_statement.
  *  @throw `invalid_request_exception` if there is no such keyspace or there is no element with given name
  */
@@ -368,7 +394,7 @@ future<std::vector<description>> describe_element(const data_dictionary::databas
     case element_type::table:            co_return co_await table(db, ks, name, with_internals);
     case element_type::index:            co_return std::vector{index(db, ks, name, with_internals)};
     case element_type::view:             co_return std::vector{view(db, ks, name, with_internals)};
-    case element_type::keyspace:         co_return std::vector{keyspace(replica_db, ks_meta, true)};
+    case element_type::keyspace:         co_return std::vector{ks_meta->describe(replica_db, with_create_statement::yes)};
     }
 }
 
@@ -390,10 +416,10 @@ future<std::vector<description>> describe_all_keyspace_elements(const data_dicti
         result.insert(result.end(), elements.begin(), elements.end());
     };
 
-    result.push_back(keyspace(replica_db, ks_meta, true));
-    inserter(co_await types(replica_db, ks_meta, true));
-    inserter(co_await functions(replica_db, ks, true));
-    inserter(co_await aggregates(replica_db, ks, true));
+    result.push_back(ks_meta->describe(replica_db, with_create_statement::yes));
+    inserter(co_await types(replica_db, ks_meta, with_create_statement::yes));
+    inserter(co_await functions(replica_db, ks, with_create_statement::yes));
+    inserter(co_await aggregates(replica_db, ks, with_create_statement::yes));
     inserter(co_await tables(db, ks_meta, with_internals));
 
     co_return result; 
@@ -417,10 +443,10 @@ std::vector<lw_shared_ptr<column_specification>> get_element_column_specificatio
     return col_specs;
 }
 
-std::vector<std::vector<bytes_opt>> serialize_descriptions(std::vector<description>&& descs) {
-    return boost::copy_range<std::vector<std::vector<bytes_opt>>>(descs | boost::adaptors::transformed([] (const description& desc) {
-        return desc.serialize();
-    }));
+std::vector<std::vector<bytes_opt>> serialize_descriptions(std::vector<description>&& descs, bool serialize_create_statement = true) {
+    return descs | std::views::transform([serialize_create_statement] (const description& desc) {
+        return desc.serialize(serialize_create_statement);
+    }) | std::ranges::to<std::vector>();
 }
 
 
@@ -445,7 +471,7 @@ describe_statement::execute(cql3::query_processor& qp, service::query_state& sta
     auto& client_state = state.get_client_state();
 
     auto descriptions = co_await describe(qp, client_state);
-    auto result = std::make_unique<result_set>(get_column_specifications(client_state));
+    auto result = std::make_unique<result_set>(get_column_specifications(qp.proxy().local_db(), client_state));
 
     for (auto&& row: descriptions) {
         result->add_row(std::move(row));
@@ -475,9 +501,9 @@ std::vector<lw_shared_ptr<column_specification>> cluster_describe_statement::get
     };
 }
 
-std::vector<lw_shared_ptr<column_specification>> cluster_describe_statement::get_column_specifications(const service::client_state& client_state) const {
+std::vector<lw_shared_ptr<column_specification>> cluster_describe_statement::get_column_specifications(replica::database& db, const service::client_state& client_state) const {
     auto spec = get_column_specifications();
-    if (should_add_range_ownership(client_state)) {
+    if (should_add_range_ownership(db, client_state)) {
         auto map_type = range_ownership_type().second;
         spec.push_back(
             make_lw_shared<column_specification>("system", "describe", ::make_shared<column_identifier>("range_ownership", true), map_type)
@@ -487,28 +513,35 @@ std::vector<lw_shared_ptr<column_specification>> cluster_describe_statement::get
     return spec;
 }
 
-bool cluster_describe_statement::should_add_range_ownership(const service::client_state& client_state) const {
+bool cluster_describe_statement::should_add_range_ownership(replica::database& db, const service::client_state& client_state) const {
     auto ks = client_state.get_raw_keyspace();
-    return !ks.empty() && !is_system_keyspace(ks) && !is_internal_keyspace(ks);
+    //TODO: produce range ownership for tables using tablets too
+    bool uses_tablets = false;
+    try {
+        uses_tablets = !ks.empty() && db.find_keyspace(ks).uses_tablets();
+    } catch (const data_dictionary::no_such_keyspace&) {
+        // ignore
+    }
+    return !ks.empty() && !is_system_keyspace(ks) && !is_internal_keyspace(ks) && !uses_tablets;
 }
 
 future<bytes_opt> cluster_describe_statement::range_ownership(const service::storage_proxy& proxy, const sstring& ks) const {
     auto [list_type, map_type] = range_ownership_type();
 
     auto ranges = co_await proxy.describe_ring(ks);
-    boost::sort(ranges, [] (const dht::token_range_endpoints& l, const dht::token_range_endpoints& r) {
-        return std::stol(l._start_token) < std::stol(r._start_token);
+    std::ranges::sort(ranges, std::ranges::less(), [] (const dht::token_range_endpoints& r) {
+        return std::stol(r._start_token);
     });
 
-    auto ring_ranges = boost::copy_range<std::vector<std::pair<data_value, data_value>>>(ranges | boost::adaptors::transformed([list_type = std::move(list_type)] (auto& range) {
+    auto ring_ranges = ranges | std::views::transform([list_type = std::move(list_type)] (auto& range) {
         auto token_end = data_value(range._end_token);
-        auto endpoints = boost::copy_range<std::vector<data_value>>(range._endpoints | boost::adaptors::transformed([] (const auto& endpoint) {
+        auto endpoints = range._endpoints | std::views::transform([] (const auto& endpoint) {
             return data_value(endpoint);
-        }));
+        }) | std::ranges::to<std::vector>();
         auto endpoints_list = make_list_value(list_type, endpoints);
 
         return std::pair(token_end, endpoints_list);
-    }));
+    }) | std::ranges::to<std::vector>();
 
     co_return make_map_value(map_type, map_type_impl::native_type(
         std::make_move_iterator(ring_ranges.begin()),
@@ -530,7 +563,7 @@ future<std::vector<std::vector<bytes_opt>>> cluster_describe_statement::describe
         {snitch}
     };
 
-    if (should_add_range_ownership(client_state)) {
+    if (should_add_range_ownership(proxy.local_db(), client_state)) {
         auto ro_map = co_await range_ownership(proxy, client_state.get_raw_keyspace());
         row.push_back(std::move(ro_map));
     }
@@ -540,9 +573,9 @@ future<std::vector<std::vector<bytes_opt>>> cluster_describe_statement::describe
 }
 
 // SCHEMA DESCRIBE STATEMENT
-schema_describe_statement::schema_describe_statement(bool full_schema, bool with_internals)
+schema_describe_statement::schema_describe_statement(bool full_schema, bool with_hashed_passwords, bool with_internals)
     : describe_statement()
-    , _config(schema_desc{full_schema})
+    , _config(schema_desc{.full_schema = full_schema, .with_hashed_passwords = with_hashed_passwords})
     , _with_internals(with_internals) {}
 
 schema_describe_statement::schema_describe_statement(std::optional<sstring> keyspace, bool only, bool with_internals)
@@ -559,12 +592,37 @@ future<std::vector<std::vector<bytes_opt>>> schema_describe_statement::describe(
 
     auto result = co_await std::visit(overloaded_functor{
         [&] (const schema_desc& config) -> future<std::vector<description>> {
+            auto& auth_service = *client_state.get_auth_service();
+
+            if (config.with_hashed_passwords) {
+                const auto maybe_user = client_state.user();
+                if (!maybe_user || !co_await auth::has_superuser(auth_service, *maybe_user)) {
+                    co_await coroutine::return_exception(exceptions::unauthorized_exception(
+                            "DESCRIBE SCHEMA WITH INTERNALS AND PASSWORDS can only be issued by a superuser"));
+                }
+            }
+
             auto keyspaces = config.full_schema ? db.get_all_keyspaces() : db.get_user_keyspaces();
             std::vector<description> schema_result;
 
             for (auto&& ks: keyspaces) {
+                if (!config.full_schema && db.extensions().is_extension_internal_keyspace(ks)) {
+                    continue;
+                }
                 auto ks_result = co_await describe_all_keyspace_elements(db, ks, _with_internals);
                 schema_result.insert(schema_result.end(), ks_result.begin(), ks_result.end());
+            }
+
+            if (_with_internals) {
+                // The order is important here. We need to first restore auth
+                // because we can only attach a service level to an existing role.
+                auto auth_descs = co_await auth_service.describe_auth(config.with_hashed_passwords);
+                auto service_level_descs = co_await client_state.get_service_level_controller().describe_service_levels();
+
+                schema_result.insert(schema_result.end(), std::make_move_iterator(auth_descs.begin()),
+                        std::make_move_iterator(auth_descs.end()));
+                schema_result.insert(schema_result.end(), std::make_move_iterator(service_level_descs.begin()),
+                        std::make_move_iterator(service_level_descs.end()));
             }
 
             co_return schema_result;
@@ -577,7 +635,7 @@ future<std::vector<std::vector<bytes_opt>>> schema_describe_statement::describe(
 
             if (config.only_keyspace) {
                 auto ks_meta = get_keyspace_metadata(db, ks);
-                auto ks_desc = keyspace(db.real_database(), ks_meta, true);
+                auto ks_desc = ks_meta->describe(db.real_database(), with_create_statement::yes);
 
                 co_return std::vector{ks_desc};
             } else {
@@ -609,7 +667,7 @@ future<std::vector<std::vector<bytes_opt>>> listing_describe_statement::describe
         keyspaces.push_back(raw_ks);
     } else {
         keyspaces = db.get_all_keyspaces();
-        boost::sort(keyspaces);
+        std::ranges::sort(keyspaces);
     }
 
     std::vector<description> result;
@@ -619,7 +677,7 @@ future<std::vector<std::vector<bytes_opt>>> listing_describe_statement::describe
         co_await coroutine::maybe_yield();
     }
 
-    co_return serialize_descriptions(std::move(result));
+    co_return serialize_descriptions(std::move(result), false);
 }
 
 // ELEMENT DESCRIBE STATEMENT
@@ -698,24 +756,36 @@ future<std::vector<std::vector<bytes_opt>>> generic_describe_statement::describe
         co_return serialize_descriptions({type(replica_db, ks_meta, _name)});
     }
 
-    auto uf = functions::functions::find(functions::function_name(ks_name, _name));
+    auto uf = functions::instance().find(functions::function_name(ks_name, _name));
     if (!uf.empty()) {
-        auto udfs = boost::copy_range<std::vector<shared_ptr<const keyspace_element>>>(uf | boost::adaptors::transformed([] (const auto& f) {
-            return dynamic_pointer_cast<const functions::user_function>(f.second);
-        }) | boost::adaptors::filtered([] (const auto& f) {
+        auto udfs = uf | std::views::transform([] (const auto& f) {
+            const auto& [function_name, function_ptr] = f;
+            return dynamic_pointer_cast<const functions::user_function>(function_ptr);
+        }) | std::views::filter([] (shared_ptr<const functions::user_function> f) {
             return f != nullptr;
-        }));
+        });
+
+        auto udf_describer = [] (shared_ptr<const functions::user_function> udf) {
+            return udf->describe(with_create_statement::yes);
+        };
+
         if (!udfs.empty()) {
-            co_return serialize_descriptions(co_await generate_descriptions(replica_db, udfs, true));
+            co_return serialize_descriptions(co_await generate_descriptions(udfs, udf_describer, true));
         }
 
-        auto udas = boost::copy_range<std::vector<shared_ptr<const keyspace_element>>>(uf | boost::adaptors::transformed([] (const auto& f) {
-            return dynamic_pointer_cast<const functions::user_aggregate>(f.second);
-        }) | boost::adaptors::filtered([] (const auto& f) {
+        auto udas = uf | std::views::transform([] (const auto& f) {
+            const auto& [function_name, function_ptr] = f;
+            return dynamic_pointer_cast<const functions::user_aggregate>(function_ptr);
+        }) | std::views::filter([] (shared_ptr<const functions::user_aggregate> f) {
             return f != nullptr;
-        }));
+        });
+
+        auto uda_describer = [] (shared_ptr<const functions::user_aggregate> uda) {
+            return uda->describe(with_create_statement::yes);
+        };
+
         if (!udas.empty()) {
-            co_return serialize_descriptions(co_await generate_descriptions(replica_db, udas, true));
+            co_return serialize_descriptions(co_await generate_descriptions(udas, uda_describer, true));
         }
     }
 
@@ -728,8 +798,26 @@ using ds = describe_statement;
 
 describe_statement::describe_statement(ds::describe_config config) : _config(std::move(config)), _with_internals(false) {}
 
-void describe_statement::with_internals_details() {
+void describe_statement::with_internals_details(bool with_hashed_passwords) {
     _with_internals = internals(true);
+
+    if (with_hashed_passwords && !std::holds_alternative<describe_schema>(_config)) {
+        throw exceptions::invalid_request_exception{"Option WITH PASSWORDS is only allowed with DESC SCHEMA"};
+    }
+
+    if (std::holds_alternative<describe_schema>(_config)) {
+        std::get<describe_schema>(_config).with_hashed_passwords = with_hashed_passwords;
+    }
+}
+
+audit::statement_category
+describe_statement::category() const {
+    return audit::statement_category::QUERY;
+}
+
+audit::audit_info_ptr
+describe_statement::audit_info() const {
+    return audit::audit::create_audit_info(category(), "system", "");
 }
 
 std::unique_ptr<prepared_statement> describe_statement::prepare(data_dictionary::database db, cql_stats &stats) {
@@ -739,7 +827,7 @@ std::unique_ptr<prepared_statement> describe_statement::prepare(data_dictionary:
             return ::make_shared<cluster_describe_statement>();
         },
         [&] (const describe_schema& cfg) -> ::shared_ptr<statements::describe_statement> {
-            return ::make_shared<schema_describe_statement>(cfg.full_schema, internals);
+            return ::make_shared<schema_describe_statement>(cfg.full_schema, cfg.with_hashed_passwords, internals);
         },
         [&] (const describe_keyspace& cfg) -> ::shared_ptr<statements::describe_statement> {
             return ::make_shared<schema_describe_statement>(std::move(cfg.keyspace), cfg.only_keyspace, internals);
@@ -754,7 +842,7 @@ std::unique_ptr<prepared_statement> describe_statement::prepare(data_dictionary:
             return ::make_shared<generic_describe_statement>(std::move(cfg.keyspace), std::move(cfg.name), internals);
         }
     }, _config);
-    return std::make_unique<prepared_statement>(desc_stmt);
+    return std::make_unique<prepared_statement>(audit_info(), desc_stmt);
 }
 
 std::unique_ptr<describe_statement> describe_statement::cluster() {

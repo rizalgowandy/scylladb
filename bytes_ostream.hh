@@ -3,20 +3,63 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <boost/range/iterator_range.hpp>
-
 #include "bytes.hh"
+#include "utils/assert.hh"
 #include "utils/managed_bytes.hh"
-#include "utils/hashing.hh"
 #include <seastar/core/simple-stream.hh>
 #include <seastar/core/loop.hh>
 #include <bit>
 #include <concepts>
+#include <ranges>
+
+
+class bytes_ostream_fragment_iterator {
+public:
+    using iterator_category = std::input_iterator_tag;
+    using iterator_concept = std::input_iterator_tag;
+    using value_type = bytes_view;
+    using difference_type = std::ptrdiff_t;
+    using pointer = bytes_view*;
+    using reference = bytes_view&;
+public:
+    using chunk = multi_chunk_blob_storage;
+    struct implementation {
+        chunk* current_chunk;
+    };
+private:
+    chunk* _current = nullptr;
+public:
+    bytes_ostream_fragment_iterator() = default;
+    bytes_ostream_fragment_iterator(chunk* current) : _current(current) {}
+    bytes_ostream_fragment_iterator(const bytes_ostream_fragment_iterator&) = default;
+    bytes_ostream_fragment_iterator& operator=(const bytes_ostream_fragment_iterator&) = default;
+    bytes_view operator*() const {
+        return { _current->data, _current->frag_size };
+    }
+    bytes_view operator->() const {
+        return *(*this);
+    }
+    bytes_ostream_fragment_iterator& operator++() {
+        _current = _current->next;
+        return *this;
+    }
+    bytes_ostream_fragment_iterator operator++(int) {
+        bytes_ostream_fragment_iterator tmp(*this);
+        ++(*this);
+        return tmp;
+    }
+    bool operator==(const bytes_ostream_fragment_iterator&) const = default;
+    implementation extract_implementation() const {
+        return implementation {
+            .current_chunk = _current,
+        };
+    }
+};
 
 /**
  * Utility for writing data into a buffer when its final size is not known up front.
@@ -37,55 +80,16 @@ private:
     //       and chunk::frag_size refers to the currently occupied space in the chunk.
     //       After building, the first chunk::size is the whole object size, and chunk::frag_size
     //       doesn't change. This fits with managed_bytes interpretation.
-    using chunk = blob_storage;
+    using chunk = multi_chunk_blob_storage;
     static constexpr size_type default_chunk_size{512};
     static constexpr size_type max_alloc_size() { return 128 * 1024; }
 private:
-    blob_storage::ref_type _begin;
+    chunk::ref_type _begin;
     chunk* _current;
     size_type _size;
     size_type _initial_chunk_size = default_chunk_size;
 public:
-    class fragment_iterator {
-    public:
-        using iterator_category = std::input_iterator_tag;
-        using value_type = bytes_view;
-        using difference_type = std::ptrdiff_t;
-        using pointer = bytes_view*;
-        using reference = bytes_view&;
-
-        struct implementation {
-            blob_storage* current_chunk;
-        };
-    private:
-        chunk* _current = nullptr;
-    public:
-        fragment_iterator() = default;
-        fragment_iterator(chunk* current) : _current(current) {}
-        fragment_iterator(const fragment_iterator&) = default;
-        fragment_iterator& operator=(const fragment_iterator&) = default;
-        bytes_view operator*() const {
-            return { _current->data, _current->frag_size };
-        }
-        bytes_view operator->() const {
-            return *(*this);
-        }
-        fragment_iterator& operator++() {
-            _current = _current->next;
-            return *this;
-        }
-        fragment_iterator operator++(int) {
-            fragment_iterator tmp(*this);
-            ++(*this);
-            return tmp;
-        }
-        bool operator==(const fragment_iterator&) const = default;
-        implementation extract_implementation() const {
-            return implementation {
-                .current_chunk = _current,
-            };
-        }
-    };
+    using fragment_iterator = bytes_ostream_fragment_iterator;
     using const_iterator = fragment_iterator;
 
     class output_iterator {
@@ -270,7 +274,7 @@ public:
 
     // Call only when is_linearized()
     bytes_view view() const {
-        assert(is_linearized());
+        SCYLLA_ASSERT(is_linearized());
         if (!_current) {
             return bytes_view();
         }
@@ -358,7 +362,7 @@ public:
 
     output_iterator write_begin() { return output_iterator(*this); }
 
-    boost::iterator_range<fragment_iterator> fragments() const {
+    std::ranges::subrange<fragment_iterator> fragments() const {
         return { begin(), end() };
     }
 

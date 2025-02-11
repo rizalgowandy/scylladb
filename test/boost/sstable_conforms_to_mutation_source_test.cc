@@ -3,22 +3,22 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
+#include "utils/assert.hh"
 #include <boost/test/unit_test.hpp>
 #include "test/lib/scylla_test_case.hh"
 #include <seastar/testing/thread_test_case.hh>
-#include "test/boost/sstable_test.hh"
 #include <seastar/core/thread.hh>
 #include "sstables/sstables.hh"
 #include "test/lib/mutation_source_test.hh"
 #include "test/lib/sstable_utils.hh"
-#include "row_cache.hh"
+#include "db/row_cache.hh"
 #include "test/lib/simple_schema.hh"
 #include "partition_slice_builder.hh"
-#include "test/lib/flat_mutation_reader_assertions.hh"
+#include "test/lib/mutation_reader_assertions.hh"
 #include "test/lib/random_utils.hh"
 #include "test/lib/random_schema.hh"
 
@@ -36,8 +36,8 @@ mutation_source make_sstable_mutation_source(sstables::test_env& env, schema_ptr
     return sst->as_mutation_source();
 }
 
-static void consume_all(flat_mutation_reader_v2& rd) {
-    while (auto mfopt = rd().get0()) {}
+static void consume_all(mutation_reader& rd) {
+    while (auto mfopt = rd().get()) {}
 }
 
 // It is assumed that src won't change.
@@ -138,7 +138,7 @@ SEASTAR_TEST_CASE(test_sstable_conforms_to_mutation_source_md_large) {
     return test_sstable_conforms_to_mutation_source(writable_sstable_versions[1], block_sizes[2]);
 }
 
-// This assert makes sure we don't miss writable vertions
+// This SCYLLA_ASSERT makes sure we don't miss writable vertions
 static_assert(writable_sstable_versions.size() == 3);
 
 // `keys` may contain repetitions.
@@ -203,10 +203,6 @@ SEASTAR_THREAD_TEST_CASE(test_sstable_reversing_reader_random_schema) {
 
     auto muts = tests::generate_random_mutations(random_schema).get();
 
-    // FIXME: workaround for #9352. The index pages for reversed source would sometimes be different
-    // from the forward source, causing one source to hit the bug from #9352 but not the other.
-    muts.erase(std::remove_if(muts.begin(), muts.end(), [] (auto& m) { return m.decorated_key().token() == dht::token::from_int64(0); }), muts.end());
-
     std::vector<mutation> reversed_muts;
     for (auto& m : muts) {
         reversed_muts.push_back(reverse(m));
@@ -224,7 +220,7 @@ SEASTAR_THREAD_TEST_CASE(test_sstable_reversing_reader_random_schema) {
 
     std::vector<query::clustering_range> ranges;
     for (auto& r: fwd_ranges) {
-        assert(position_in_partition::less_compare(*query_schema)(r.start(), r.end()));
+        SCYLLA_ASSERT(position_in_partition::less_compare(*query_schema)(r.start(), r.end()));
         auto cr_opt = position_range_to_clustering_range(r, *query_schema);
         if (!cr_opt) {
             continue;
@@ -236,11 +232,14 @@ SEASTAR_THREAD_TEST_CASE(test_sstable_reversing_reader_random_schema) {
         .with_ranges(ranges)
         .build();
 
-    auto rev_slice = native_reverse_slice_to_legacy_reverse_slice(*query_schema, slice);
-    rev_slice.options.set(query::partition_slice::option::reversed);
-
-    auto rev_full_slice = native_reverse_slice_to_legacy_reverse_slice(*query_schema, query_schema->full_slice());
-    rev_full_slice.options.set(query::partition_slice::option::reversed);
+    // Clustering ranges of the slice are already reversed in relation to the reversed
+    // query schema. No need to reverse it. Just toggle the reverse option.
+    auto rev_slice = partition_slice_builder(*query_schema, slice)
+            .with_option<query::partition_slice::option::reversed>()
+            .build();
+    auto rev_full_slice = partition_slice_builder(*query_schema, query_schema->full_slice())
+            .with_option<query::partition_slice::option::reversed>()
+            .build();
 
     sstables::test_env::do_with_async([&, version = writable_sstable_versions[1]] (sstables::test_env& env) {
 

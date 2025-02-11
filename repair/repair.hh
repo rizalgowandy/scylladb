@@ -3,34 +3,29 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <unordered_set>
 #include <unordered_map>
 #include <exception>
-#include <absl/container/btree_set.h>
+#include <fmt/core.h>
 
-#include <seastar/core/abort_source.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/condition-variable.hh>
-#include <seastar/core/gate.hh>
 
+#include "gms/inet_address.hh"
 #include "locator/abstract_replication_strategy.hh"
 #include "replica/database_fwd.hh"
 #include "mutation/frozen_mutation.hh"
-#include "utils/UUID.hh"
 #include "utils/hash.hh"
-#include "streaming/stream_reason.hh"
-#include "locator/token_metadata.hh"
 #include "repair/hash.hh"
-#include "node_ops/id.hh"
+#include "utils/stall_free.hh"
 #include "repair/sync_boundary.hh"
 #include "tasks/types.hh"
+#include "gms/gossip_address_map.hh"
 
 namespace tasks {
 namespace repair {
@@ -45,9 +40,8 @@ class database;
 class repair_service;
 namespace db {
     namespace view {
-        class view_update_generator;
+        class view_builder;
     }
-    class system_distributed_keyspace;
 }
 namespace netw { class messaging_service; }
 namespace service {
@@ -85,6 +79,11 @@ struct repair_uniq_id {
 };
 std::ostream& operator<<(std::ostream& os, const repair_uniq_id& x);
 
+// If the repair master sets the dst_cpu_id to repair_unspecified_shard. It
+// means the repair master does not choose shard id for the repair follower.
+// The repair follower should choose the shard id itself.
+constexpr shard_id repair_unspecified_shard = shard_id(-1);
+
 // NOTE: repair_start() can be run on any node, but starts a node-global
 // operation.
 // repair_start() starts the requested repair on this node. It returns an
@@ -92,7 +91,7 @@ std::ostream& operator<<(std::ostream& os, const repair_uniq_id& x);
 // repair_get_status(). The returned future<int> becomes available quickly,
 // as soon as repair_get_status() can be used - it doesn't wait for the
 // repair to complete.
-future<int> repair_start(seastar::sharded<repair_service>& repair,
+future<int> repair_start(seastar::sharded<repair_service>& repair, sharded<gms::gossip_address_map>& am,
         sstring keyspace, std::unordered_map<sstring, sstring> options);
 
 // TODO: Have repair_progress contains a percentage progress estimator
@@ -122,11 +121,11 @@ public:
     uint64_t tx_row_bytes = 0;
     uint64_t rx_row_bytes = 0;
 
-    std::map<gms::inet_address, uint64_t> row_from_disk_bytes;
-    std::map<gms::inet_address, uint64_t> row_from_disk_nr;
+    std::map<locator::host_id, uint64_t> row_from_disk_bytes;
+    std::map<locator::host_id, uint64_t> row_from_disk_nr;
 
-    std::map<gms::inet_address, uint64_t> tx_row_nr_peer;
-    std::map<gms::inet_address, uint64_t> rx_row_nr_peer;
+    std::map<locator::host_id, uint64_t> tx_row_nr_peer;
+    std::map<locator::host_id, uint64_t> rx_row_nr_peer;
 
     lowres_clock::time_point start_time = lowres_clock::now();
 
@@ -137,16 +136,18 @@ public:
 
 class repair_neighbors {
 public:
-    std::vector<gms::inet_address> all;
-    std::vector<gms::inet_address> mandatory;
+    std::vector<locator::host_id> all;
+    std::vector<locator::host_id> mandatory;
+    std::unordered_map<locator::host_id, shard_id> shard_map;
     repair_neighbors() = default;
-    explicit repair_neighbors(std::vector<gms::inet_address> a)
+    explicit repair_neighbors(std::vector<locator::host_id> a)
         : all(std::move(a)) {
     }
-    repair_neighbors(std::vector<gms::inet_address> a, std::vector<gms::inet_address> m)
+    repair_neighbors(std::vector<locator::host_id> a, std::vector<locator::host_id> m)
         : all(std::move(a))
         , mandatory(std::move(m)) {
     }
+    repair_neighbors(std::vector<locator::host_id> nodes, std::vector<shard_id> shards);
 };
 
 future<uint64_t> estimate_partitions(seastar::sharded<replica::database>& db, const sstring& keyspace,
@@ -178,7 +179,7 @@ struct get_sync_boundary_response {
 using get_combined_row_hash_response = repair_hash;
 
 struct node_repair_meta_id {
-    gms::inet_address ip;
+    locator::host_id ip;
     uint32_t repair_meta_id;
     bool operator==(const node_repair_meta_id& x) const {
         return x.ip == ip && x.repair_meta_id == repair_meta_id;
@@ -202,6 +203,7 @@ public:
     partition_key& get_key() { return _key; }
     std::list<frozen_mutation_fragment>& get_mutation_fragments() { return _mfs; }
     void push_mutation_fragment(frozen_mutation_fragment mf) { _mfs.push_back(std::move(mf)); }
+    future<> clear_gently() { return utils::clear_gently(_mfs); };
 };
 
 using repair_row_on_wire = partition_key_and_mutation_fragments;
@@ -233,7 +235,6 @@ enum class row_level_diff_detect_algorithm : uint8_t {
     send_full_set_rpc_stream,
 };
 
-std::ostream& operator<<(std::ostream& out, row_level_diff_detect_algorithm algo);
 std::string_view format_as(row_level_diff_detect_algorithm);
 
 struct repair_update_system_table_request {
@@ -250,12 +251,24 @@ struct repair_update_system_table_response {
 
 struct repair_flush_hints_batchlog_request {
     tasks::task_id repair_uuid;
-    std::list<gms::inet_address> target_nodes;
+    std::list<gms::inet_address> unused;
     std::chrono::seconds hints_timeout;
     std::chrono::seconds batchlog_timeout;
 };
 
 struct repair_flush_hints_batchlog_response {
+    gc_clock::time_point flush_time;
+};
+
+struct tablet_repair_task_meta {
+    sstring keyspace_name;
+    sstring table_name;
+    table_id tid;
+    shard_id master_shard_id;
+    dht::token_range range;
+    repair_neighbors neighbors;
+    locator::tablet_replica_set replicas;
+    locator::effective_replication_map_ptr erm;
 };
 
 namespace std {
@@ -271,3 +284,9 @@ struct hash<node_repair_meta_id> {
 };
 
 }
+
+template <> struct fmt::formatter<row_level_diff_detect_algorithm> : fmt::formatter<string_view> {
+    auto format(row_level_diff_detect_algorithm algo, fmt::format_context& ctx) const {
+        return formatter<string_view>::format(format_as(algo), ctx);
+    }
+};

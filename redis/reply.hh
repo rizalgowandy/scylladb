@@ -3,18 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include "bytes.hh"
-#include <seastar/core/sharded.hh>
+#include "bytes_fwd.hh"
+#include <map>
+#include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
-#include <seastar/core/print.hh>
 #include <seastar/core/scattered_message.hh>
 #include "redis/exceptions.hh"
-#include "utils/fmt-compat.hh"
 
 namespace redis {
 

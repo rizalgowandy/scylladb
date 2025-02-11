@@ -5,14 +5,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include <seastar/core/shared_ptr.hh>
-#include "utils/to_string.hh"
-#include "exceptions/exceptions.hh"
 #include "index/secondary_index_manager.hh"
 #include "cql3/expr/expression.hh"
 #include "cql3/statements/bound.hh"
@@ -90,10 +89,10 @@ public:
      */
     void merge(const bounds_slice& other) {
         if (has_bound(statements::bound::START)) {
-            assert(!other.has_bound(statements::bound::START));
+            SCYLLA_ASSERT(!other.has_bound(statements::bound::START));
             _bounds[get_idx(statements::bound::END)] = other._bounds[get_idx(statements::bound::END)];
         } else {
-            assert(!other.has_bound(statements::bound::END));
+            SCYLLA_ASSERT(!other.has_bound(statements::bound::END));
             _bounds[get_idx(statements::bound::START)] = other._bounds[get_idx(statements::bound::START)];
         }
     }

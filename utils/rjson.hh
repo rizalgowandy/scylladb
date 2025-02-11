@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -26,8 +26,11 @@
  * or calling Size() on a non-array value.
  */
 
+#include <iostream>
+#include <map>
 #include <string>
-#include <stdexcept>
+#include <string_view>
+#include <type_traits>
 #include "utils/base64.hh"
 
 #include <seastar/core/future.hh>
@@ -54,7 +57,7 @@ public:
 // 2. assert() crashes a program
 // Fortunately, the default policy can be overridden, and so rapidjson errors will
 // throw an rjson::error exception instead.
-#define RAPIDJSON_ASSERT(x) do { if (!(x)) throw rjson::error(std::string("JSON error: condition not met: ") + #x); } while (0)
+#define RAPIDJSON_ASSERT(x) do { if (!(x)) throw rjson::error(fmt::format("JSON assert failed on condition '{}', at: {}", #x, current_backtrace_tasklocal())); } while (0)
 // This macro is used for functions which are called for every json char making it
 // quite costly if not inlined, by default rapidjson only enables it if NDEBUG
 // is defined which isn't the case for us.
@@ -63,7 +66,6 @@ public:
 #include <rapidjson/document.h>
 #include <rapidjson/writer.h>
 #include <rapidjson/stringbuffer.h>
-#include <rapidjson/error/en.h>
 #include <rapidjson/allocators.h>
 #include <rapidjson/ostreamwrapper.h>
 #include <seastar/core/sstring.hh>
@@ -362,7 +364,7 @@ inline bytes base64_decode(const value& v) {
     return ::base64_decode(std::string_view(v.GetString(), v.GetStringLength()));
 }
 
-// A writer which allows writing json into an std::ostream in a streamin manner.
+// A writer which allows writing json into an std::ostream in a streaming manner.
 //
 // It is a wrapper around rapidjson::Writer, with a more convenient API.
 class streaming_writer {
@@ -393,10 +395,39 @@ public:
     bool EndObject(rapidjson::SizeType memberCount = 0) { return _writer.EndObject(memberCount); }
     bool StartArray() { return _writer.StartArray(); }
     bool EndArray(rapidjson::SizeType elementCount = 0) { return _writer.EndArray(elementCount); }
+
+    template<typename U>
+    bool Write(U v) {
+        using T = std::remove_cvref_t<U>;
+        if constexpr (std::same_as<T, bool>) {
+            return Bool(v);
+        } else if constexpr (std::same_as<T, int>) {
+            return Int(v);
+        } else if constexpr (std::same_as<T, unsigned>) {
+            return Uint(v);
+        } else if constexpr (std::same_as<T, int64_t>) {
+            return Int64(v);
+        } else if constexpr (std::same_as<T, uint64_t>) {
+            return Uint64(v);
+        } else if constexpr (std::same_as<T, double>) {
+            return Double(v);
+        } else if constexpr (std::convertible_to<T, std::string_view>) {
+            return String(v);
+        }
+    }
 };
+
+inline bool is_leaf(const rjson::value& value) {
+    return !value.IsObject() && !value.IsArray();
+}
+
+future<> destroy_gently(rjson::value&& value);
 
 } // end namespace rjson
 
-namespace std {
-std::ostream& operator<<(std::ostream& os, const rjson::value& v);
-}
+template <> struct fmt::formatter<rjson::value> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const rjson::value& v, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", rjson::print(v));
+    }
+};

@@ -5,11 +5,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include <seastar/core/coroutine.hh>
 #include "cql3/statements/drop_keyspace_statement.hh"
+#include "auth/common.hh"
+#include "auth/service.hh"
 #include "cql3/statements/prepared_statement.hh"
 #include "cql3/query_processor.hh"
 #include "service/migration_manager.hh"
@@ -36,9 +38,6 @@ future<> drop_keyspace_statement::check_access(query_processor& qp, const servic
 void drop_keyspace_statement::validate(query_processor&, const service::client_state& state) const
 {
     warn(unimplemented::cause::VALIDATION);
-#if 0
-    ThriftValidation.validateKeyspaceNotSystem(keyspace);
-#endif
 }
 
 const sstring& drop_keyspace_statement::keyspace() const
@@ -46,13 +45,12 @@ const sstring& drop_keyspace_statement::keyspace() const
     return _keyspace;
 }
 
-future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>>
-drop_keyspace_statement::prepare_schema_mutations(query_processor& qp, api::timestamp_type ts) const {
-    std::vector<mutation> m;
+future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, cql3::cql_warnings_vec>> drop_keyspace_statement::prepare_schema_mutations(query_processor& qp, service::query_state& state, const query_options& options, service::group0_batch& mc) const {
     ::shared_ptr<cql_transport::event::schema_change> ret;
 
     try {
-        m = co_await service::prepare_keyspace_drop_announcement(qp.db().real_database(), _keyspace, ts);
+        auto muts = co_await service::prepare_keyspace_drop_announcement(qp.db().real_database(), _keyspace, mc.write_timestamp());
+        mc.add_mutations(std::move(muts));
 
         using namespace cql_transport;
         ret = ::make_shared<event::schema_change>(
@@ -65,12 +63,18 @@ drop_keyspace_statement::prepare_schema_mutations(query_processor& qp, api::time
         }
     }
 
-    co_return std::make_tuple(std::move(ret), std::move(m), std::vector<sstring>());
+    if (!auth::legacy_mode(qp)) {
+        const auto& as = *state.get_client_state().get_auth_service();
+        co_await auth::revoke_all(as, auth::make_data_resource(_keyspace), mc);
+        co_await auth::revoke_all(as, auth::make_functions_resource(_keyspace), mc);
+    }
+
+    co_return std::make_tuple(std::move(ret), std::vector<sstring>());
 }
 
 std::unique_ptr<cql3::statements::prepared_statement>
 drop_keyspace_statement::prepare(data_dictionary::database db, cql_stats& stats) {
-    return std::make_unique<prepared_statement>(make_shared<drop_keyspace_statement>(*this));
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<drop_keyspace_statement>(*this));
 }
 
 }

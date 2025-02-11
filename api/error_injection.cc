@@ -3,14 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "api/api-doc/error_injection.json.hh"
-#include "api/api.hh"
-
+#include "api/api_init.hh"
 #include <seastar/http/exception.hh>
-#include "log.hh"
 #include "utils/error_injection.hh"
 #include "utils/rjson.hh"
 #include <seastar/core/future-util.hh>
@@ -24,7 +22,7 @@ namespace hf = httpd::error_injection_json;
 void set_error_injection(http_context& ctx, routes& r) {
 
     hf::enable_injection.set(r, [](std::unique_ptr<request> req) {
-        sstring injection = req->param["injection"];
+        sstring injection = req->get_path_param("injection");
         bool one_shot = req->get_query_param("one_shot") == "True";
         auto params = req->content;
 
@@ -56,12 +54,38 @@ void set_error_injection(http_context& ctx, routes& r) {
     });
 
     hf::disable_injection.set(r, [](std::unique_ptr<request> req) {
-        sstring injection = req->param["injection"];
+        sstring injection = req->get_path_param("injection");
 
         auto& errinj = utils::get_local_injector();
         return errinj.disable_on_all(injection).then([] {
             return make_ready_future<json::json_return_type>(json::json_void());
         });
+    });
+
+    hf::read_injection.set(r, [](std::unique_ptr<request> req) -> future<json::json_return_type> {
+        const sstring injection = req->get_path_param("injection");
+
+        std::vector<error_injection_json::error_injection_info> error_injection_infos(smp::count, error_injection_json::error_injection_info{});
+
+        co_await smp::invoke_on_all([&] {
+            auto& info = error_injection_infos[this_shard_id()];
+            auto& errinj = utils::get_local_injector();
+            const auto enabled = errinj.is_enabled(injection);
+            info.enabled = enabled;
+            if (!enabled) {
+                return;
+            }
+            std::vector<error_injection_json::mapper> parameters;
+            for (const auto& p : errinj.get_injection_parameters(injection)) {
+                error_injection_json::mapper param;
+                param.key = p.first;
+                param.value = p.second;
+                parameters.push_back(std::move(param));
+            }
+            info.parameters = std::move(parameters);
+        });
+
+        co_return json::json_return_type(error_injection_infos);
     });
 
     hf::disable_on_all.set(r, [](std::unique_ptr<request> req) {
@@ -72,7 +96,7 @@ void set_error_injection(http_context& ctx, routes& r) {
     });
 
     hf::message_injection.set(r, [](std::unique_ptr<request> req) {
-        sstring injection = req->param["injection"];
+        sstring injection = req->get_path_param("injection");
         auto& errinj = utils::get_local_injector();
         return errinj.receive_message_on_all(injection).then([] {
             return make_ready_future<json::json_return_type>(json::json_void());

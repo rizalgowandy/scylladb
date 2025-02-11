@@ -3,13 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "seastarx.hh"
 #include "cql3/statements/list_service_level_attachments_statement.hh"
 #include "cql3/column_identifier.hh"
-#include "service/qos/service_level_controller.hh"
 #include "transport/messages/result_message.hh"
 #include "service/client_state.hh"
 #include "service/query_state.hh"
@@ -29,7 +28,7 @@ list_service_level_attachments_statement::list_service_level_attachments_stateme
 std::unique_ptr<cql3::statements::prepared_statement>
 cql3::statements::list_service_level_attachments_statement::prepare(
         data_dictionary::database db, cql_stats &stats) {
-    return std::make_unique<prepared_statement>(::make_shared<list_service_level_attachments_statement>(*this));
+    return std::make_unique<prepared_statement>(audit_info(), ::make_shared<list_service_level_attachments_statement>(*this));
 }
 
 future<> list_service_level_attachments_statement::check_access(query_processor& qp, const service::client_state &state) const {

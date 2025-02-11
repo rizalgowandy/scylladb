@@ -3,14 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #pragma once
 
 #include <seastar/core/sstring.hh>
 #include "enum_set.hh"
-
-#include <map>
 
 namespace cql_transport {
 
@@ -29,12 +27,14 @@ namespace cql_transport {
  */
 enum class cql_protocol_extension {
     LWT_ADD_METADATA_MARK,
-    RATE_LIMIT_ERROR
+    RATE_LIMIT_ERROR,
+    TABLETS_ROUTING_V1
 };
 
 using cql_protocol_extension_enum = super_enum<cql_protocol_extension,
     cql_protocol_extension::LWT_ADD_METADATA_MARK,
-    cql_protocol_extension::RATE_LIMIT_ERROR>;
+    cql_protocol_extension::RATE_LIMIT_ERROR,
+    cql_protocol_extension::TABLETS_ROUTING_V1>;
 
 using cql_protocol_extension_enum_set = enum_set<cql_protocol_extension_enum>;
 

@@ -2,8 +2,8 @@
 
 import sys
 
-# Use the run.py library from ../cql-pytest:
-sys.path.insert(1, sys.path[0] + '/../cql-pytest')
+# Use the run.py library from ../cqlpy:
+sys.path.insert(1, sys.path[0] + '/test/cqlpy')
 import run
 
 print('Scylla is: ' + run.find_scylla() + '.')
@@ -15,6 +15,21 @@ if ssl:
 else:
     cmd = run.run_scylla_cmd
     check_cql = run.check_cql
+
+# If the "--vnodes" option is given, drop the "tablets" experimental
+# feature (turned on in run.py) so that all tests will be run with the
+# old vnode-based replication instead of tablets. This option only has
+# temporary usefulness, and should eventually be removed.
+if '--vnodes' in sys.argv:
+    sys.argv.remove('--vnodes')
+    def run_without_tablets(pid, dir):
+        (c, e) = run_without_tablets.orig_cmd(pid, dir)
+        c.remove('--enable-tablets=true')
+        # Tablets are now enabled by default on some releases, it is not enough to remove the enable above.
+        c.append('--enable-tablets=false')
+        return (c, e)
+    run_without_tablets.orig_cmd = cmd
+    cmd = run_without_tablets
 
 pid = run.run_with_temporary_dir(cmd)
 ip = run.pid_to_ip(pid)

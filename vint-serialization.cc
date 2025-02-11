@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "vint-serialization.hh"
@@ -15,7 +15,6 @@
 #include <algorithm>
 #include <array>
 #include <limits>
-#include <type_traits>
 
 static_assert(-1 == ~0, "Not a twos-complement architecture");
 

@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "query-result-set.hh"
@@ -11,7 +11,6 @@
 #include "partition_slice_builder.hh"
 #include "mutation/mutation.hh"
 #include "types/map.hh"
-#include "utils/exceptions.hh"
 #include "mutation_query.hh"
 
 #include <fmt/format.h>
@@ -161,7 +160,7 @@ result_set_builder::deserialize(const result_row_view& row, bool is_static)
     std::unordered_map<sstring, non_null_data_value> cells;
     auto i = row.iterator();
     auto column_ids = is_static ? _slice.static_columns : _slice.regular_columns;
-    auto columns = column_ids | boost::adaptors::transformed([this, is_static] (column_id id) -> const column_definition& {
+    auto columns = column_ids | std::views::transform([this, is_static] (column_id id) -> const column_definition& {
         if (is_static) {
             return _schema->static_column_at(id);
         } else {

@@ -5,14 +5,16 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "locator/gossiping_property_file_snitch.hh"
+
+#include <seastar/core/file.hh>
+#include <seastar/core/seastar.hh>
 #include "gms/versioned_value.hh"
-#include "message/msg_addr.hh"
-#include "message/messaging_service.hh"
 #include "gms/gossiper.hh"
+#include "utils/class_registrator.hh"
 
 namespace locator {
 future<bool> gossiping_property_file_snitch::property_file_was_modified() {
@@ -23,7 +25,7 @@ future<bool> gossiping_property_file_snitch::property_file_was_modified() {
         });
     }).then_wrapped([this] (auto&& f) {
         try {
-            auto st = f.get0();
+            auto st = f.get();
 
             if (!_last_file_mod ||
                 _last_file_mod->tv_sec != st.st_mtim.tv_sec) {
@@ -107,21 +109,19 @@ void gossiping_property_file_snitch::periodic_reader_callback() {
     });
 }
 
-std::list<std::pair<gms::application_state, gms::versioned_value>> gossiping_property_file_snitch::get_app_states() const {
-    std::list<std::pair<gms::application_state, gms::versioned_value>> ret = {
+gms::application_state_map gossiping_property_file_snitch::get_app_states() const {
+    gms::application_state_map ret = {
         {gms::application_state::DC, gms::versioned_value::datacenter(_my_dc)},
         {gms::application_state::RACK, gms::versioned_value::rack(_my_rack)},
     };
     if (_listen_address.has_value()) {
         sstring ip = format("{}", *_listen_address);
-        ret.emplace_back(gms::application_state::INTERNAL_IP, gms::versioned_value::internal_ip(std::move(ip)));
+        ret.emplace(gms::application_state::INTERNAL_IP, gms::versioned_value::internal_ip(std::move(ip)));
     }
     return ret;
 }
 
 future<> gossiping_property_file_snitch::read_property_file() {
-    using namespace exceptions;
-
     return load_property_file().then([this] {
         return reload_configuration();
     }).then_wrapped([this] (auto&& f) {

@@ -29,7 +29,7 @@ Then, node4 will be added to the cluster **without streaming any data**.
 
 **Lesson Learned** - To prevent new nodes from not bootstrapping, always configure the seed node (contact point) as an existing node in the cluster.
 
-**Procedure to Use** - :doc:`Add a New Node Into an Existing Scylla Cluster </operating-scylla/procedures/cluster-management/add-node-to-cluster/>`
+**Procedure to Use** - :doc:`Add a New Node Into an Existing ScyllaDB Cluster </operating-scylla/procedures/cluster-management/add-node-to-cluster/>`
 
 Node Removal Error
 ------------------
@@ -48,7 +48,7 @@ Node3 is a dead node. If you do the following:
 
 **Lesson Learned** - Never reinstate a node that was removed.
 
-**Procedure to Use** - :doc:`Remove a Node from a Scylla Cluster (Down Scale) </operating-scylla/procedures/cluster-management/remove-node/>`
+**Procedure to Use** - :doc:`Remove a Node from a ScyllaDB Cluster (Down Scale) </operating-scylla/procedures/cluster-management/remove-node/>`
 
 Decommission Error
 ------------------
@@ -63,12 +63,12 @@ Node2 is down. You login node3. You run ``nodetool decommission`` to remove n3 f
 
 * After three days have passed the ``LEFT`` status is expired and removed from gossip in the cluster.
 * Node2 restarts and goes back into the cluster.
-* Node2 will revive Node3 abd bring it back into the cluster because from Node2's point of view, Node3 should be part of the cluster.
+* Node2 will revive Node3 and bring it back into the cluster because from Node2's point of view, Node3 should be part of the cluster.
 
 **Lesson Learned** -  It is best to fix dead nodes before a ``nodetool decommission`` operation so that every node knows which nodes are decommissioned.
 If there is no way to fix the dead node and decommission is performed without it, do not bring that dead node.
 
-**Procedure to Use** - :doc:`Replace a Dead Node in a Scylla Cluster </operating-scylla/procedures/cluster-management/replace-dead-node/>`
+**Procedure to Use** - :doc:`Replace a Dead Node in a ScyllaDB Cluster </operating-scylla/procedures/cluster-management/replace-dead-node/>`
 
 Node Replacement Error
 ----------------------
@@ -83,4 +83,4 @@ Node3 is dead. If you add node4 to replace node3 with the same IP address as nod
 
 **Lesson Learned** - Never reinstate a node that was removed.
 
-**Procedure to Use** - :doc:`Replace a Dead Node in a Scylla Cluster </operating-scylla/procedures/cluster-management/replace-dead-node/>`
+**Procedure to Use** - :doc:`Replace a Dead Node in a ScyllaDB Cluster </operating-scylla/procedures/cluster-management/replace-dead-node/>`

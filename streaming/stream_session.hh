@@ -5,12 +5,11 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
-#include "gms/i_endpoint_state_change_subscriber.hh"
 #include <seastar/core/distributed.hh>
 #include "message/messaging_service_fwd.hh"
 #include "streaming/stream_session_state.hh"
@@ -18,15 +17,12 @@
 #include "streaming/stream_receive_task.hh"
 #include "streaming/stream_request.hh"
 #include "streaming/prepare_message.hh"
-#include "streaming/stream_detail.hh"
 #include "streaming/stream_manager.hh"
 #include "streaming/stream_reason.hh"
 #include "streaming/session_info.hh"
 #include "service/topology_guard.hh"
-#include "query-request.hh"
 #include <map>
 #include <vector>
-#include <memory>
 
 namespace db {
 
@@ -127,7 +123,7 @@ public:
      *
      * Each {@code StreamSession} is identified by this InetAddress which is broadcast address of the node streaming.
      */
-    inet_address peer;
+    locator::host_id peer;
     unsigned dst_cpu_id = 0;
 private:
     stream_manager& _mgr;
@@ -197,7 +193,7 @@ public:
      * @param connecting Actual connecting address
      * @param factory is used for establishing connection
      */
-    stream_session(stream_manager& mgr, inet_address peer_);
+    stream_session(stream_manager& mgr, locator::host_id peer_);
     ~stream_session();
 
     streaming::plan_id plan_id() const;

@@ -3,21 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include "bytes.hh"
+#include <seastar/util/bool_class.hh>
+
 #include "timestamp.hh"
 #include "mutation/tombstone.hh"
 #include "gc_clock.hh"
+#include "utils/assert.hh"
 #include "utils/managed_bytes.hh"
-#include <seastar/net//byteorder.hh>
 #include <seastar/util/bool_class.hh>
 #include <cstdint>
-#include <iosfwd>
-#include <concepts>
 #include "utils/fragmented_temporary_buffer.hh"
 
 #include "serializer.hh"
@@ -31,6 +30,7 @@ template <mutable_view is_mutable>
 using atomic_cell_value_basic_view = managed_bytes_basic_view<is_mutable>;
 using atomic_cell_value_view = atomic_cell_value_basic_view<mutable_view::no>;
 using atomic_cell_value_mutable_view = atomic_cell_value_basic_view<mutable_view::yes>;
+using is_live = bool_class<struct is_live_tag>;
 
 template <typename T>
 requires std::is_trivial_v<T>
@@ -127,18 +127,18 @@ public:
     }
     // Can be called only when is_dead() is true.
     static gc_clock::time_point deletion_time(atomic_cell_value_view cell) {
-        assert(is_dead(cell));
+        SCYLLA_ASSERT(is_dead(cell));
         return gc_clock::time_point(gc_clock::duration(get_field<int64_t>(cell, deletion_time_offset)));
     }
     // Can be called only when is_live_and_has_ttl() is true.
     static gc_clock::time_point expiry(atomic_cell_value_view cell) {
-        assert(is_live_and_has_ttl(cell));
+        SCYLLA_ASSERT(is_live_and_has_ttl(cell));
         auto expiry = get_field<int64_t>(cell, expiry_offset);
         return gc_clock::time_point(gc_clock::duration(expiry));
     }
     // Can be called only when is_live_and_has_ttl() is true.
     static gc_clock::duration ttl(atomic_cell_value_view cell) {
-        assert(is_live_and_has_ttl(cell));
+        SCYLLA_ASSERT(is_live_and_has_ttl(cell));
         return gc_clock::duration(get_field<int32_t>(cell, ttl_offset));
     }
     static managed_bytes make_dead(api::timestamp_type timestamp, gc_clock::time_point deletion_time) {
@@ -284,15 +284,21 @@ public:
         return atomic_cell_view(managed_bytes_view(v));
     }
 
-    friend std::ostream& operator<<(std::ostream& os, const atomic_cell_view& acv);
-
+    friend fmt::formatter<class atomic_cell>;
     class printer {
         const abstract_type& _type;
         const atomic_cell_view& _cell;
     public:
         printer(const abstract_type& type, const atomic_cell_view& cell) : _type(type), _cell(cell) {}
-        friend std::ostream& operator<<(std::ostream& os, const printer& acvp);
+        friend fmt::formatter<printer>;
     };
+};
+
+template <>
+struct fmt::formatter<atomic_cell_view::printer> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const atomic_cell_view::printer&, fmt::format_context& ctx) const
+        -> decltype(ctx.out());
 };
 
 class atomic_cell_mutable_view final : public basic_atomic_cell_view<mutable_view::yes> {
@@ -372,13 +378,21 @@ public:
     }
     static atomic_cell make_live_uninitialized(const abstract_type& type, api::timestamp_type timestamp, size_t size);
     friend class atomic_cell_or_collection;
-    friend std::ostream& operator<<(std::ostream& os, const atomic_cell& ac);
 
     class printer : atomic_cell_view::printer {
     public:
         printer(const abstract_type& type, const atomic_cell_view& cell) : atomic_cell_view::printer(type, cell) {}
-        friend std::ostream& operator<<(std::ostream& os, const printer& acvp);
+        friend fmt::formatter<printer>;
     };
+};
+
+template <>
+struct fmt::formatter<atomic_cell::printer> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const atomic_cell::printer& acp, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+        return fmt::format_to(ctx.out(), "{}", static_cast<const atomic_cell_view::printer&>(acp));
+    }
 };
 
 class column_definition;
@@ -387,3 +401,15 @@ std::strong_ordering compare_atomic_cell_for_merge(atomic_cell_view left, atomic
 void merge_column(const abstract_type& def,
         atomic_cell_or_collection& old,
         const atomic_cell_or_collection& neww);
+
+template <>
+struct fmt::formatter<atomic_cell_view> : fmt::formatter<string_view> {
+    auto format(const atomic_cell_view&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <>
+struct fmt::formatter<atomic_cell> : fmt::formatter<string_view> {
+    auto format(const atomic_cell& ac, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", atomic_cell_view(ac));
+    }
+};

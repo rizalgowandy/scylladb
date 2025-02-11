@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -11,11 +11,14 @@
 #include "compaction/compaction_garbage_collector.hh"
 #include "mutation_fragment.hh"
 #include "mutation_fragment_stream_validator.hh"
-#include "range_tombstone_assembler.hh"
 #include "tombstone_gc.hh"
 #include "full_position.hh"
+#include <type_traits>
+#include "utils/log.hh"
 
-static inline bool has_ck_selector(const query::clustering_row_ranges& ranges) {
+extern logging::logger mclog;
+
+inline bool has_ck_selector(const query::clustering_row_ranges& ranges) {
     // Like PK range, an empty row range, should be considered an "exclude all" restriction
     return ranges.empty() || std::any_of(ranges.begin(), ranges.end(), [](auto& r) {
         return !r.is_full();
@@ -113,15 +116,26 @@ struct compaction_stats {
     struct row_stats {
         uint64_t live = 0;
         uint64_t dead = 0;
+        compact_and_expire_result cell_stats;
 
-        void operator+=(bool is_live) {
+        void add_row(const compact_and_expire_result& new_cell_stats, bool force_live = false) {
+            const auto is_live = new_cell_stats.is_live() || force_live;
             live += is_live;
             dead += !is_live;
+            cell_stats += new_cell_stats;
         }
         uint64_t total() const {
             return live + dead;
         }
     };
+
+    uint64_t live_cells() const {
+        return static_rows.cell_stats.live_cells + clustering_rows.cell_stats.live_cells;
+    }
+    uint64_t dead_cells() const {
+        return static_rows.cell_stats.dead_cells + clustering_rows.cell_stats.dead_cells +
+            static_rows.cell_stats.collection_tombstones + clustering_rows.cell_stats.collection_tombstones;
+    }
 
     uint64_t partitions = 0;
     row_stats static_rows;
@@ -133,7 +147,7 @@ template<compact_for_sstables SSTableCompaction>
 class compact_mutation_state {
     const schema& _schema;
     gc_clock::time_point _query_time;
-    std::function<api::timestamp_type(const dht::decorated_key&)> _get_max_purgeable;
+    max_purgeable_fn _get_max_purgeable;
     can_gc_fn _can_gc;
     api::timestamp_type _max_purgeable = api::missing_timestamp;
     std::optional<gc_clock::time_point> _gc_before;
@@ -235,23 +249,24 @@ private:
         return deletion_time < get_gc_before();
     }
 
-    bool can_purge_tombstone(const tombstone& t, const gc_clock::time_point deletion_time) {
+    bool can_purge_tombstone(const tombstone& t, is_shadowable is_shadowable, const gc_clock::time_point deletion_time) {
         if (_tombstone_gc_state.cheap_to_get_gc_before(_schema)) {
             // if retrieval of grace period is cheap, can_gc() will only be
             // called for tombstones that are older than grace period, in
             // order to avoid unnecessary bloom filter checks when calculating
             // max purgeable timestamp.
-            return satisfy_grace_period(deletion_time) && can_gc(t);
+            return satisfy_grace_period(deletion_time) && can_gc(t, is_shadowable);
         }
-        return can_gc(t) && satisfy_grace_period(deletion_time);
+        return can_gc(t, is_shadowable) && satisfy_grace_period(deletion_time);
     }
 
     bool can_purge_tombstone(const tombstone& t) {
-        return can_purge_tombstone(t, t.deletion_time);
+        // Only row tombstones can be shadowable, regular tombstones aren't
+        return can_purge_tombstone(t, is_shadowable::no, t.deletion_time);
     };
 
     bool can_purge_tombstone(const row_tombstone& t) {
-        return can_purge_tombstone(t.tomb(), t.max_deletion_time());
+        return can_purge_tombstone(t.tomb(), t.is_shadowable(), t.max_deletion_time());
     };
 
     gc_clock::time_point get_gc_before() {
@@ -267,7 +282,7 @@ private:
         }
     }
 
-    bool can_gc(tombstone t) {
+    bool can_gc(tombstone t, is_shadowable is_shadowable) {
         if (!sstable_compaction()) {
             return true;
         }
@@ -275,9 +290,11 @@ private:
             return false;
         }
         if (_max_purgeable == api::missing_timestamp) {
-            _max_purgeable = _get_max_purgeable(*_dk);
+            _max_purgeable = _get_max_purgeable(*_dk, is_shadowable);
         }
-        return t.timestamp < _max_purgeable;
+        auto ret = t.timestamp < _max_purgeable;
+        mclog.debug("can_gc: t={} is_shadowable={} max_purgeable={}: ret={}", t, is_shadowable, _max_purgeable, ret);
+        return ret;
     };
 
 public:
@@ -301,12 +318,12 @@ public:
     }
 
     compact_mutation_state(const schema& s, gc_clock::time_point compaction_time,
-            std::function<api::timestamp_type(const dht::decorated_key&)> get_max_purgeable,
+            max_purgeable_fn get_max_purgeable,
             const tombstone_gc_state& gc_state)
         : _schema(s)
         , _query_time(compaction_time)
         , _get_max_purgeable(std::move(get_max_purgeable))
-        , _can_gc([this] (tombstone t) { return can_gc(t); })
+        , _can_gc([this] (tombstone t, is_shadowable is_shadowable) { return can_gc(t, is_shadowable); })
         , _slice(s.full_slice())
         , _tombstone_gc_state(gc_state)
         , _last_dk({dht::token(), partition_key::make_empty()})
@@ -370,9 +387,10 @@ public:
             _collector->start_collecting_static_row();
         }
         auto gc_before = get_gc_before();
-        bool is_live = sr.cells().compact_and_expire(_schema, column_kind::static_column, row_tombstone(current_tombstone),
+        auto res = sr.cells().compact_and_expire(_schema, column_kind::static_column, row_tombstone(current_tombstone),
                 _query_time, _can_gc, gc_before, _collector.get());
-        _stats.static_rows += is_live;
+        _stats.static_rows.add_row(res);
+        const auto is_live = res.is_live();
         if constexpr (sstable_compaction()) {
             _collector->consume_static_row([this, &gc_consumer, current_tombstone] (static_row&& sr_garbage) {
                 partition_is_not_empty_for_gc_consumer(gc_consumer);
@@ -419,10 +437,11 @@ public:
             }
         }
         auto gc_before = get_gc_before();
-        bool is_live = cr.marker().compact_and_expire(t.tomb(), _query_time, _can_gc, gc_before, _collector.get());
-        is_live |= cr.cells().compact_and_expire(_schema, column_kind::regular_column, t, _query_time, _can_gc, gc_before, cr.marker(),
+        const bool marker_is_live = cr.marker().compact_and_expire(t.tomb(), _query_time, _can_gc, gc_before, _collector.get());
+        const auto res = cr.cells().compact_and_expire(_schema, column_kind::regular_column, t, _query_time, _can_gc, gc_before, cr.marker(),
                 _collector.get());
-        _stats.clustering_rows += is_live;
+        _stats.clustering_rows.add_row(res, marker_is_live);
+        const auto is_live = res.is_live() || marker_is_live;
 
         if constexpr (sstable_compaction()) {
             _collector->consume_clustering_row([this, &gc_consumer, t] (clustering_row&& cr_garbage) {
@@ -482,7 +501,7 @@ public:
             gc_consumer.consume_end_of_partition();
         }
         if (!_empty_partition) {
-            // #589 - Do not add extra row for statics unless we did a CK range-less query.
+            // #589 - Do not add extra row for static content unless we did a CK range-less query.
             // See comment in query
             if (_rows_in_current_partition == 0 && _static_row_live &&
                     _return_static_content_on_partition_with_no_rows) {
@@ -516,7 +535,7 @@ public:
             _last_dk = *_dk;
             _dk = &_last_dk;
         }
-        if constexpr (std::is_same_v<std::result_of_t<decltype(&GCConsumer::consume_end_of_stream)(GCConsumer&)>, void>) {
+        if constexpr (std::is_void_v<std::invoke_result_t<decltype(&GCConsumer::consume_end_of_stream), GCConsumer&>>) {
             gc_consumer.consume_end_of_stream();
             return consumer.consume_end_of_stream();
         } else {
@@ -642,7 +661,7 @@ public:
 
     // Can only be used for compact_for_sstables::yes
     compact_mutation_v2(const schema& s, gc_clock::time_point compaction_time,
-            std::function<api::timestamp_type(const dht::decorated_key&)> get_max_purgeable,
+            max_purgeable_fn get_max_purgeable,
             const tombstone_gc_state& gc_state,
             Consumer consumer, GCConsumer gc_consumer = GCConsumer())
         : _state(make_lw_shared<compact_mutation_state<SSTableCompaction>>(s, compaction_time, get_max_purgeable, gc_state))

@@ -3,18 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <boost/range/algorithm/copy.hpp>
-#include <boost/range/adaptor/transformed.hpp>
+#include <ranges>
 #include <compare>
+#include <seastar/core/on_internal_error.hh>
 #include "compound.hh"
 #include "schema/schema.hh"
 #include "sstables/version.hh"
-#include "log.hh"
+#include "utils/log.hh"
 
 //FIXME: de-inline methods and define this as static in a .cc file.
 extern logging::logger compound_logger;
@@ -72,12 +72,12 @@ public:
         iterator(const legacy_compound_view& v)
             : _singular(v._type.is_singular())
             , _offset(_singular ? 0 : -2)
-            , _i(_singular && !v._type.begin(v._packed)->size() ?
+            , _i(_singular && !(*v._type.begin(v._packed)).size() ?
                     v._type.end(v._packed) : v._type.begin(v._packed))
         { }
 
         iterator(const legacy_compound_view& v, end_tag)
-            : _offset(v._type.is_singular() && !v._type.begin(v._packed)->size() ? 0 : -2)
+            : _offset(v._type.is_singular() && !(*v._type.begin(v._packed)).size() ? 0 : -2)
             , _i(v._type.end(v._packed))
         { }
 
@@ -88,20 +88,22 @@ public:
         iterator() {}
 
         value_type operator*() const {
-            int32_t component_size = _i->size();
+            auto tmp = *_i;
+            int32_t component_size = tmp.size();
             if (_offset == -2) {
                 return (component_size >> 8) & 0xff;
             } else if (_offset == -1) {
                 return component_size & 0xff;
             } else if (_offset < component_size) {
-                return (*_i)[_offset];
+                return tmp[_offset];
             } else { // _offset == component_size
                 return 0; // EOC field
             }
         }
 
         iterator& operator++() {
-            auto component_size = (int32_t) _i->size();
+            auto tmp = *_i;
+            auto component_size = (int32_t) tmp.size();
             if (_offset < component_size
                 // When _singular, we skip the EOC byte.
                 && (!_singular || _offset != (component_size - 1)))
@@ -164,7 +166,7 @@ public:
     // Equivalent to std::distance(begin(), end()), but computes faster
     size_t size() const {
         if (_type.is_singular()) {
-            return _type.begin(_packed)->size();
+            return (*_type.begin(_packed)).size();
         }
         size_t s = 0;
         for (auto&& component : _type.components(_packed)) {
@@ -185,7 +187,7 @@ public:
 // Converts compound_type<> representation to legacy representation
 // @packed is assumed to be serialized using supplied @type.
 template <typename CompoundType>
-static inline
+inline
 bytes to_legacy(CompoundType& type, managed_bytes_view packed) {
     legacy_compound_view<CompoundType> lv(type, packed);
     bytes legacy_form(bytes::initialized_later(), lv.size());
@@ -343,8 +345,9 @@ public:
     static composite serialize_static(const schema& s, RangeOfSerializedComponents&& values) {
         // FIXME: Optimize
         auto b = bytes(size_t(2), bytes::value_type(0xff));
-        std::vector<bytes_view> sv(s.clustering_key_size());
-        b += composite::serialize_value(boost::range::join(sv, std::forward<RangeOfSerializedComponents>(values)), true).release_bytes();
+        std::vector<bytes_view> sv(s.clustering_key_size() + std::ranges::distance(values));
+        std::ranges::copy(values, sv.begin() + s.clustering_key_size());
+        b += composite::serialize_value(sv, true).release_bytes();
         return composite(std::move(b));
     }
 
@@ -439,12 +442,12 @@ public:
         return iterator(iterator::end_iterator_tag());
     }
 
-    boost::iterator_range<iterator> components() const & {
+    std::ranges::subrange<iterator> components() const & {
         return { begin(), end() };
     }
 
     auto values() const & {
-        return components() | boost::adaptors::transformed([](auto&& c) { return c.first; });
+        return components() | std::views::transform(&component_view::first);
     }
 
     std::vector<component> components() const && {
@@ -457,7 +460,7 @@ public:
 
     std::vector<bytes> values() const && {
         std::vector<bytes> result;
-        boost::copy(components() | boost::adaptors::transformed([](auto&& c) { return to_bytes(c.first); }), std::back_inserter(result));
+        std::ranges::copy(components() | std::views::transform([](auto&& c) { return to_bytes(c.first); }), std::back_inserter(result));
         return result;
     }
 
@@ -524,7 +527,7 @@ public:
 };
 
 template <typename Component>
-struct fmt::formatter<std::pair<Component, composite::eoc>> : fmt::formatter<std::string_view> {
+struct fmt::formatter<std::pair<Component, composite::eoc>> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const std::pair<Component, composite::eoc>& c, FormatContext& ctx) const {
         if constexpr (std::same_as<Component, bytes_view>) {
@@ -582,7 +585,7 @@ public:
         return composite::iterator(composite::iterator::end_iterator_tag());
     }
 
-    boost::iterator_range<composite::iterator> components() const {
+    std::ranges::subrange<composite::iterator> components() const {
         return { begin(), end() };
     }
 
@@ -596,7 +599,7 @@ public:
     }
 
     auto values() const {
-        return components() | boost::adaptors::transformed([](auto&& c) { return c.first; });
+        return components() | std::views::transform(&composite::component_view::first);
     }
 
     size_t size() const {
@@ -636,7 +639,7 @@ public:
 };
 
 template <>
-struct fmt::formatter<composite_view> : fmt::formatter<std::string_view> {
+struct fmt::formatter<composite_view> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const composite_view& v, FormatContext& ctx) const {
         return fmt::format_to(ctx.out(), "{{{}, compound={}, static={}}}",
@@ -650,7 +653,7 @@ composite::composite(const composite_view& v)
 { }
 
 template <>
-struct fmt::formatter<composite> : fmt::formatter<std::string_view> {
+struct fmt::formatter<composite> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const composite& v, FormatContext& ctx) const {
         return fmt::format_to(ctx.out(), "{}", composite_view(v));

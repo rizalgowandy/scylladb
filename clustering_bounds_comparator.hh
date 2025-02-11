@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -12,7 +12,7 @@
 #include <functional>
 #include "keys.hh"
 #include "schema/schema_fwd.hh"
-#include "range.hh"
+#include "interval.hh"
 
 /**
  * Represents the kind of bound in a range tombstone.
@@ -24,8 +24,6 @@ enum class bound_kind : uint8_t {
     incl_end = 6,
     excl_start = 7,
 };
-
-std::ostream& operator<<(std::ostream& out, const bound_kind k);
 
 // Swaps start <-> end && incl <-> excl
 bound_kind invert_kind(bound_kind k);
@@ -125,34 +123,41 @@ public:
         return {_empty_prefix, bound_kind::incl_end};
     }
     template<template<typename> typename R>
-    requires Range<R, clustering_key_prefix_view>
+    requires Interval<R, clustering_key_prefix_view>
     static bound_view from_range_start(const R<clustering_key_prefix>& range) {
         return range.start()
                ? bound_view(range.start()->value(), range.start()->is_inclusive() ? bound_kind::incl_start : bound_kind::excl_start)
                : bottom();
     }
     template<template<typename> typename R>
-    requires Range<R, clustering_key_prefix>
+    requires Interval<R, clustering_key_prefix>
     static bound_view from_range_end(const R<clustering_key_prefix>& range) {
         return range.end()
                ? bound_view(range.end()->value(), range.end()->is_inclusive() ? bound_kind::incl_end : bound_kind::excl_end)
                : top();
     }
     template<template<typename> typename R>
-    requires Range<R, clustering_key_prefix>
+    requires Interval<R, clustering_key_prefix>
     static std::pair<bound_view, bound_view> from_range(const R<clustering_key_prefix>& range) {
         return {from_range_start(range), from_range_end(range)};
     }
     template<template<typename> typename R>
-    requires Range<R, clustering_key_prefix_view>
-    static std::optional<typename R<clustering_key_prefix_view>::bound> to_range_bound(const bound_view& bv) {
+    requires Interval<R, clustering_key_prefix_view>
+    static std::optional<typename R<clustering_key_prefix_view>::bound> to_interval_bound(const bound_view& bv) {
         if (&bv._prefix.get() == &_empty_prefix) {
             return {};
         }
         bool inclusive = bv._kind != bound_kind::excl_end && bv._kind != bound_kind::excl_start;
         return {typename R<clustering_key_prefix_view>::bound(bv._prefix.get().view(), inclusive)};
     }
-    friend std::ostream& operator<<(std::ostream& out, const bound_view& b) {
-        return out << "{bound: prefix=" << b._prefix.get() << ", kind=" << b._kind << "}";
+    friend fmt::formatter<bound_view>;
+};
+
+template <> struct fmt::formatter<bound_kind> : fmt::formatter<string_view> {
+    auto format(bound_kind, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+template <> struct fmt::formatter<bound_view> : fmt::formatter<string_view> {
+    auto format(const bound_view& b, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{{bound: prefix={},kind={}}}", b._prefix.get(), b._kind);
     }
 };

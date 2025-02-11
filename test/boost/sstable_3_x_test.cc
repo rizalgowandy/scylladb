@@ -3,13 +3,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include <set>
-#include <fstream>
 #include <iterator>
+#include <algorithm>
 
+#include <boost/range/irange.hpp>
 #include <boost/test/unit_test.hpp>
 
 #include <seastar/core/thread.hh>
@@ -20,12 +22,11 @@
 
 #include "sstables/sstables.hh"
 #include "compaction/compaction_manager.hh"
-#include "cell_locking.hh"
 #include "compress.hh"
 #include "counters.hh"
 #include "schema/schema_builder.hh"
 #include "test/boost/sstable_test.hh"
-#include "test/lib/flat_mutation_reader_assertions.hh"
+#include "test/lib/mutation_reader_assertions.hh"
 #include "test/lib/sstable_utils.hh"
 #include "test/lib/index_reader_assertions.hh"
 #include "test/lib/random_utils.hh"
@@ -42,7 +43,6 @@
 #include "db/large_data_handler.hh"
 #include "readers/combined.hh"
 
-#include <boost/range/algorithm/sort.hpp>
 #include <fmt/ranges.h>
 
 using namespace sstables;
@@ -91,7 +91,7 @@ public:
         load();
         return sstables::test(_sst).read_indexes(_env.make_reader_permit());
     }
-    flat_mutation_reader_v2 make_reader() {
+    mutation_reader make_reader() {
         return _sst->make_reader(_sst->_schema, _env.make_reader_permit(), query::full_partition_range, _sst->_schema->full_slice());
     }
 
@@ -103,7 +103,7 @@ public:
         return _sst;
     }
 
-    flat_mutation_reader_v2 make_reader(
+    mutation_reader make_reader(
             const dht::partition_range& range,
             const query::partition_slice& slice,
             tracing::trace_state_ptr trace_state = {},
@@ -122,7 +122,7 @@ public:
     void assert_toc(const std::set<component_type>& expected_components) {
         for (auto& expected : expected_components) {
             if(!_sst->_recognized_components.contains(expected)) {
-                BOOST_FAIL(format("Expected component of TOC missing: {}\n ... in: {}",
+                BOOST_FAIL(seastar::format("Expected component of TOC missing: {}\n ... in: {}",
                                   expected,
                                   std::set<component_type>(
                                       cbegin(_sst->_recognized_components),
@@ -131,7 +131,7 @@ public:
         }
         for (auto& present : _sst->_recognized_components) {
             if (!expected_components.contains(present)) {
-                BOOST_FAIL(format("Unexpected component of TOC: {}\n ... when expecting: {}",
+                BOOST_FAIL(seastar::format("Unexpected component of TOC: {}\n ... when expecting: {}",
                                   present,
                                   expected_components));
             }
@@ -478,14 +478,14 @@ SEASTAR_TEST_CASE(test_uncompressed_skip_using_index_rows) {
         r.produces_partition_start(to_key(1))
             .produces_static_row({{st_cdef, int32_type->decompose(int32_t(777))}});
 
-        for (auto idx: boost::irange(0, 1024)) {
+        for (auto idx: std::views::iota(0, 1024)) {
             r.produces_row(to_ck(idx), to_expected(format("{}{}", rc_base, idx)));
         }
         r.produces_partition_end();
 
         r.produces_partition_start(to_key(2))
             .produces_static_row({{st_cdef, int32_type->decompose(int32_t(999))}});
-        for (auto idx: boost::irange(0, 1024)) {
+        for (auto idx: std::views::iota(0, 1024)) {
             r.produces_row(to_ck(idx), to_expected(format("{}{}", rc_base, idx)));
         }
         r.produces_partition_end()
@@ -505,20 +505,20 @@ SEASTAR_TEST_CASE(test_uncompressed_skip_using_index_rows) {
         auto r = assert_that(std::move(rd));
         r.produces_partition_start(to_key(1))
             .produces_static_row({{st_cdef, int32_type->decompose(int32_t(777))}});
-        for (auto idx: boost::irange(70, 80)) {
+        for (auto idx: std::views::iota(70, 80)) {
             r.produces_row(to_ck(idx), to_expected(format("{}{}", rc_base, idx)));
         }
-        for (auto idx: boost::irange(1001, 1024)) {
+        for (auto idx: std::views::iota(1001, 1024)) {
             r.produces_row(to_ck(idx), to_expected(format("{}{}", rc_base, idx)));
         }
         r.produces_partition_end();
 
         r.produces_partition_start(to_key(2))
             .produces_static_row({{st_cdef, int32_type->decompose(int32_t(999))}});
-        for (auto idx: boost::irange(70, 80)) {
+        for (auto idx: std::views::iota(70, 80)) {
             r.produces_row(to_ck(idx), to_expected(format("{}{}", rc_base, idx)));
         }
-        for (auto idx: boost::irange(1001, 1024)) {
+        for (auto idx: std::views::iota(1001, 1024)) {
             r.produces_row(to_ck(idx), to_expected(format("{}{}", rc_base, idx)));
         }
 
@@ -537,7 +537,7 @@ SEASTAR_TEST_CASE(test_uncompressed_skip_using_index_rows) {
         r.produces_partition_start(to_key(1));
 
         r.fast_forward_to(to_ck(316), to_ck(379));
-        for (auto idx: boost::irange(316, 379)) {
+        for (auto idx: std::views::iota(316, 379)) {
             r.produces_row(to_ck(idx), to_expected(format("{}{}", rc_base, idx)));
         }
         r.produces_end_of_stream();
@@ -549,13 +549,13 @@ SEASTAR_TEST_CASE(test_uncompressed_skip_using_index_rows) {
                 .produces_end_of_stream();
 
         r.fast_forward_to(to_ck(442), to_ck(450));
-        for (auto idx: boost::irange(442, 450)) {
+        for (auto idx: std::views::iota(442, 450)) {
             r.produces_row(to_ck(idx), to_expected(format("{}{}", rc_base, idx)));
         }
         r.produces_end_of_stream();
 
         r.fast_forward_to(to_ck(1009), to_ck(1024));
-        for (auto idx: boost::irange(1009, 1024)) {
+        for (auto idx: std::views::iota(1009, 1024)) {
             r.produces_row(to_ck(idx), to_expected(format("{}{}", rc_base, idx)));
         }
         r.produces_end_of_stream();
@@ -577,7 +577,7 @@ SEASTAR_TEST_CASE(test_uncompressed_skip_using_index_rows) {
         r.produces_partition_start(to_key(1));
         r.fast_forward_to(to_ck(200), to_ck(250));
 
-        for (auto idx: boost::irange(210, 241)) {
+        for (auto idx: std::views::iota(210, 241)) {
             r.produces_row(to_ck(idx), to_expected(format("{}{}", rc_base, idx)));
         }
         r.produces_end_of_stream();
@@ -593,19 +593,19 @@ SEASTAR_TEST_CASE(test_uncompressed_skip_using_index_rows) {
             .produces_end_of_stream();
 
         r.fast_forward_to(to_ck(200), to_ck(250));
-        for (auto idx: boost::irange(210, 241)) {
+        for (auto idx: std::views::iota(210, 241)) {
             r.produces_row(to_ck(idx), to_expected(format("{}{}", rc_base, idx)));
         }
         r.produces_end_of_stream();
 
         r.fast_forward_to(to_ck(900), to_ck(1010));
-        for (auto idx: boost::irange(1000, 1010)) {
+        for (auto idx: std::views::iota(1000, 1010)) {
             r.produces_row(to_ck(idx), to_expected(format("{}{}", rc_base, idx)));
         }
         r.produces_end_of_stream();
 
         r.fast_forward_to(to_ck(1010), to_ck(1024));
-        for (auto idx: boost::irange(1010, 1024)) {
+        for (auto idx: std::views::iota(1010, 1024)) {
             r.produces_row(to_ck(idx), to_expected(format("{}{}", rc_base, idx)));
         }
         r.produces_end_of_stream();
@@ -708,7 +708,7 @@ SEASTAR_TEST_CASE(test_uncompressed_filtering_and_forwarding_range_tombstones_re
         return tombstone{api::timestamp_type{ts}, gc_clock::time_point(gc_clock::duration(tp))};
     };
 
-    auto make_assertions = [] (flat_mutation_reader_v2 rd) {
+    auto make_assertions = [] (mutation_reader rd) {
         rd.set_max_buffer_size(1);
         return std::move(assert_that(std::move(rd)).ignore_deletion_time());
     };
@@ -727,7 +727,7 @@ SEASTAR_TEST_CASE(test_uncompressed_filtering_and_forwarding_range_tombstones_re
     {
         auto r = make_assertions(sst.make_reader());
         tombstone tomb = make_tombstone(1525385507816568, 1534898526);
-        for (auto pkey : boost::irange(1, 3)) {
+        for (auto pkey : std::views::iota(1, 3)) {
             r.produces_partition_start(to_pkey(pkey))
             .produces_static_row({{st_cdef, int32_type->decompose(static_row_values[pkey - 1])}});
 
@@ -748,7 +748,7 @@ SEASTAR_TEST_CASE(test_uncompressed_filtering_and_forwarding_range_tombstones_re
                                            tracing::trace_state_ptr(),
                                            streamed_mutation::forwarding::yes));
         std::array<int32_t, 2> rt_deletion_times {1534898600, 1534899416};
-        for (auto pkey : boost::irange(1, 3)) {
+        for (auto pkey : std::views::iota(1, 3)) {
             const tombstone tomb = make_tombstone(1525385507816568, rt_deletion_times[pkey - 1]);
             r.produces_partition_start(to_pkey(pkey));
             // First, fast-forward to a block that start with an end open marker set
@@ -815,7 +815,7 @@ SEASTAR_TEST_CASE(test_uncompressed_filtering_and_forwarding_range_tombstones_re
 
         auto r = make_assertions(sst.make_reader(query::full_partition_range, slice));
         std::array<int32_t, 2> rt_deletion_times {1534898600, 1534899416};
-        for (auto pkey : boost::irange(1, 3)) {
+        for (auto pkey : std::views::iota(1, 3)) {
             auto slices = slice.get_all_ranges();
             const tombstone tomb = make_tombstone(1525385507816568, rt_deletion_times[pkey - 1]);
             r.produces_partition_start(to_pkey(pkey))
@@ -868,7 +868,7 @@ SEASTAR_TEST_CASE(test_uncompressed_filtering_and_forwarding_range_tombstones_re
                                                       streamed_mutation::forwarding::yes));
 
         std::array<int32_t, 2> rt_deletion_times {1534898600, 1534899416};
-        for (auto pkey : boost::irange(1, 3)) {
+        for (auto pkey : std::views::iota(1, 3)) {
             auto slices = slice.get_all_ranges();
             const tombstone tomb = make_tombstone(1525385507816568, rt_deletion_times[pkey - 1]);
             r.produces_partition_start(to_pkey(pkey))
@@ -1005,7 +1005,7 @@ SEASTAR_TEST_CASE(test_uncompressed_slicing_interleaved_rows_and_rts_read) {
             query::clustering_range::bound(std::move(end), false));
     };
 
-    auto make_assertions = [] (flat_mutation_reader_v2 rd) {
+    auto make_assertions = [] (mutation_reader rd) {
         rd.set_max_buffer_size(1);
         return std::move(assert_that(std::move(rd)).ignore_deletion_time());
     };
@@ -1308,7 +1308,7 @@ SEASTAR_TEST_CASE(test_uncompressed_compound_static_row_read) {
     auto val_cdef = UNCOMPRESSED_COMPOUND_STATIC_ROW_SCHEMA->get_column_definition(to_bytes("val"));
     BOOST_REQUIRE(val_cdef);
 
-    auto generate = [&] (int int_val, sstring_view text_val, sstring_view inet_val) {
+    auto generate = [&] (int int_val, std::string_view text_val, std::string_view inet_val) {
         std::vector<flat_reader_assertions_v2::expected_column> columns;
 
         columns.push_back({s_int_cdef, int32_type->decompose(int_val)});
@@ -1669,8 +1669,8 @@ static future<> test_partition_key_with_values_of_different_types_read(const sst
     BOOST_REQUIRE(text_cdef);
 
     auto generate = [&] (bool bool_val, double double_val, float float_val, int int_val, long long_val,
-                         sstring_view timestamp_val, sstring_view timeuuid_val, sstring_view uuid_val,
-                         sstring_view text_val) {
+                         std::string_view timestamp_val, std::string_view timeuuid_val, std::string_view uuid_val,
+                         std::string_view text_val) {
         std::vector<flat_reader_assertions_v2::expected_column> columns;
 
         columns.push_back({bool_cdef, boolean_type->decompose(bool_val)});
@@ -1906,8 +1906,8 @@ SEASTAR_TEST_CASE(test_uncompressed_subset_of_columns_read) {
 
     auto generate = [&] (std::optional<bool> bool_val, std::optional<double> double_val,
                          std::optional<float> float_val, std::optional<int> int_val, std::optional<long> long_val,
-                         std::optional<sstring_view> timestamp_val, std::optional<sstring_view> timeuuid_val,
-                         std::optional<sstring_view> uuid_val, std::optional<sstring_view> text_val) {
+                         std::optional<std::string_view> timestamp_val, std::optional<std::string_view> timeuuid_val,
+                         std::optional<std::string_view> uuid_val, std::optional<std::string_view> text_val) {
         std::vector<flat_reader_assertions_v2::expected_column> columns;
 
         if (bool_val) {
@@ -2694,7 +2694,7 @@ SEASTAR_TEST_CASE(test_uncompressed_simple_load) {
 SEASTAR_TEST_CASE(test_uncompressed_simple_read_index) {
   return test_env::do_with_async([] (test_env& env) {
     sstable_assertions sst(env, UNCOMPRESSED_SIMPLE_SCHEMA, UNCOMPRESSED_SIMPLE_PATH);
-    auto vec = sst.read_index().get0();
+    auto vec = sst.read_index().get();
     BOOST_REQUIRE_EQUAL(5, vec.size());
   });
 }
@@ -2999,7 +2999,7 @@ SEASTAR_TEST_CASE(test_uncompressed_collections_read) {
 }
 
 static sstables::shared_sstable open_sstable(test_env& env, schema_ptr schema, sstring dir, sstables::generation_type generation) {
-    return env.reusable_sst(std::move(schema), dir, generation, sstables::sstable::version_types::mc).get0();
+    return env.reusable_sst(std::move(schema), dir, generation, sstables::sstable::version_types::mc).get();
 }
 
 static std::vector<sstables::shared_sstable> open_sstables(test_env& env, schema_ptr s, sstring dir, std::vector<sstables::generation_type> generations) {
@@ -3011,10 +3011,11 @@ static std::vector<sstables::shared_sstable> open_sstables(test_env& env, schema
 }
 
 // Must be called in a seastar thread.
-static flat_mutation_reader_v2 compacted_sstable_reader(test_env& env, schema_ptr s,
+static mutation_reader compacted_sstable_reader(test_env& env, schema_ptr s,
                      sstring table_name, std::vector<sstables::generation_type::int_t> gen_values) {
     env.maybe_start_compaction_manager(false);
     auto cf = env.make_table_for_tests(s);
+    auto close_cf = deferred_stop(cf);
     auto generations = generations_from_values(gen_values);
     lw_shared_ptr<replica::memtable> mt = make_lw_shared<replica::memtable>(s);
 
@@ -3029,7 +3030,7 @@ static flat_mutation_reader_v2 compacted_sstable_reader(test_env& env, schema_pt
     desc.replacer = replacer_fn_no_op();
     auto cdata = compaction_manager::create_compaction_data();
     compaction_progress_monitor progress_monitor;
-    sstables::compact_sstables(std::move(desc), cdata, cf->as_table_state(), progress_monitor).get();
+    sstables::compact_sstables(std::move(desc), cdata, cf->try_get_table_state_with_static_sharding(), progress_monitor).get();
 
     return compacted_sst->as_mutation_source().make_reader_v2(s, env.make_reader_permit(), query::full_partition_range, s->full_slice());
 }
@@ -3087,9 +3088,9 @@ SEASTAR_TEST_CASE(compact_deleted_row) {
      *   }
      * ]
      */
-    mutation_opt m = with_closeable(compacted_sstable_reader(env, s, table_name, {1, 2}), [&] (flat_mutation_reader_v2& reader) {
-        return read_mutation_from_flat_mutation_reader(reader);
-    }).get0();
+    mutation_opt m = with_closeable(compacted_sstable_reader(env, s, table_name, {1, 2}), [&] (mutation_reader& reader) {
+        return read_mutation_from_mutation_reader(reader);
+    }).get();
     BOOST_REQUIRE(m);
     BOOST_REQUIRE(m->key().equal(*s, partition_key::from_singular(*s, data_value(sstring("key")))));
     BOOST_REQUIRE(!m->partition().partition_tombstone());
@@ -3159,9 +3160,9 @@ SEASTAR_TEST_CASE(compact_deleted_cell) {
      *]
      *
      */
-    mutation_opt m = with_closeable(compacted_sstable_reader(env, s, table_name, {1, 2}), [&] (flat_mutation_reader_v2& reader) {
-        return read_mutation_from_flat_mutation_reader(reader);
-    }).get0();
+    mutation_opt m = with_closeable(compacted_sstable_reader(env, s, table_name, {1, 2}), [&] (mutation_reader& reader) {
+        return read_mutation_from_mutation_reader(reader);
+    }).get();
     BOOST_REQUIRE(m);
     BOOST_REQUIRE(m->key().equal(*s, partition_key::from_singular(*s, data_value(sstring("key")))));
     BOOST_REQUIRE(!m->partition().partition_tombstone());
@@ -3189,8 +3190,10 @@ static void compare_sstables(const std::filesystem::path& result_path, sstring t
                                   "ks", table_name, sstables::sstable_version_types::mc, generation_from_value(1), big, file_type);
         auto result_filename =
                 sstable::filename(result_path.string(), "ks", table_name, sst->get_version(), sst->generation(), big, file_type);
-        auto eq = tests::compare_files(orig_filename, result_filename).get0();
-        BOOST_REQUIRE(eq);
+        auto eq = tests::compare_files(orig_filename, result_filename).get();
+        if (!eq) {
+            BOOST_FAIL(format("Files {} and {} are different", orig_filename, result_filename));
+        }
     }
 }
 
@@ -3278,7 +3281,7 @@ static constexpr api::timestamp_type write_timestamp = 1525385507816568;
 static constexpr gc_clock::time_point write_time_point = gc_clock::time_point{} + gc_clock::duration{1525385507};
 
 static void do_validate_stats_metadata(schema_ptr s, sstable_assertions& written_sst, sstring table_name) {
-    auto orig_sst = written_sst.get_env().reusable_sst(s, get_write_test_path(table_name), 1, sstable_version_types::mc).get0();
+    auto orig_sst = written_sst.get_env().reusable_sst(s, get_write_test_path(table_name), 1, sstable_version_types::mc).get();
 
     const auto& orig_stats = orig_sst->get_stats_metadata();
     const auto& written_stats = written_sst.get_stats_metadata();
@@ -3469,7 +3472,7 @@ SEASTAR_TEST_CASE(test_write_wide_partitions) {
     mutation mut1{s, key1};
     {
         mut1.set_static_cell("st", data_value{"hello"}, ts);
-        for (auto idx: boost::irange(0, 1024)) {
+        for (auto idx: std::views::iota(0, 1024)) {
             clustering_key ckey = clustering_key::from_deeply_exploded(*s, {format("{}{}", ck_base, idx)});
             mut1.partition().apply_insert(*s, ckey, ts);
             mut1.set_cell(ckey, "rc", data_value{format("{}{}", rc_base, idx)}, ts);
@@ -3481,7 +3484,7 @@ SEASTAR_TEST_CASE(test_write_wide_partitions) {
     mutation mut2{s, key2};
     {
         mut2.set_static_cell("st", data_value{"goodbye"}, ts);
-        for (auto idx: boost::irange(0, 1024)) {
+        for (auto idx: std::views::iota(0, 1024)) {
             clustering_key ckey = clustering_key::from_deeply_exploded(*s, {format("{}{}", ck_base, idx)});
             mut2.partition().apply_insert(*s, ckey, ts);
             mut2.set_cell(ckey, "rc", data_value{format("{}{}", rc_base, idx)}, ts);
@@ -3666,7 +3669,7 @@ SEASTAR_TEST_CASE(test_write_multiple_partitions) {
     // INSERT INTO multiple_partitions (pk, rc2) VALUES (2, 20) USING TIMESTAMP 1525385507816578;
     // INSERT INTO multiple_partitions (pk, rc3) VALUES (3, 30) USING TIMESTAMP 1525385507816588;
     std::vector<mutation> muts;
-    for (auto i : boost::irange(1, 4)) {
+    for (auto i : std::views::iota(1, 4)) {
         auto key = partition_key::from_deeply_exploded(*s, {i});
         muts.emplace_back(s, key);
 
@@ -3689,7 +3692,7 @@ static future<> test_write_many_partitions(sstring table_name, tombstone partiti
     schema_ptr s = builder.build(schema_builder::compact_storage::no);
 
     std::vector<mutation> muts;
-    for (auto i : boost::irange(0, 65536)) {
+    for (auto i : std::views::iota(0, 65536)) {
         auto key = partition_key::from_deeply_exploded(*s, {i});
         muts.emplace_back(s, key);
         if (partition_tomb) {
@@ -3701,7 +3704,7 @@ static future<> test_write_many_partitions(sstring table_name, tombstone partiti
     for (auto version : test_sstable_versions) {
         lw_shared_ptr<replica::memtable> mt = make_memtable(s, muts);
         auto sst = compressed ? write_sstables(env, s, mt, version) : write_and_compare_sstables(env, s, mt, table_name, version);
-        boost::sort(muts, mutation_decorated_key_less_comparator());
+        std::ranges::sort(muts, mutation_decorated_key_less_comparator());
         validate_read(env, sst, muts);
     }
   });
@@ -3771,7 +3774,7 @@ SEASTAR_TEST_CASE(test_write_multiple_rows) {
     // INSERT INTO multiple_rows (pk, ck, rc1) VALUES (0, 1, 10) USING TIMESTAMP 1525385507816568;
     // INSERT INTO multiple_rows (pk, ck, rc2) VALUES (0, 2, 20) USING TIMESTAMP 1525385507816578;
     // INSERT INTO multiple_rows (pk, ck, rc3) VALUES (0, 3, 30) USING TIMESTAMP 1525385507816588;
-    for (auto i : boost::irange(1, 4)) {
+    for (auto i : std::views::iota(1, 4)) {
         clustering_key ckey = clustering_key::from_deeply_exploded(*s, { i });
         mut.partition().apply_insert(*s, ckey, ts);
         mut.set_cell(ckey, to_bytes(format("rc{}", i)), data_value{i * 10}, ts);
@@ -3791,7 +3794,7 @@ SEASTAR_TEST_CASE(test_write_missing_columns_large_set) {
     schema_builder builder("sst3", table_name);
     builder.with_column("pk", int32_type, column_kind::partition_key);
     builder.with_column("ck", int32_type, column_kind::clustering_key);
-    for (auto idx: boost::irange(1, 65)) {
+    for (auto idx: std::views::iota(1, 65)) {
         builder.with_column(to_bytes(format("rc{}", idx)), int32_type);
     }
     builder.set_compressor_params(compression_parameters::no_compression());
@@ -3806,7 +3809,7 @@ SEASTAR_TEST_CASE(test_write_missing_columns_large_set) {
     {
         clustering_key ckey = clustering_key::from_deeply_exploded(*s, {0});
         mut.partition().apply_insert(*s, ckey, ts);
-        for (auto idx: boost::irange(1, 63)) {
+        for (auto idx: std::views::iota(1, 63)) {
             mut.set_cell(ckey, to_bytes(format("rc{}", idx)), data_value{idx}, ts);
         }
     }
@@ -3870,7 +3873,7 @@ SEASTAR_TEST_CASE(test_write_counter_table) {
         counter_id{utils::UUID{"e079a6fe-eb79-4bdf-97ca-c87a2c387d5c"}},
         counter_id{utils::UUID{"bbba5897-78b6-4cdc-9a0d-ea9e9a3b833f"}},
     };
-    boost::range::sort(ids);
+    std::ranges::sort(ids);
 
     const column_definition& cdef1 = *s->get_column_definition("rc1");
     const column_definition& cdef2 = *s->get_column_definition("rc2");
@@ -3995,7 +3998,7 @@ SEASTAR_TEST_CASE(test_write_large_clustering_key) {
     // CREATE TABLE large_clustering_key (pk int, ck1 text, ck2 text, ..., ck35 text, rc int, PRIMARY KEY (pk, ck1, ck2, ..., ck35)) WITH compression = {'sstable_compression': ''};
     schema_builder builder("sst3", table_name);
     builder.with_column("pk", int32_type, column_kind::partition_key);
-    for (auto idx: boost::irange(1, 36)) {
+    for (auto idx: std::views::iota(1, 36)) {
         builder.with_column(to_bytes(format("ck{}", idx)), utf8_type, column_kind::clustering_key);
     }
     builder.with_column("rc", int32_type);
@@ -4010,7 +4013,7 @@ SEASTAR_TEST_CASE(test_write_large_clustering_key) {
     //    - "X" for odd X
     // INSERT INTO large_clustering_key (pk, ck1, ..., ck35, rc) VALUES (0, '1', '', '3',..., '', '35', 1) USING TIMESTAMP 1525385507816568;
     std::vector<data_value> clustering_values;
-    for (auto idx: boost::irange(1, 36)) {
+    for (auto idx: std::views::iota(1, 36)) {
         clustering_values.emplace_back((idx % 2 == 1) ? std::to_string(idx) : std::string{});
     }
     clustering_key ckey = clustering_key::from_deeply_exploded(*s, clustering_values);
@@ -4248,6 +4251,9 @@ SEASTAR_TEST_CASE(test_write_mixed_rows_and_range_tombstones) {
 
 SEASTAR_TEST_CASE(test_write_many_range_tombstones) {
   return test_env::do_with_async([] (test_env& env) {
+    // Golden copy sstables were written without this feature, which affects Index contents.
+    env.manager().set_correct_pi_block_width(false);
+
     sstring table_name = "many_range_tombstones";
     // CREATE TABLE many_range_tombstones (pk text, ck1 text, ck2 text, PRIMARY KEY (pk, ck1, ck2) WITH compression = {'sstable_compression': ''};
     schema_builder builder("sst3", table_name);
@@ -4263,7 +4269,7 @@ SEASTAR_TEST_CASE(test_write_many_range_tombstones) {
     gc_clock::time_point tp = gc_clock::time_point{} + gc_clock::duration{1528226962};
     tombstone tomb{write_timestamp, tp};
     sstring ck_base(650, 'a');
-    for (auto idx: boost::irange(1000, 1100)) {
+    for (auto idx: std::views::iota(1000, 1100)) {
         range_tombstone rt{clustering_key_prefix::from_single_value(*s, to_bytes(format("{}{}", ck_base, idx * 2))), tomb,
                            bound_kind::excl_start,
                            clustering_key_prefix::from_single_value(*s, to_bytes(format("{}{}", ck_base, idx * 2 + 1))),
@@ -4542,7 +4548,7 @@ static std::unique_ptr<index_reader> get_index_reader(shared_sstable sst, reader
 }
 
 shared_sstable make_test_sstable(test_env& env, schema_ptr schema, const sstring& table_name) {
-    return env.reusable_sst(schema, get_read_index_test_path(table_name), sstables::generation_type{1}).get0();
+    return env.reusable_sst(schema, get_read_index_test_path(table_name), sstables::generation_type{1}).get();
 }
 
 /*
@@ -5089,7 +5095,8 @@ SEASTAR_TEST_CASE(test_sstable_reader_on_unknown_column) {
 namespace {
 struct large_row_handler : public db::large_data_handler {
     using callback_t = std::function<void(const schema& s, const sstables::key& partition_key,
-            const clustering_key_prefix* clustering_key, uint64_t row_size, const column_definition* cdef, uint64_t cell_size, uint64_t collection_elements)>;
+            const clustering_key_prefix* clustering_key, uint64_t row_size, uint64_t range_tombstones, uint64_t dead_rows,
+            const column_definition* cdef, uint64_t cell_size, uint64_t collection_elements)>;
     callback_t callback;
 
     large_row_handler(uint64_t large_rows_threshold, uint64_t rows_count_threshold, uint64_t cell_threshold_bytes, uint64_t collection_elements_threshold, callback_t callback)
@@ -5102,21 +5109,21 @@ struct large_row_handler : public db::large_data_handler {
     virtual future<> record_large_rows(const sstables::sstable& sst, const sstables::key& partition_key,
             const clustering_key_prefix* clustering_key, uint64_t row_size) const override {
         const schema_ptr s = sst.get_schema();
-        callback(*s, partition_key, clustering_key, row_size, nullptr, 0, 0);
+        callback(*s, partition_key, clustering_key, row_size, 0, 0, nullptr, 0, 0);
         return make_ready_future<>();
     }
 
     virtual future<> record_large_cells(const sstables::sstable& sst, const sstables::key& partition_key,
         const clustering_key_prefix* clustering_key, const column_definition& cdef, uint64_t cell_size, uint64_t collection_elements) const override {
         const schema_ptr s = sst.get_schema();
-        callback(*s, partition_key, clustering_key, 0, &cdef, cell_size, collection_elements);
+        callback(*s, partition_key, clustering_key, 0, 0, 0, &cdef, cell_size, collection_elements);
         return make_ready_future<>();
     }
 
-    virtual future<> record_large_partitions(const sstables::sstable& sst,
-        const sstables::key& partition_key, uint64_t partition_size, uint64_t rows_count) const override {
+    virtual future<> record_large_partitions(const sstables::sstable& sst, const sstables::key& partition_key,
+            uint64_t partition_size, uint64_t rows_count, uint64_t range_tombstones_count, uint64_t dead_rows_count) const override {
         const schema_ptr s = sst.get_schema();
-        callback(*s, partition_key, nullptr, rows_count, nullptr, 0, 0);
+        callback(*s, partition_key, nullptr, rows_count, range_tombstones_count, dead_rows_count, nullptr, 0, 0);
         return make_ready_future<>();
     }
 
@@ -5130,11 +5137,13 @@ static void test_sstable_write_large_row_f(schema_ptr s, reader_permit permit, r
         std::vector<clustering_key*> expected, uint64_t threshold, sstables::sstable_version_types version) {
     unsigned i = 0;
     auto f = [&i, &expected, &pk, &threshold](const schema& s, const sstables::key& partition_key,
-                     const clustering_key_prefix* clustering_key, uint64_t row_size,
+                     const clustering_key_prefix* clustering_key, uint64_t row_size, uint64_t range_tombstones, uint64_t dead_rows,
                      const column_definition* cdef, uint64_t cell_size, uint64_t collection_elements) {
-        BOOST_REQUIRE_EQUAL(pk.components(s), partition_key.to_partition_key(s).components(s));
+        BOOST_REQUIRE(std::ranges::equal(pk.components(s), partition_key.to_partition_key(s).components(s)));
         BOOST_REQUIRE_LT(i, expected.size());
         BOOST_REQUIRE_GT(row_size, threshold);
+        BOOST_REQUIRE_EQUAL(range_tombstones, 0);
+        BOOST_REQUIRE_EQUAL(dead_rows, 0);
 
         if (clustering_key) {
             BOOST_REQUIRE(expected[i]->equal(s, *clustering_key));
@@ -5181,12 +5190,14 @@ static void test_sstable_write_large_cell_f(schema_ptr s, reader_permit permit, 
         std::vector<clustering_key*> expected, uint64_t threshold, sstables::sstable_version_types version) {
     unsigned i = 0;
     auto f = [&i, &expected, &pk, &threshold](const schema& s, const sstables::key& partition_key,
-                     const clustering_key_prefix* clustering_key, uint64_t row_size,
+                     const clustering_key_prefix* clustering_key, uint64_t row_size, uint64_t range_tombstones, uint64_t dead_rows,
                      const column_definition* cdef, uint64_t cell_size, uint64_t collection_elements) {
         BOOST_TEST_MESSAGE(format("i={} ck={} cell_size={} threshold={}", i, clustering_key ? format("{}", *clustering_key) : "null", cell_size, threshold));
-        BOOST_REQUIRE_EQUAL(pk.components(s), partition_key.to_partition_key(s).components(s));
+        BOOST_REQUIRE(std::ranges::equal(pk.components(s), partition_key.to_partition_key(s).components(s)));
         BOOST_REQUIRE_LT(i, expected.size());
         BOOST_REQUIRE_GT(cell_size, threshold);
+        BOOST_REQUIRE_EQUAL(range_tombstones, 0);
+        BOOST_REQUIRE_EQUAL(dead_rows, 0);
 
         if (clustering_key) {
             BOOST_REQUIRE(expected[i]->equal(s, *clustering_key));
@@ -5229,7 +5240,7 @@ SEASTAR_THREAD_TEST_CASE(test_sstable_write_large_cell) {
     }
 }
 
-static void test_sstable_log_too_many_rows_f(int rows, uint64_t threshold, bool expected, sstable_version_types version) {
+static void test_sstable_log_too_many_rows_f(int rows, int range_tombstones, uint64_t threshold, bool expected, sstable_version_types version) {
     simple_schema s;
     tests::reader_concurrency_semaphore_wrapper semaphore;
     mutation p = s.new_mutation("pv");
@@ -5239,15 +5250,24 @@ static void test_sstable_log_too_many_rows_f(int rows, uint64_t threshold, bool 
         sv += "foo ";
         s.add_row(p, s.make_ckey(sv), sv);
     }
+    for (auto idx = 0; idx < range_tombstones; ++idx) {
+        s.delete_range(p, s.make_ckey_range(0 + idx*2, 1 + idx*2));
+    }
+
     schema_ptr sc = s.schema();
     auto mt = make_memtable(sc, {p});
 
     bool logged = false;
-    auto f = [&logged, &pk, &threshold](const schema& sc, const sstables::key& partition_key,
-                     const clustering_key_prefix* clustering_key, uint64_t rows_count,
+    auto f = [&logged, &pk, &threshold, &rows, &range_tombstones](const schema& sc, const sstables::key& partition_key,
+                     const clustering_key_prefix* clustering_key, uint64_t rows_count, uint64_t range_tombstones_count, uint64_t dead_rows,
                      const column_definition* cdef, uint64_t cell_size, uint64_t collection_elements) {
         BOOST_REQUIRE_GT(rows_count, threshold);
-        BOOST_REQUIRE_EQUAL(pk.components(sc), partition_key.to_partition_key(sc).components(sc));
+        BOOST_REQUIRE(std::ranges::equal(pk.components(sc), partition_key.to_partition_key(sc).components(sc)));
+        BOOST_REQUIRE_EQUAL(dead_rows, 0);
+
+        // Inserting one range tombstone creates two range tombstone marker rows
+        BOOST_REQUIRE_EQUAL(rows_count, rows + range_tombstones * 2);
+        BOOST_REQUIRE_EQUAL(range_tombstones_count, range_tombstones * 2);
         logged = true;
     };
 
@@ -5266,15 +5286,128 @@ SEASTAR_THREAD_TEST_CASE(test_sstable_log_too_many_rows) {
     uint64_t random = tests::random::get_int(1, 100);
 
     // This test creates a sstable with a given number of rows and test it against a
+    // compaction_rows_count_warning_threshold. A warning is triggered when the sum of
+    // the number of rows and the number of range tombstone markers exceeds the threshold.
+    for (auto version : test_sstable_versions) {
+        test_sstable_log_too_many_rows_f(random, 0, 0, true, version);
+        test_sstable_log_too_many_rows_f(random, 0, (random - 1), true, version);
+        test_sstable_log_too_many_rows_f(random, 0, random, false, version);
+        test_sstable_log_too_many_rows_f(random, 0, (random + 1), false, version);
+        test_sstable_log_too_many_rows_f((random + 1), 0, random, true, version);
+
+        test_sstable_log_too_many_rows_f(random, 1, (random + 1), true, version);
+        test_sstable_log_too_many_rows_f(random, 1, (random + 2), false, version);
+        test_sstable_log_too_many_rows_f(random, 2, (random + 2), true, version);
+    }
+}
+
+
+static void test_sstable_log_too_many_dead_rows_f(int rows, uint64_t threshold, bool expected, sstable_version_types version) {
+    simple_schema s;
+    tests::reader_concurrency_semaphore_wrapper semaphore;
+    mutation p = s.new_mutation("pv");
+    const partition_key& pk = p.key();
+    sstring sv;
+    int live_rows = 0;
+    int expected_dead_rows = 0;
+    int expected_expired_rows = 0;
+    int expected_rows_with_dead_cell = 0;
+    int expected_range_tombstones = 0;
+    while (live_rows + expected_dead_rows + expected_expired_rows + expected_rows_with_dead_cell + expected_range_tombstones < rows - 1) {
+        sv += "X";
+        auto ck = s.make_ckey(sv);
+        switch (tests::random::get_int(0, 4)) {
+        case 0:
+            // regular row
+            s.add_row(p, ck, sv);
+            ++live_rows;
+            testlog.debug("added live row: {}", ck);
+            break;
+        case 1: {
+            // dead (deleted) row
+            auto& row = p.partition().clustered_row(*s.schema(), ck);
+            row.apply(row_marker(s.new_tombstone()));
+            testlog.debug("added dead row: {}", ck);
+            ++expected_dead_rows;
+            break;
+        }
+        case 2: {
+            // dead (expired) row
+            auto& row = p.partition().clustered_row(*s.schema(), ck);
+            row.apply(row_marker(s.new_timestamp(), gc_clock::duration(1), gc_clock::now()));
+            testlog.debug("added expired row: {}", ck);
+            ++expected_expired_rows;
+            break;
+        }
+        case 3: {
+            // row with dead cell
+            s.add_row_with_dead_cell(p, ck);
+            ++expected_rows_with_dead_cell;
+            testlog.debug("added row with dead cell: {}", ck);
+            break;
+        }
+        case 4: {
+            // multi-row range tombstone
+            if (live_rows + expected_dead_rows + expected_rows_with_dead_cell + expected_expired_rows + expected_range_tombstones + 2 >= rows - 1) {
+                continue;
+            }
+            auto ck_start = ck;
+            auto rt_start = bound_view(ck_start, tests::random::get_bool() ? bound_kind::incl_start : bound_kind::excl_start);
+            auto sv_end = sv;
+            auto rt_size = tests::random::get_int(1, 10);
+            for (auto i = 0; i < rt_size; i++) {
+                sv += "X";
+            }
+            auto ck_end = s.make_ckey(sv);
+            auto rt_end = bound_view(ck_end, tests::random::get_bool() ? bound_kind::excl_end : bound_kind::incl_end);
+            auto rt = range_tombstone(rt_start, rt_end, s.new_tombstone());
+            testlog.debug("added range tombstone: {}", rt);
+            p.partition().apply_delete(*s.schema(), std::move(rt));
+            expected_range_tombstones += 2;
+            break;
+        }
+        }
+    }
+    schema_ptr sc = s.schema();
+    auto mt = make_lw_shared<replica::memtable>(sc);
+    mt->apply(p);
+
+    bool logged = false;
+    auto f = [&] (const schema& sc, const sstables::key& partition_key,
+                     const clustering_key_prefix* clustering_key, uint64_t rows_count, uint64_t range_tombstones, uint64_t dead_rows,
+                     const column_definition* cdef, uint64_t cell_size, uint64_t collection_elements) {
+        BOOST_REQUIRE_GT(rows_count, threshold);
+        BOOST_REQUIRE_EQUAL(rows_count, rows);
+        BOOST_REQUIRE_EQUAL(dead_rows, expected_dead_rows + expected_expired_rows + expected_rows_with_dead_cell);
+        BOOST_REQUIRE_EQUAL(range_tombstones, expected_range_tombstones);
+        BOOST_REQUIRE(std::ranges::equal(pk.components(sc), partition_key.to_partition_key(sc).components(sc)));
+        logged = true;
+    };
+
+    large_row_handler handler(std::numeric_limits<uint64_t>::max(), threshold, std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max(), f);
+
+    sstables::test_env::do_with_async([&] (auto& env) {
+        auto sst = env.make_sstable(sc, version);
+        sst->write_components(mt->make_flat_reader(sc, semaphore.make_permit()), 1, sc, env.manager().configure_writer("test"), encoding_stats{}).get();
+
+        BOOST_REQUIRE_EQUAL(logged, expected);
+    }, { &handler }).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_sstable_log_too_many_dead_rows) {
+    // Generates a pseudo-random number from 1 to 100
+    uint64_t random = tests::random::get_int(1, 100);
+
+    // This test creates a sstable with a given number of rows and test it against a
     // compaction_rows_count_warning_threshold. A warning is triggered when the number of rows
     // exceeds the threshold.
-  for (auto version : test_sstable_versions) {
-    test_sstable_log_too_many_rows_f(random, 0, true, version);
-    test_sstable_log_too_many_rows_f(random, (random - 1), true, version);
-    test_sstable_log_too_many_rows_f(random, random, false, version);
-    test_sstable_log_too_many_rows_f(random, (random + 1), false, version);
-    test_sstable_log_too_many_rows_f((random + 1), random, true, version);
-  }
+    for (auto version : test_sstable_versions) {
+        test_sstable_log_too_many_dead_rows_f(random, 0, true, version);
+        test_sstable_log_too_many_dead_rows_f(random, (random - 1), true, version);
+        test_sstable_log_too_many_dead_rows_f(random, random, false, version);
+        test_sstable_log_too_many_dead_rows_f(random, (random + 1), false, version);
+        test_sstable_log_too_many_dead_rows_f((random + 1), random, true, version);
+    }
 }
 
 
@@ -5293,10 +5426,12 @@ static void test_sstable_too_many_collection_elements_f(int elements, uint64_t t
 
     bool logged = false;
     auto f = [&logged, &pk, &threshold](const schema& sc, const sstables::key& partition_key,
-                     const clustering_key_prefix* clustering_key, uint64_t rows_count,
+                     const clustering_key_prefix* clustering_key, uint64_t rows_count, uint64_t range_tombstones, uint64_t dead_rows,
                      const column_definition* cdef, uint64_t cell_size, uint64_t collection_elements) {
         BOOST_REQUIRE_GT(collection_elements, threshold);
-        BOOST_REQUIRE_EQUAL(pk.components(sc), partition_key.to_partition_key(sc).components(sc));
+        BOOST_REQUIRE(std::ranges::equal(pk.components(sc), partition_key.to_partition_key(sc).components(sc)));
+        BOOST_REQUIRE_EQUAL(range_tombstones, 0);
+        BOOST_REQUIRE_EQUAL(dead_rows, 0);
         logged = true;
     };
 
@@ -5475,5 +5610,82 @@ SEASTAR_TEST_CASE(test_compression_premature_eof) {
             std::string what = e.what();
             BOOST_REQUIRE(what.find("compressed reader hit premature end-of-file") != std::string::npos);
         }
+    });
+}
+
+// A reproducer for scylladb/scylladb#16065.
+// Creates an sstable with a newer schema, and populates
+// it with a reader created with an older schema.
+// 
+// Before the fixes, it would have resulted in an SCYLLA_ASSERT violation.
+SEASTAR_TEST_CASE(test_alter_bloom_fp_chance_during_write) {
+    return test_env::do_with_async([] (test_env& env) {
+        auto s1 = schema_builder("ks", "t")
+            .with_column("pk", bytes_type, column_kind::partition_key)
+            .with_column("v", utf8_type, column_kind::regular_column)
+            .set_bloom_filter_fp_chance(1.0)
+            .build();
+        auto s2 = schema_builder(s1)
+            .set_bloom_filter_fp_chance(0.01)
+            .build();
+
+        auto ts = api::new_timestamp();
+
+        auto m = mutation(s1, partition_key::from_single_value(*s1, serialized(0)));
+        auto val = std::string(1000, '0');
+        m.set_clustered_cell(clustering_key::make_empty(), "v", val, ts);
+
+        auto mt = make_lw_shared<replica::memtable>(s1);
+        mt->apply(m);
+
+        auto sst = env.make_sstable(s2, sstable_version_types::me);
+        sst->write_components(mt->make_flat_reader(s1, env.make_reader_permit()), 1, s1, env.manager().configure_writer(), mt->get_encoding_stats()).get();
+
+        sstable_assertions sa(env, sst);
+        sa.load();
+        m.upgrade(s2);
+        auto assertions = assert_that(sa.make_reader());
+        assertions.produces(m);
+        assertions.produces_end_of_stream();
+    });
+}
+
+// Reproducer for scylladb/scylladb#16065.
+// Creates an sstable with a newer schema, and populates
+// it with a reader created with an older schema.
+//
+// Before the fixes, it would result in a "compress is not supported" error.
+SEASTAR_TEST_CASE(test_alter_compression_during_write) {
+    return test_env::do_with_async([] (test_env& env) {
+        auto s1 = schema_builder("ks", "t")
+            .with_column("pk", bytes_type, column_kind::partition_key)
+            .with_column("v", utf8_type, column_kind::regular_column)
+            .set_compressor_params(std::map<sstring, sstring>{
+            })
+            .build();
+        auto s2 = schema_builder(s1)
+            .set_compressor_params(std::map<sstring, sstring>{
+                {"sstable_compression", "org.apache.cassandra.io.compress.ZstdCompressor"}
+            })
+            .build();
+
+        auto ts = api::new_timestamp();
+
+        auto m = mutation(s1, partition_key::from_single_value(*s1, serialized(0)));
+        auto val = std::string(1000, '0');
+        m.set_clustered_cell(clustering_key::make_empty(), "v", val, ts);
+
+        auto mt = make_lw_shared<replica::memtable>(s1);
+        mt->apply(m);
+
+        auto sst = env.make_sstable(s2, sstable_version_types::me);
+        sst->write_components(mt->make_flat_reader(s1, env.make_reader_permit()), 1, s1, env.manager().configure_writer(), mt->get_encoding_stats()).get();
+
+        sstable_assertions sa(env, sst);
+        sa.load();
+        m.upgrade(s2);
+        auto assertions = assert_that(sa.make_reader());
+        assertions.produces(m);
+        assertions.produces_end_of_stream();
     });
 }

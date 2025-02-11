@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -12,6 +12,7 @@
 #include "utils/estimated_histogram.hh"
 #include "utils/histogram.hh"
 #include <seastar/core/metrics.hh>
+#include "locator/host_id.hh"
 
 namespace locator { class topology; }
 
@@ -54,7 +55,7 @@ public:
     split_stats(const sstring& category, const sstring& short_description_prefix, const sstring& long_description_prefix, const sstring& op_type, bool auto_register_metrics = true);
 
     void register_metrics_local();
-    void register_metrics_for(sstring dc, gms::inet_address ep);
+    void register_metrics_for(sstring dc, locator::host_id ep);
 
     /**
      * Get a reference to the statistics counter corresponding to the given
@@ -64,7 +65,7 @@ public:
      *
      * @return a reference to the requested counter
      */
-    uint64_t& get_ep_stat(const locator::topology& topo, gms::inet_address ep) noexcept;
+    uint64_t& get_ep_stat(const locator::topology& topo, locator::host_id ep) noexcept;
 };
 
 struct write_stats {
@@ -100,6 +101,7 @@ struct write_stats {
     uint64_t background_writes = 0; // client no longer waits for the write
     uint64_t throttled_writes = 0; // total number of writes ever delayed due to throttling
     uint64_t throttled_base_writes = 0; // current number of base writes delayed due to view update backlog
+    uint64_t total_throttled_base_writes = 0; // total number of base writes delayed due to view update backlog
     uint64_t background_writes_failed = 0;
     uint64_t writes_failed_due_to_too_many_in_flight_hints = 0;
 
@@ -115,6 +117,7 @@ struct write_stats {
     seastar::metrics::metric_groups _metrics;
 
     std::chrono::microseconds last_mv_flow_control_delay; // delay added for MV flow control in the last request
+    uint64_t mv_flow_control_delay = 0; // total delay added for MV flow control (in microseconds)
 public:
     write_stats();
     write_stats(const sstring& category, bool auto_register_stats);
@@ -188,6 +191,10 @@ struct stats : public write_stats {
     split_stats mutation_data_read_attempts;
     split_stats mutation_data_read_completed;
     split_stats mutation_data_read_errors;
+
+    // Received hints
+    uint64_t received_hints_total = 0;
+    uint64_t received_hints_bytes_total = 0;
 
 public:
     stats();

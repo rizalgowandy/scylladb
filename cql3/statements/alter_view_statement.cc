@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include <seastar/core/coroutine.hh>
@@ -15,7 +15,6 @@
 #include "service/storage_proxy.hh"
 #include "validation.hh"
 #include "view_info.hh"
-#include "db/extensions.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "cql3/query_processor.hh"
 
@@ -57,7 +56,7 @@ view_ptr alter_view_statement::prepare_view(data_dictionary::database db) const 
     _properties->validate(db, keyspace(), schema_extensions);
 
     auto builder = schema_builder(schema);
-    _properties->apply_to_builder(builder, std::move(schema_extensions));
+    _properties->apply_to_builder(builder, std::move(schema_extensions), db, keyspace());
 
     if (builder.get_gc_grace_seconds() == 0) {
         throw exceptions::invalid_request_exception(
@@ -76,7 +75,7 @@ view_ptr alter_view_statement::prepare_view(data_dictionary::database db) const 
     return view_ptr(builder.build());
 }
 
-future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>> alter_view_statement::prepare_schema_mutations(query_processor& qp, api::timestamp_type ts) const {
+future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>> alter_view_statement::prepare_schema_mutations(query_processor& qp, const query_options&, api::timestamp_type ts) const {
     auto m = co_await service::prepare_view_update_announcement(qp.proxy(), prepare_view(qp.db()), ts);
 
     using namespace cql_transport;
@@ -91,7 +90,7 @@ future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector
 
 std::unique_ptr<cql3::statements::prepared_statement>
 alter_view_statement::prepare(data_dictionary::database db, cql_stats& stats) {
-    return std::make_unique<prepared_statement>(make_shared<alter_view_statement>(*this));
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<alter_view_statement>(*this));
 }
 
 }

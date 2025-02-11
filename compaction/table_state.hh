@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -39,6 +39,7 @@ public:
     virtual bool compaction_enforce_min_threshold() const noexcept = 0;
     virtual const sstables::sstable_set& main_sstable_set() const = 0;
     virtual const sstables::sstable_set& maintenance_sstable_set() const = 0;
+    virtual lw_shared_ptr<const sstables::sstable_set> sstable_set_for_tombstone_gc() const = 0;
     virtual std::unordered_set<sstables::shared_sstable> fully_expired_sstables(const std::vector<sstables::shared_sstable>& sstables, gc_clock::time_point compaction_time) const = 0;
     virtual const std::vector<sstables::shared_sstable>& compacted_undeleted_sstables() const noexcept = 0;
     virtual sstables::compaction_strategy& get_compaction_strategy() const noexcept = 0;
@@ -48,6 +49,9 @@ public:
     virtual sstables::shared_sstable make_sstable() const = 0;
     virtual sstables::sstable_writer_config configure_writer(sstring origin) const = 0;
     virtual api::timestamp_type min_memtable_timestamp() const = 0;
+    virtual api::timestamp_type min_memtable_live_timestamp() const = 0;
+    virtual api::timestamp_type min_memtable_live_row_marker_timestamp() const = 0;
+    virtual bool memtable_has_key(const dht::decorated_key& key) const = 0;
     virtual future<> on_compaction_completion(sstables::compaction_completion_desc desc, sstables::offstrategy offstrategy) = 0;
     virtual bool is_auto_compaction_disabled_by_user() const noexcept = 0;
     virtual bool tombstone_gc_enabled() const noexcept = 0;
@@ -55,6 +59,7 @@ public:
     virtual compaction_backlog_tracker& get_backlog_tracker() = 0;
     virtual const std::string get_group_id() const noexcept = 0;
     virtual seastar::condition_variable& get_staging_done_condition() noexcept = 0;
+    virtual dht::token_range get_token_range_after_split(const dht::token& t) const noexcept = 0;
 };
 
 } // namespace compaction
@@ -62,7 +67,7 @@ public:
 namespace fmt {
 
 template <>
-struct formatter<compaction::table_state> : formatter<std::string_view> {
+struct formatter<compaction::table_state> : formatter<string_view> {
     template <typename FormatContext>
     auto format(const compaction::table_state& t, FormatContext& ctx) const {
         auto s = t.schema();

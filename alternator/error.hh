@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -87,6 +87,9 @@ public:
     }
     static api_error table_not_found(std::string msg) {
         return api_error("TableNotFoundException", std::move(msg));
+    }
+    static api_error limit_exceeded(std::string msg) {
+        return api_error("LimitExceededException", std::move(msg));
     }
     static api_error internal(std::string msg) {
         return api_error("InternalServerError", std::move(msg), http::reply::status_type::internal_server_error);

@@ -4,12 +4,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include <seastar/core/coroutine.hh>
 #include "sstables-format-selector.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "replica/database.hh"
 #include "gms/gossiper.hh"
 #include "gms/feature_service.hh"
@@ -66,7 +67,6 @@ sstables_format_listener::sstables_format_listener(gms::gossiper& g, sharded<gms
     : _gossiper(g)
     , _features(f)
     , _selector(selector)
-    , _md_feature_listener(*this, sstables::sstable_version_types::md)
     , _me_feature_listener(*this, sstables::sstable_version_types::me)
 { }
 
@@ -83,11 +83,10 @@ future<> sstables_format_listener::maybe_select_format(sstables::sstable_version
 }
 
 future<> sstables_format_listener::start() {
-    assert(this_shard_id() == 0);
+    SCYLLA_ASSERT(this_shard_id() == 0);
     // The listener may fire immediately, create a thread for that case.
     co_await seastar::async([this] {
-        _features.local().me_sstable.when_enabled(_me_feature_listener);
-        _features.local().md_sstable.when_enabled(_md_feature_listener);
+        _me_feature_listener.on_enabled();
     });
 }
 

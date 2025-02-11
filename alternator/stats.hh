@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -11,8 +11,7 @@
 #include <cstdint>
 
 #include <seastar/core/metrics_registration.hh>
-#include "seastarx.hh"
-#include "utils/estimated_histogram.hh"
+#include "utils/histogram.hh"
 #include "cql3/stats.hh"
 
 namespace alternator {
@@ -27,6 +26,8 @@ public:
     struct {
         uint64_t batch_get_item = 0;
         uint64_t batch_write_item = 0;
+        uint64_t batch_get_item_batch_total = 0;
+        uint64_t batch_write_item_batch_total = 0;
         uint64_t create_backup = 0;
         uint64_t create_global_table = 0;
         uint64_t create_table = 0;
@@ -66,11 +67,14 @@ public:
         uint64_t get_shard_iterator = 0;
         uint64_t get_records = 0;
 
-        utils::time_estimated_histogram put_item_latency;
-        utils::time_estimated_histogram get_item_latency;
-        utils::time_estimated_histogram delete_item_latency;
-        utils::time_estimated_histogram update_item_latency;
-        utils::time_estimated_histogram get_records_latency;
+
+        utils::timed_rate_moving_average_summary_and_histogram put_item_latency;
+        utils::timed_rate_moving_average_summary_and_histogram get_item_latency;
+        utils::timed_rate_moving_average_summary_and_histogram delete_item_latency;
+        utils::timed_rate_moving_average_summary_and_histogram update_item_latency;
+        utils::timed_rate_moving_average_summary_and_histogram batch_write_item_latency;
+        utils::timed_rate_moving_average_summary_and_histogram batch_get_item_latency;
+        utils::timed_rate_moving_average_summary_and_histogram get_records_latency;
     } api_operations;
     // Miscellaneous event counters
     uint64_t total_operations = 0;
@@ -80,6 +84,18 @@ public:
     uint64_t shard_bounce_for_lwt = 0;
     uint64_t requests_blocked_memory = 0;
     uint64_t requests_shed = 0;
+    uint64_t rcu_total = 0;
+    // wcu can results from put, update, delete and index
+    // Index related will be done on top of the operation it comes with
+    enum wcu_types {
+        PUT_ITEM,
+        UPDATE_ITEM,
+        DELETE_ITEM,
+        INDEX,
+        NUM_TYPES
+    };
+
+    uint64_t wcu_total[NUM_TYPES] = {0};
     // CQL-derived stats
     cql3::cql_stats cql_stats;
 private:

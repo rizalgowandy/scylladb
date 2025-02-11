@@ -3,15 +3,22 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
+
+#include <seastar/util/closeable.hh>
 
 #include "mutation.hh"
 #include "query-result-writer.hh"
 #include "mutation_rebuilder.hh"
 #include "mutation/json.hh"
+#include "types/collection.hh"
 #include "types/tuple.hh"
 #include "dht/i_partitioner.hh"
+#include "reader_concurrency_semaphore.hh"
+#include "readers/from_mutations_v2.hh"
+
+logging::logger mlog("mutation");
 
 mutation::data::data(dht::decorated_key&& key, schema_ptr&& schema)
     : _schema(std::move(schema))
@@ -100,7 +107,7 @@ mutation_decorated_key_less_comparator::operator()(const mutation& m1, const mut
     return m1.decorated_key().less_compare(*m1.schema(), m2.decorated_key());
 }
 
-boost::iterator_range<std::vector<mutation>::const_iterator>
+std::ranges::subrange<std::vector<mutation>::const_iterator>
 slice(const std::vector<mutation>& partitions, const dht::partition_range& r) {
     struct cmp {
         bool operator()(const dht::ring_position& pos, const mutation& m) const {
@@ -111,7 +118,7 @@ slice(const std::vector<mutation>& partitions, const dht::partition_range& r) {
         };
     };
 
-    return boost::make_iterator_range(
+    return std::ranges::subrange(
         r.start()
             ? (r.start()->is_inclusive()
                 ? std::lower_bound(partitions.begin(), partitions.end(), r.start()->value(), cmp())
@@ -193,24 +200,117 @@ mutation reverse(mutation mut) {
     return *std::move(mut).consume(reverse_rebuilder, consume_in_reverse::yes).result;
 }
 
-std::ostream& operator<<(std::ostream& os, const mutation& m) {
+namespace {
+class mutation_by_size_splitter {
+    struct partition_state {
+        mutation_rebuilder_v2 builder;
+        size_t empty_partition_size;
+        size_t size = 0;
+        explicit partition_state(schema_ptr schema)
+            : builder(std::move(schema))
+        {
+        }
+    };
+    const schema_ptr _schema;
+    std::vector<mutation>& _target;
+    const size_t _max_size;
+    std::optional<partition_state> _state;
+    template <typename T>
+    stop_iteration consume_fragment(T&& fragment) {
+        const auto fragment_size = fragment.memory_usage(*_schema);
+        if (_state->size && _state->size + _state->empty_partition_size + fragment_size > _max_size) {
+            _target.emplace_back(_state->builder.flush());
+            // We could end up with an empty mutation if we consumed a range_tombstone_change
+            // and the next fragment exceeds the limit. The tombstone range may not have been
+            // closed yet and range_tombstone will not be created.
+            // This should be a rare case though, so just pop such mutation.
+            if (_target.back().partition().empty()) {
+                _target.pop_back();
+            }
+            _state->size = 0;
+        }
+        _state->size += fragment_size;
+        _state->builder.consume(std::move(fragment));
+        return stop_iteration::no;
+    }
+public:
+    mutation_by_size_splitter(schema_ptr schema, std::vector<mutation>& target, size_t max_size)
+        : _schema(std::move(schema))
+        , _target(target)
+        , _max_size(max_size)
+    {
+    }
+    void consume_new_partition(const dht::decorated_key& dk) {
+        _state.emplace(_schema);
+        _state->empty_partition_size = _state->builder.consume_new_partition(dk).memory_usage(*_schema);
+    }
+    void consume(tombstone t) {
+        _state->builder.consume(t);
+    }
+    stop_iteration consume(static_row&& sr) {
+        return consume_fragment(std::move(sr));
+    }
+    stop_iteration consume(clustering_row&& cr) {
+        return consume_fragment(std::move(cr));
+    }
+    stop_iteration consume(range_tombstone_change&& rtc) {
+        return consume_fragment(std::move(rtc));
+    }
+    stop_iteration consume_end_of_partition() {
+        _state->builder.consume_end_of_partition();
+        if (auto mut_opt = _state->builder.consume_end_of_stream(); mut_opt) {
+            // This final mutation could be empty if the last consumed fragment was a range_tombstone_change
+            // with no timestamp (i.e. a closing rtc), but a range_tombstone ending at this position
+            // was already emitted in the previous mutation (because the previous mutation was flushed
+            // after consuming a clustering_row at that position).
+            if (!mut_opt->partition().empty()) {
+                _target.emplace_back(std::move(*mut_opt));
+            }
+        } else {
+            on_internal_error(mlog, "consume_end_of_stream didn't return a mutation");
+        }
+        _state.reset();
+        return stop_iteration::no;
+    }
+    stop_iteration consume_end_of_stream() {
+        return stop_iteration::no;
+    }
+};
+}
+
+future<> split_mutation(mutation source, std::vector<mutation>& target, size_t max_size) {
+    reader_concurrency_semaphore sem(reader_concurrency_semaphore::no_limits{}, "split_mutation",
+        reader_concurrency_semaphore::register_metrics::no);
+    {
+        auto s = source.schema();
+        auto reader = make_mutation_reader_from_mutations_v2(s,
+            sem.make_tracking_only_permit(s, "split_mutation", db::no_timeout, {}),
+            std::move(source));
+        co_await with_closeable(std::move(reader), [&] (mutation_reader& reader) {
+            return reader.consume(mutation_by_size_splitter(s, target, max_size));
+        });
+    }
+    co_await sem.stop();
+}
+
+auto fmt::formatter<mutation>::format(const mutation& m, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
     const ::schema& s = *m.schema();
     const auto& dk = m.decorated_key();
 
-    fmt::print(os, "{{table: '{}.{}', key: {{", s.ks_name(), s.cf_name());
+    auto out = ctx.out();
+    out = fmt::format_to(out, "{{table: '{}.{}', key: {{", s.ks_name(), s.cf_name());
 
     auto type_iterator = dk._key.get_compound_type(s)->types().begin();
     auto column_iterator = s.partition_key_columns().begin();
 
     for (auto&& e : dk._key.components(s)) {
-        os << "'" << column_iterator->name_as_text() << "': " << (*type_iterator)->to_string(to_bytes(e)) << ", ";
+        fmt::format_to(out, "'{}': {}, ", column_iterator->name_as_text(), (*type_iterator)->to_string(to_bytes(e)));
         ++type_iterator;
         ++column_iterator;
     }
 
-    fmt::print(os, "token: {}}}, ", dk._token);
-    os << mutation_partition::printer(s, m.partition()) << "\n}";
-    return os;
+    return fmt::format_to(out, "token: {}}}, {}\n}}", dk._token, mutation_partition::printer(s, m.partition()));
 }
 
 namespace mutation_json {

@@ -3,21 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
-#include <vector>
 #include "types/types.hh"
 #include "collection_mutation.hh"
-#include "utils/chunked_vector.hh"
-#include "schema/schema_fwd.hh"
-#include "log.hh"
-
-#include "exceptions/exceptions.hh"
+#include "utils/log.hh"
 
 namespace cql3 {
 

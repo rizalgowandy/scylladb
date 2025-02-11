@@ -3,16 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <seastar/core/iostream.hh>
 #include <seastar/core/fstream.hh>
+#include <boost/range/numeric.hpp>
 #include "sstables/types.hh"
 #include "checksum_utils.hh"
-#include "progress_monitor.hh"
 #include "vint-serialization.hh"
 #include <seastar/core/byteorder.hh>
 #include "version.hh"
@@ -31,57 +31,6 @@ class index_sampling_state;
 class compression;
 class metadata_collector;
 
-class file_writer {
-    output_stream<char> _out;
-    writer_offset_tracker _offset;
-    std::optional<sstring> _filename;
-    bool _closed = false;
-public:
-    file_writer(output_stream<char>&& out, sstring filename) noexcept
-        : _out(std::move(out))
-        , _filename(std::move(filename))
-    {}
-
-    file_writer(output_stream<char>&& out) noexcept
-        : _out(std::move(out))
-    {}
-
-    // Must be called in a seastar thread.
-    virtual ~file_writer();
-    file_writer(const file_writer&) = delete;
-    file_writer(file_writer&& x) noexcept
-        : _out(std::move(x._out))
-        , _offset(std::move(x._offset))
-        , _filename(std::move(x._filename))
-        , _closed(x._closed)
-    {
-        x._closed = true;   // don't auto-close in destructor
-    }
-    // Must be called in a seastar thread.
-    void write(const char* buf, size_t n) {
-        _offset.offset += n;
-        _out.write(buf, n).get();
-    }
-    // Must be called in a seastar thread.
-    void write(bytes_view s) {
-        _offset.offset += s.size();
-        _out.write(reinterpret_cast<const char*>(s.begin()), s.size()).get();
-    }
-    // Must be called in a seastar thread.
-    void close();
-
-    uint64_t offset() const {
-        return _offset.offset;
-    }
-
-    const writer_offset_tracker& offset_tracker() const {
-        return _offset;
-    }
-
-private:
-    const char* get_filename() const noexcept;
-};
-
 
 class sizing_data_sink : public data_sink_impl {
     uint64_t& _size;
@@ -97,7 +46,7 @@ public:
         return make_ready_future<>();
     }
     virtual future<> put(std::vector<temporary_buffer<char>> data) override {
-        _size += boost::accumulate(data | boost::adaptors::transformed(std::mem_fn(&temporary_buffer<char>::size)), 0);
+        _size += std::ranges::fold_left(data | std::views::transform(std::mem_fn(&temporary_buffer<char>::size)), 0, std::plus{});
         return make_ready_future<>();
     }
     virtual future<> put(temporary_buffer<char> buf) override {
@@ -198,7 +147,7 @@ class checksummed_file_writer : public file_writer {
 public:
     checksummed_file_writer(data_sink out, size_t buffer_size, sstring filename)
             : file_writer(make_checksummed_file_output_stream<ChecksumType>(std::move(out), _c, _full_checksum), std::move(filename))
-            , _c({uint32_t(std::min(size_t(DEFAULT_CHUNK_SIZE), buffer_size))})
+            , _c(uint32_t(std::min(size_t(DEFAULT_CHUNK_SIZE), buffer_size)), {})
             , _full_checksum(ChecksumType::init_checksum()) {}
 
     // Since we are exposing a reference to _full_checksum, we delete the move

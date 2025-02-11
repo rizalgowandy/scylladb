@@ -5,22 +5,23 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "streaming/stream_plan.hh"
 #include "streaming/stream_result_future.hh"
 #include "streaming/stream_state.hh"
+#include <seastar/coroutine/all.hh>
 
 namespace streaming {
 
 extern logging::logger sslog;
 
-stream_plan& stream_plan::request_ranges(inet_address from, sstring keyspace, dht::token_range_vector ranges) {
+stream_plan& stream_plan::request_ranges(locator::host_id from, sstring keyspace, dht::token_range_vector ranges) {
     return request_ranges(from, keyspace, std::move(ranges), {});
 }
 
-stream_plan& stream_plan::request_ranges(inet_address from, sstring keyspace, dht::token_range_vector ranges, std::vector<sstring> column_families) {
+stream_plan& stream_plan::request_ranges(locator::host_id from, sstring keyspace, dht::token_range_vector ranges, std::vector<sstring> column_families) {
     _range_added = true;
     auto session = _coordinator->get_or_create_session(_mgr, from);
     session->add_stream_request(keyspace, std::move(ranges), std::move(column_families));
@@ -29,11 +30,11 @@ stream_plan& stream_plan::request_ranges(inet_address from, sstring keyspace, dh
     return *this;
 }
 
-stream_plan& stream_plan::transfer_ranges(inet_address to, sstring keyspace, dht::token_range_vector ranges) {
+stream_plan& stream_plan::transfer_ranges(locator::host_id to, sstring keyspace, dht::token_range_vector ranges) {
     return transfer_ranges(to, std::move(keyspace), std::move(ranges), {});
 }
 
-stream_plan& stream_plan::transfer_ranges(inet_address to, sstring keyspace, dht::token_range_vector ranges, std::vector<sstring> column_families) {
+stream_plan& stream_plan::transfer_ranges(locator::host_id to, sstring keyspace, dht::token_range_vector ranges, std::vector<sstring> column_families) {
     _range_added = true;
     auto session = _coordinator->get_or_create_session(_mgr, to);
     session->add_transfer_ranges(std::move(keyspace), std::move(ranges), std::move(column_families));

@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -15,6 +15,7 @@
 
 #include <seastar/core/sstring.hh>
 #include "seastarx.hh"
+#include "db/hints/internal/common.hh"
 
 namespace gms {
     class inet_address;
@@ -28,6 +29,8 @@ namespace hints {
 // host_filter tells hints_manager towards which endpoints it is allowed to generate hints.
 class host_filter final {
 private:
+    using endpoint_id = internal::endpoint_id;
+    
     enum class enabled_kind {
         enabled_for_all,
         enabled_selectively,
@@ -58,7 +61,7 @@ public:
     // Parses hint filtering configuration from a list of DCs.
     static host_filter parse_from_dc_list(sstring opt);
 
-    bool can_hint_for(const locator::topology& topo, gms::inet_address ep) const;
+    bool can_hint_for(const locator::topology& topo, endpoint_id ep) const;
 
     inline const std::unordered_set<sstring>& get_dcs() const {
         return _dcs;
@@ -79,7 +82,7 @@ public:
 
     sstring to_configuration_string() const;
 
-    friend std::ostream& operator<<(std::ostream& os, const host_filter& f);
+    friend fmt::formatter<host_filter>;
 };
 
 std::istream& operator>>(std::istream& is, host_filter& f);
@@ -91,3 +94,8 @@ public:
 
 }
 }
+
+template <>
+struct fmt::formatter<db::hints::host_filter> : fmt::formatter<string_view> {
+    auto format(const db::hints::host_filter&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

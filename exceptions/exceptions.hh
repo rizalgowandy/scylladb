@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -15,7 +15,7 @@
 #include "db/operation_type.hh"
 #include <stdexcept>
 #include <seastar/core/sstring.hh>
-#include "bytes.hh"
+#include "bytes_fwd.hh"
 
 namespace exceptions {
 
@@ -56,7 +56,9 @@ enum class exception_code : int32_t {
     RATE_LIMIT_ERROR = 0xF000
 };
 
-std::ostream& operator<<(std::ostream& os, exception_code ec);
+inline auto format_as(exception_code ec) {
+    return fmt::underlying(ec);
+}
 
 const std::unordered_map<exception_code, sstring>& exception_map();
 
@@ -117,29 +119,36 @@ public:
     truncate_exception(std::exception_ptr ep);
 };
 
+// Base class for various request timeout exceptions
 class request_timeout_exception : public cassandra_exception {
+public:
+    request_timeout_exception(exception_code code, sstring msg) : cassandra_exception(code, std::move(msg)) {}
+};
+
+// Timeout during read/write - didn't receive enough responses from remote nodes to fulfill the consistency requirement.
+class read_write_timeout_exception : public request_timeout_exception {
 public:
     db::consistency_level consistency;
     int32_t received;
     int32_t block_for;
 
-    request_timeout_exception(exception_code code, const sstring& ks, const sstring& cf, db::consistency_level consistency, int32_t received, int32_t block_for) noexcept;
+    read_write_timeout_exception(exception_code code, const sstring& ks, const sstring& cf, db::consistency_level consistency, int32_t received, int32_t block_for) noexcept;
 };
 
-class read_timeout_exception : public request_timeout_exception {
+class read_timeout_exception : public read_write_timeout_exception {
 public:
     bool data_present;
 
     read_timeout_exception(const sstring& ks, const sstring& cf, db::consistency_level consistency, int32_t received, int32_t block_for, bool data_present) noexcept
-        : request_timeout_exception{exception_code::READ_TIMEOUT, ks, cf, consistency, received, block_for}
+        : read_write_timeout_exception{exception_code::READ_TIMEOUT, ks, cf, consistency, received, block_for}
         , data_present{data_present}
     { }
 };
 
-struct mutation_write_timeout_exception : public request_timeout_exception {
+struct mutation_write_timeout_exception : public read_write_timeout_exception {
     db::write_type type;
     mutation_write_timeout_exception(const sstring& ks, const sstring& cf, db::consistency_level consistency, int32_t received, int32_t block_for, db::write_type type) noexcept :
-        request_timeout_exception(exception_code::WRITE_TIMEOUT, ks, cf, consistency, received, block_for)
+        read_write_timeout_exception(exception_code::WRITE_TIMEOUT, ks, cf, consistency, received, block_for)
         , type{std::move(type)}
     { }
 };
@@ -309,4 +318,4 @@ public:
     function_execution_exception(sstring func_name_, sstring detail, sstring ks_name_, std::vector<sstring> args_) noexcept;
 };
 
-}
+} // namespace exceptions

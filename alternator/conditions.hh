@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 /*
@@ -18,8 +18,6 @@
 
 #pragma once
 
-#include "cql3/restrictions/statement_restrictions.hh"
-#include "serialization.hh"
 #include "expressions_types.hh"
 
 namespace alternator {

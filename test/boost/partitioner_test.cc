@@ -3,24 +3,31 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <boost/algorithm/cxx11/all_of.hpp>
+#include <limits>
+
 #include <boost/range/combine.hpp>
+#include <boost/test/tools/old/interface.hpp>
+#include <fmt/ranges.h>
+#include <fmt/std.h>
 #include "test/lib/scylla_test_case.hh"
 
+#include "dht/token.hh"
 #include "dht/i_partitioner.hh"
 #include "dht/sharder.hh"
 #include "dht/murmur3_partitioner.hh"
 #include "schema/schema.hh"
 #include "types/types.hh"
 #include "schema/schema_builder.hh"
-#include "utils/div_ceil.hh"
+#include "utils/assert.hh"
+#include "utils/to_string.hh"
 
 #include "test/lib/simple_schema.hh"
 #include "test/lib/log.hh"
 #include "test/lib/random_utils.hh"
+#include "test/lib/test_utils.hh"
 #include "test/boost/total_order_check.hh"
 
 template <typename... Args>
@@ -33,11 +40,72 @@ debug(Args&&... args) {
 }
 
 static dht::token token_from_long(uint64_t value) {
-    return dht::token(dht::token::kind::key, value);
+    return dht::token(value);
 }
 
 static int64_t long_from_token(dht::token token) {
     return token._data;
+}
+
+void print_token(sstring desc, dht::token t) {
+    testlog.debug("{}={}", desc, t);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_minimum_token) {
+    auto t = dht::token::minimum();
+    BOOST_REQUIRE_EQUAL(t, dht::minimum_token());
+    BOOST_REQUIRE(t.is_minimum());
+    BOOST_REQUIRE_EQUAL(dht::token::to_int64(t), std::numeric_limits<int64_t>::min());
+    BOOST_REQUIRE_EQUAL(t.raw(), std::numeric_limits<int64_t>::min());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_maximum_token) {
+    auto t = dht::token::maximum();
+    BOOST_REQUIRE_EQUAL(t, dht::maximum_token());
+    BOOST_REQUIRE(t.is_maximum());
+    BOOST_REQUIRE_EQUAL(dht::token::to_int64(t), std::numeric_limits<int64_t>::min());
+    BOOST_REQUIRE_EQUAL(t.raw(), std::numeric_limits<int64_t>::max());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_first_token) {
+    auto t = dht::first_token();
+    BOOST_REQUIRE_EQUAL(t, dht::first_token());
+    BOOST_REQUIRE(t.is_first());
+    BOOST_REQUIRE_EQUAL(dht::token::to_int64(t), std::numeric_limits<int64_t>::min() + 1);
+    BOOST_REQUIRE_EQUAL(t.raw(), std::numeric_limits<int64_t>::min() + 1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_last_token) {
+    auto t = dht::token::last();
+    BOOST_REQUIRE_EQUAL(t, dht::last_token());
+    BOOST_REQUIRE(t.is_last());
+    BOOST_REQUIRE_EQUAL(dht::token::to_int64(t), std::numeric_limits<int64_t>::max());
+    BOOST_REQUIRE_EQUAL(t.raw(), std::numeric_limits<int64_t>::max());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_token_ordering) {
+    auto minimum = dht::minimum_token();
+    print_token("minimum", minimum);
+    auto first = dht::first_token();
+    print_token("first", first);
+    BOOST_REQUIRE(minimum <=> first < 0);
+    auto next = next_token(first);
+    print_token("next", next);
+    BOOST_REQUIRE(first <=> next < 0);
+    auto last = dht::last_token();
+    print_token("last", last);
+    BOOST_REQUIRE(next <=> last < 0);
+    auto maximum = dht::maximum_token();
+    print_token("maximum", maximum);
+    BOOST_REQUIRE(last <=> maximum < 0);
+
+    auto midpoint = dht::token::midpoint(first, last);
+    print_token("midpoint", midpoint);
+    BOOST_REQUIRE(first <=> midpoint < 0);
+    next = dht::next_token(midpoint);
+    print_token("next", next);
+    BOOST_REQUIRE(midpoint <=> next < 0);
+    BOOST_REQUIRE(next <=> last < 0);
 }
 
 SEASTAR_THREAD_TEST_CASE(test_decorated_key_is_compatible_with_origin) {
@@ -124,9 +192,9 @@ SEASTAR_THREAD_TEST_CASE(test_ring_position_ordering) {
 
     testlog.info("Keys: {}", keys);
 
-    auto positions = boost::copy_range<std::vector<dht::ring_position>>(keys);
-    auto ext_positions = boost::copy_range<std::vector<dht::ring_position_ext>>(keys);
-    auto views = boost::copy_range<std::vector<dht::ring_position_view>>(positions);
+    auto positions = keys | std::ranges::to<std::vector<dht::ring_position>>();
+    auto ext_positions = keys | std::ranges::to<std::vector<dht::ring_position_ext>>();
+    auto views = positions | std::ranges::to<std::vector<dht::ring_position_view>>();
 
     total_order_check<dht::ring_position_comparator, dht::ring_position, dht::ring_position_view, dht::decorated_key>(cmp)
       .next(dht::ring_position_view::min())
@@ -226,36 +294,35 @@ void test_sharding(const dht::sharder& sharder, unsigned shards, std::vector<dht
         .build();
     for (unsigned i = 0; i < (shards << ignorebits); ++i) {
         auto lim = shard_limits[i];
-        BOOST_REQUIRE_EQUAL(sharder.shard_of(lim), i % shards);
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_reads(lim), i % shards);
         if (i != 0) {
-            BOOST_REQUIRE_EQUAL(sharder.shard_of(prev_token(lim)), (i - 1) % shards);
-            BOOST_REQUIRE_EQUAL(lim, sharder.token_for_next_shard(prev_token(lim), i % shards));
+            BOOST_REQUIRE_EQUAL(sharder.shard_for_reads(prev_token(lim)), (i - 1) % shards);
+            BOOST_REQUIRE_EQUAL(lim, sharder.token_for_next_shard_for_reads(prev_token(lim), i % shards));
         }
         if (i != (shards << ignorebits) - 1) {
             auto next_shard = (i + 1) % shards;
-            BOOST_REQUIRE_EQUAL(sharder.shard_of(sharder.token_for_next_shard(lim, next_shard)), next_shard);
+            BOOST_REQUIRE_EQUAL(sharder.shard_for_reads(sharder.token_for_next_shard_for_reads(lim, next_shard)), next_shard);
         }
     }
 }
 
 SEASTAR_THREAD_TEST_CASE(test_murmur3_sharding) {
     auto make_token_vector = [] (std::vector<int64_t> v) {
-        return boost::copy_range<std::vector<dht::token>>(
-                v | boost::adaptors::transformed(token_from_long));
+        return v | std::views::transform(token_from_long) | std::ranges::to<std::vector<dht::token>>();
     };
-    dht::sharder mm3p7s(7);
+    dht::static_sharder mm3p7s(7);
     auto mm3p7s_shard_limits = make_token_vector({
         -9223372036854775807, -6588122883467697006+1, -3952873730080618204+1,
         -1317624576693539402+1, 1317624576693539401+1, 3952873730080618203+1,
         6588122883467697005+1,
     });
     test_sharding(mm3p7s, 7, mm3p7s_shard_limits);
-    dht::sharder mm3p2s(2);
+    dht::static_sharder mm3p2s(2);
     auto mm3p2s_shard_limits = make_token_vector({
         -9223372036854775807, 0,
     });
     test_sharding(mm3p2s, 2, mm3p2s_shard_limits);
-    dht::sharder mm3p1s(1);
+    dht::static_sharder mm3p1s(1);
     auto mm3p1s_shard_limits = make_token_vector({
         -9223372036854775807,
     });
@@ -264,10 +331,9 @@ SEASTAR_THREAD_TEST_CASE(test_murmur3_sharding) {
 
 SEASTAR_THREAD_TEST_CASE(test_murmur3_sharding_with_ignorebits) {
     auto make_token_vector = [] (std::vector<int64_t> v) {
-        return boost::copy_range<std::vector<dht::token>>(
-                v | boost::adaptors::transformed(token_from_long));
+        return v | std::views::transform(token_from_long) | std::ranges::to<std::vector<dht::token>>();
     };
-    dht::sharder mm3p7s2i(7, 2);
+    dht::static_sharder mm3p7s2i(7, 2);
     auto mm3p7s2i_shard_limits = make_token_vector({
         -9223372036854775807,
         -8564559748508006107, -7905747460161236406, -7246935171814466706, -6588122883467697005,
@@ -279,7 +345,7 @@ SEASTAR_THREAD_TEST_CASE(test_murmur3_sharding_with_ignorebits) {
         7905747460161236407, 8564559748508006108,
     });
     test_sharding(mm3p7s2i, 7, mm3p7s2i_shard_limits, 2);
-    dht::sharder mm3p2s4i(2, 4);
+    dht::static_sharder mm3p2s4i(2, 4);
     auto mm3p2s_shard_limits = make_token_vector({
         -9223372036854775807,
         -8646911284551352320, -8070450532247928832, -7493989779944505344, -6917529027641081856,
@@ -308,7 +374,7 @@ normalize(dht::partition_range pr) {
     return dht::partition_range(start, end);
 };
 
-class map_sharder : public dht::sharder {
+class map_sharder : public dht::static_sharder {
     // Defines mapping of tokens to shards.
     //
     // For example, {t1:s1, t2:s2, t3:s3} defines the following mapping on token ranges:
@@ -320,7 +386,7 @@ class map_sharder : public dht::sharder {
     //
     std::map<dht::token, unsigned> _shards;
 public:
-    map_sharder(unsigned num_shards) : dht::sharder(num_shards) {}
+    map_sharder(unsigned num_shards) : dht::static_sharder(num_shards) {}
 
     const std::map<dht::token, unsigned>& get_map() const {
         return _shards;
@@ -390,24 +456,24 @@ public:
 
 static
 void
-test_something_with_some_interesting_ranges_and_sharder(std::function<void (const schema&, const dht::sharder&, const dht::partition_range&)> func_to_test) {
+test_something_with_some_interesting_ranges_and_sharder(std::function<void (const schema&, const dht::static_sharder&, const dht::partition_range&)> func_to_test) {
     auto s = schema_builder("ks", "cf")
         .with_column("c1", int32_type, column_kind::partition_key)
         .with_column("c2", int32_type, column_kind::partition_key)
         .with_column("v", int32_type)
         .build();
     auto some_sharders = {
-            dht::sharder(1, 0),
-            dht::sharder(7, 4),
-            dht::sharder(4, 0),
-            dht::sharder(32, 8),  // More, and we OOM since memory isn't configured
+            dht::static_sharder(1, 0),
+            dht::static_sharder(7, 4),
+            dht::static_sharder(4, 0),
+            dht::static_sharder(32, 8),  // More, and we OOM since memory isn't configured
     };
     auto t1 = token_from_long(int64_t(-0x7fff'ffff'ffff'fffe));
     auto t2 = token_from_long(int64_t(-1));
     auto t3 = token_from_long(int64_t(1));
     auto t4 = token_from_long(int64_t(0x7fff'ffff'ffff'fffe));
     auto make_bound = [] (dht::ring_position rp) {
-        return std::make_optional(range_bound<dht::ring_position>(std::move(rp)));
+        return std::make_optional(interval_bound<dht::ring_position>(std::move(rp)));
     };
     auto some_murmur3_ranges = {
             dht::partition_range::make_open_ended_both_sides(),
@@ -445,9 +511,9 @@ test_something_with_some_interesting_ranges_and_sharder(std::function<void (cons
 
 static
 void
-do_test_split_range_to_single_shard(const schema& s, const dht::sharder& sharder_, const dht::partition_range& pr) {
-    for (auto shard : boost::irange(0u, sharder_.shard_count())) {
-        auto ranges = dht::split_range_to_single_shard(s, sharder_, pr, shard).get0();
+do_test_split_range_to_single_shard(const schema& s, const dht::static_sharder& sharder_, const dht::partition_range& pr) {
+    for (auto shard : std::views::iota(0u, sharder_.shard_count())) {
+        auto ranges = dht::split_range_to_single_shard(s, sharder_, pr, shard).get();
         auto sharder = dht::ring_position_range_sharder(sharder_, pr);
         auto x = sharder.next(s);
         auto cmp = dht::ring_position_comparator(s);
@@ -481,17 +547,17 @@ test_something_with_some_interesting_ranges_and_sharder_with_token_range(std::fu
         .with_column("v", int32_type)
         .build();
     auto some_sharder = {
-            dht::sharder(1, 0),
-            dht::sharder(7, 4),
-            dht::sharder(4, 0),
-            dht::sharder(32, 8),  // More, and we OOM since memory isn't configured
+            dht::static_sharder(1, 0),
+            dht::static_sharder(7, 4),
+            dht::static_sharder(4, 0),
+            dht::static_sharder(32, 8),  // More, and we OOM since memory isn't configured
     };
     auto t1 = token_from_long(int64_t(-0x7fff'ffff'ffff'fffe));
     auto t2 = token_from_long(int64_t(-1));
     auto t3 = token_from_long(int64_t(1));
     auto t4 = token_from_long(int64_t(0x7fff'ffff'ffff'fffe));
     auto make_bound = [] (dht::token t) {
-        return range_bound<dht::token>(std::move(t));
+        return interval_bound<dht::token>(std::move(t));
     };
     auto some_ranges = {
             dht::token_range::make_open_ended_both_sides(),
@@ -517,30 +583,33 @@ static
 void
 do_test_selective_token_range_sharder(const dht::sharder& input_sharder, const schema& s, const dht::token_range& range) {
     bool debug = false;
-    for (auto shard : boost::irange(0u, input_sharder.shard_count())) {
+    for (auto shard : std::views::iota(0u, input_sharder.shard_count())) {
         auto sharder = dht::selective_token_range_sharder(input_sharder, range, shard);
         auto range_shard = sharder.next();
         while (range_shard) {
             if (range_shard->start() && range_shard->start()->is_inclusive()) {
-                auto start_shard = input_sharder.shard_of(range_shard->start()->value());
+                auto start_shard = input_sharder.shard_for_reads(range_shard->start()->value());
                 if (debug) {
-                    std::cout << " start_shard " << start_shard << " shard " << shard << " range " << range_shard << "\n";
+                    fmt::print(" start_shard {} shard {} range {}\n",
+                               start_shard, shard, range_shard);
                 }
                 BOOST_REQUIRE(start_shard == shard);
             }
             if (range_shard->end() && range_shard->end()->is_inclusive()) {
-                auto end_shard = input_sharder.shard_of(range_shard->end()->value());
+                auto end_shard = input_sharder.shard_for_reads(range_shard->end()->value());
                 if (debug) {
-                    std::cout << " end_shard " << end_shard << " shard " << shard << " range " << range_shard << "\n";
+                    fmt::print(" end_shard {} shard range {}\n",
+                               end_shard, shard, range_shard);
                 }
                 BOOST_REQUIRE(end_shard == shard);
             }
             auto midpoint = dht::token::midpoint(
                     range_shard->start() ? range_shard->start()->value() : dht::minimum_token(),
                     range_shard->end() ? range_shard->end()->value() : dht::minimum_token());
-            auto mid_shard = input_sharder.shard_of(midpoint);
+            auto mid_shard = input_sharder.shard_for_reads(midpoint);
             if (debug) {
-                std::cout << " mid " << mid_shard << " shard " << shard << " range " << range_shard << "\n";
+                fmt::print(" mid {} shard {} range {}\n",
+                           mid_shard, shard, range_shard);
             }
             BOOST_REQUIRE(mid_shard == shard);
 
@@ -556,16 +625,16 @@ SEASTAR_THREAD_TEST_CASE(test_selective_token_range_sharder) {
 SEASTAR_THREAD_TEST_CASE(test_find_first_token_for_shard) {
     const unsigned cpu_count = 3;
     const unsigned ignore_msb_bits = 10;
-    dht::sharder sharder(cpu_count, ignore_msb_bits);
-    auto first_boundary = sharder.token_for_next_shard(dht::minimum_token(), 1);
-    auto second_boundary = sharder.token_for_next_shard(dht::minimum_token(), 2);
-    auto third_boundary = sharder.token_for_next_shard(dht::minimum_token(), 0);
+    dht::static_sharder sharder(cpu_count, ignore_msb_bits);
+    auto first_boundary = sharder.token_for_next_shard_for_reads(dht::minimum_token(), 1);
+    auto second_boundary = sharder.token_for_next_shard_for_reads(dht::minimum_token(), 2);
+    auto third_boundary = sharder.token_for_next_shard_for_reads(dht::minimum_token(), 0);
     auto next_token = [] (dht::token t) {
-        assert(dht::token::to_int64(t) < std::numeric_limits<int64_t>::max());
+        SCYLLA_ASSERT(dht::token::to_int64(t) < std::numeric_limits<int64_t>::max());
         return dht::token::from_int64(dht::token::to_int64(t) + 1);
     };
     auto prev_token = [] (dht::token t) {
-        assert(dht::token::to_int64(t) > std::numeric_limits<int64_t>::min() + 1);
+        SCYLLA_ASSERT(dht::token::to_int64(t) > std::numeric_limits<int64_t>::min() + 1);
         return dht::token::from_int64(dht::token::to_int64(t) - 1);
     };
 
@@ -613,7 +682,7 @@ SEASTAR_THREAD_TEST_CASE(test_find_first_token_for_shard) {
             dht::find_first_token_for_shard(sharder, prev_token(first_boundary), prev_token(third_boundary), 0));
 
     auto last_token = dht::token::from_int64(std::numeric_limits<int64_t>::max());
-    auto last_shard = sharder.shard_of(last_token);
+    auto last_shard = sharder.shard_for_reads(last_token);
 
     BOOST_REQUIRE_EQUAL(last_token,
             dht::find_first_token_for_shard(sharder, prev_token(last_token), dht::maximum_token(), last_shard));

@@ -5,11 +5,12 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include "bytes.hh"
 #include "schema/schema_fwd.hh"
 #include "query-result-reader.hh"
@@ -50,6 +51,8 @@ public:
     * @throws InvalidRequestException
     */
     virtual void add_input_row(result_set_builder& rs) = 0;
+
+    virtual std::uint64_t get_input_row_count() const = 0;
 
     virtual std::vector<managed_bytes_opt> get_output_row() = 0;
 
@@ -118,6 +121,7 @@ public:
     }
 
     static ::shared_ptr<selection> wildcard(schema_ptr schema);
+    static std::vector<const column_definition*> wildcard_columns(schema_ptr schema);
     static ::shared_ptr<selection> for_columns(schema_ptr schema, std::vector<const column_definition*> columns);
 
     // Adds a column to the selection and result set. Returns an index within the result set row.
@@ -153,7 +157,7 @@ public:
 
     virtual bool is_reducible() const {return false;}
 
-    virtual query::forward_request::reductions_info get_reductions() const {return {{}, {}};}
+    virtual query::mapreduce_request::reductions_info get_reductions() const {return {{}, {}};}
 
     /**
      * Returns true if the selection is trivial, i.e. there are no function
@@ -171,6 +175,12 @@ private:
     std::unique_ptr<result_set> _result_set;
     std::unique_ptr<selectors> _selectors;
     const std::vector<size_t> _group_by_cell_indices; ///< Indices in \c current of cells holding GROUP BY values.
+    const uint64_t _limit; ///< Maximum number of rows to return.
+    const uint64_t _per_partition_limit; ///< Maximum number of rows to return per partition.
+    uint64_t _per_partition_remaining; ///< Remaining rows to return for the current partition.
+    uint64_t _per_partition_remaining_previous_partition; ///< Value of _per_partition_remaining before the current partition.
+                                                          ///< Necessary because the next page might continue the same partition,
+                                                          ///< but accept_partition_end() and accept_new_partition() will be called anyway.
     std::vector<managed_bytes_opt> _last_group; ///< Previous row's group: all of GROUP BY column values.
     bool _group_began; ///< Whether a group began being formed.
 public:
@@ -179,6 +189,7 @@ public:
     std::vector<bytes> current_clustering_key;
     std::vector<api::timestamp_type> _timestamps;
     std::vector<int32_t> _ttls;
+    const query_options* _options;
 private:
     const gc_clock::time_point _now;
 public:
@@ -205,10 +216,9 @@ public:
     class restrictions_filter {
         const ::shared_ptr<const restrictions::statement_restrictions> _restrictions;
         const query_options& _options;
-        const bool _skip_pk_restrictions;
-        const bool _skip_ck_restrictions;
-        mutable bool _current_partition_key_does_not_match = false;
-        mutable bool _current_static_row_does_not_match = false;
+        const expr::expression& _partition_level_filter;
+        const expr::expression& _clustering_row_level_filter;
+        mutable bool _current_partition_does_not_match = false;
         mutable uint64_t _rows_dropped = 0;
         mutable uint64_t _remaining;
         schema_ptr _schema;
@@ -235,16 +245,22 @@ public:
     };
 
     result_set_builder(const selection& s, gc_clock::time_point now,
-                       std::vector<size_t> group_by_cell_indices = {});
+                       const query_options* options = nullptr,
+                       std::vector<size_t> group_by_cell_indices = {},
+                       uint64_t limit = std::numeric_limits<uint64_t>::max(),
+                       uint64_t per_partition_limit = std::numeric_limits<uint64_t>::max());
     void add_empty();
     void add(bytes_opt value);
     void add(const column_definition& def, const query::result_atomic_cell_view& c);
     void add_collection(const column_definition& def, bytes_view c);
     void start_new_row();
     void complete_row();
+    void accept_new_partition(const std::vector<bytes>& key);
+    void accept_partition_end();
     std::unique_ptr<result_set> build();
     api::timestamp_type timestamp_of(size_t idx);
     int32_t ttl_of(size_t idx);
+    size_t result_set_size() const;
 
     // Implements ResultVisitor concept from query.hh
     template<typename Filter = nop_filter>
@@ -289,7 +305,9 @@ public:
         }
 
         void accept_new_partition(const partition_key& key, uint64_t row_count) {
-            _partition_key = key.explode(_schema);
+            auto partition_key = key.explode(_schema);
+            _builder.accept_new_partition(partition_key);
+            _partition_key = std::move(partition_key);
             _row_count = row_count;
             _filter.reset(&key);
         }
@@ -330,7 +348,7 @@ public:
                     add_value(*def, static_row_iterator);
                     break;
                 default:
-                    assert(0);
+                    SCYLLA_ASSERT(0);
                 }
             }
             _builder.complete_row();
@@ -354,6 +372,7 @@ public:
                 }
                 _builder.complete_row();
             }
+            _builder.accept_partition_end();
             return _filter.get_rows_dropped();
         }
     };

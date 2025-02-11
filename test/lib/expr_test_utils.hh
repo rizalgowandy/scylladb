@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -19,6 +19,7 @@
 #include "types/list.hh"
 #include "types/map.hh"
 #include "types/set.hh"
+#include "types/vector.hh"
 
 namespace cql3 {
 namespace expr {
@@ -30,7 +31,7 @@ raw_value make_tinyint_raw(int8_t val);
 raw_value make_smallint_raw(int16_t val);
 raw_value make_int_raw(int32_t val);
 raw_value make_bigint_raw(int64_t val);
-raw_value make_text_raw(const sstring_view& text);
+raw_value make_text_raw(const std::string_view& text);
 raw_value make_float_raw(float val);
 raw_value make_double_raw(double val);
 
@@ -40,7 +41,7 @@ constant make_tinyint_const(int8_t val);
 constant make_smallint_const(int16_t val);
 constant make_int_const(int32_t val);
 constant make_bigint_const(int64_t val);
-constant make_text_const(const sstring_view& text);
+constant make_text_const(const std::string_view& text);
 constant make_float_const(float val);
 constant make_double_const(double val);
 
@@ -67,6 +68,12 @@ raw_value make_map_raw(const std::vector<std::pair<raw_value, raw_value>>& value
 // which is impossible to express using the existing code.
 raw_value make_tuple_raw(const std::vector<raw_value>& values);
 
+// This function implements custom serialization of vectors.
+// Some tests require the vector to contain unset_value or an empty value,
+// which is impossible to express using the existing code.
+// It only supports vectors of fixed-length elements.
+raw_value make_vector_raw(const std::vector<raw_value>& values);
+
 constant make_list_const(const std::vector<raw_value>& vals, data_type elements_type);
 constant make_list_const(const std::vector<constant>& vals, data_type elements_type);
 
@@ -84,14 +91,21 @@ constant make_map_const(const std::vector<std::pair<constant, constant>>& vals,
 constant make_tuple_const(const std::vector<raw_value>& vals, const std::vector<data_type>& element_types);
 constant make_tuple_const(const std::vector<constant>& vals, const std::vector<data_type>& element_types);
 
+constant make_vector_const(const std::vector<raw_value>& vals, data_type elements_type);
+constant make_vector_const(const std::vector<constant>& vals, data_type elements_type);
+
 raw_value make_int_list_raw(const std::vector<std::optional<int32_t>>& values);
 raw_value make_int_set_raw(const std::vector<int32_t>& values);
 
 raw_value make_int_int_map_raw(const std::vector<std::pair<int32_t, int32_t>>& values);
 
+raw_value make_int_vector_raw(const std::vector<int32_t>& values);
+
 constant make_int_list_const(const std::vector<std::optional<int32_t>>& values);
 constant make_int_set_const(const std::vector<int32_t>& values);
 constant make_int_int_map_const(const std::vector<std::pair<int32_t, int32_t>>& values);
+
+constant make_int_vector_const(const std::vector<int32_t>& values);
 
 collection_constructor make_list_constructor(std::vector<expression> elements, data_type elements_type);
 collection_constructor make_set_constructor(std::vector<expression> elements, data_type elements_type);
@@ -102,7 +116,8 @@ collection_constructor make_map_constructor(const std::vector<std::pair<expressi
                                             data_type key_type,
                                             data_type element_type);
 tuple_constructor make_tuple_constructor(std::vector<expression> elements, std::vector<data_type> element_types);
-usertype_constructor make_usertype_constructor(std::vector<std::pair<sstring_view, constant>> field_values);
+collection_constructor make_vector_constructor(std::vector<expression> elements, data_type elements_type, size_t dimension);
+usertype_constructor make_usertype_constructor(std::vector<std::pair<std::string_view, constant>> field_values);
 
 ::lw_shared_ptr<column_specification> make_receiver(data_type receiver_type, sstring name = "receiver_name");
 
@@ -147,14 +162,14 @@ std::pair<data_dictionary::database, std::unique_ptr<data_dictionary::impl>> mak
 
 raw_value evaluate_with_bind_variables(const expression& e, std::vector<raw_value> bind_variable_values);
 
-// FIXME: convert to formatter, but got into a template loop since fmt prefers the fallback formatter for
-// sstring rather than the actual formatter -> std::pair formatting fails -> loop.
-inline
-std::ostream&
-operator<<(std::ostream& os, const mutation_column_value& mcv) {
-    return os << fmt::format("{{{}/ts={}/ttl={}}}", mcv.value, mcv.timestamp, mcv.ttl);
-}
 
 }  // namespace test_utils
 }  // namespace expr
 }  // namespace cql3
+
+template <> struct fmt::formatter<cql3::expr::test_utils::mutation_column_value> : fmt::formatter<string_view> {
+    auto format(const cql3::expr::test_utils::mutation_column_value& mcv, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{{{}/ts={}/ttl={}}}", mcv.value, mcv.timestamp, mcv.ttl);
+
+    }
+};

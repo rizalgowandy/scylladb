@@ -1,11 +1,11 @@
 #
 # Copyright 2023-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
-from rest_api_mock import expected_request
-import utils
+from test.nodetool.rest_api_mock import expected_request
+from test.nodetool.utils import check_nodetool_fails_with
 
 
 def test_getlogginglevels(nodetool):
@@ -13,7 +13,7 @@ def test_getlogginglevels(nodetool):
         expected_request("GET", "/storage_service/logging_level",
                          response=[{"key": "sstable", "value": "info"}, {"key": "cache", "value": "trace"}])])
 
-    assert res == \
+    assert res.stdout == \
 """
 Logger Name                                        Log Level
 sstable                                                 info
@@ -27,7 +27,7 @@ def test_setlogginglevel(nodetool):
 
 
 def test_setlogginglevel_reset_logger(nodetool, scylla_only):
-    utils.check_nodetool_fails_with(
+    check_nodetool_fails_with(
             nodetool,
             ("setlogginglevel", "wasm"),
             {"expected_requests": []},
@@ -35,7 +35,7 @@ def test_setlogginglevel_reset_logger(nodetool, scylla_only):
 
 
 def test_setlogginglevel_reset_all_loggers(nodetool, scylla_only):
-    utils.check_nodetool_fails_with(
+    check_nodetool_fails_with(
             nodetool,
             ("setlogginglevel",),
             {"expected_requests": []},

@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
@@ -11,18 +11,18 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/util/backtrace.hh>
 #include <seastar/util/alloc_failure_injector.hh>
-#include <boost/algorithm/cxx11/any_of.hpp>
 #include <seastar/util/closeable.hh>
 
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include "test/lib/mutation_assertions.hh"
-#include "test/lib/flat_mutation_reader_assertions.hh"
+#include "test/lib/mutation_reader_assertions.hh"
 #include "test/lib/mutation_source_test.hh"
 #include "test/lib/key_utils.hh"
 
 #include "schema/schema_builder.hh"
 #include "test/lib/simple_schema.hh"
-#include "row_cache.hh"
+#include "db/row_cache.hh"
 #include <seastar/core/thread.hh>
 #include "replica/memtable.hh"
 #include "partition_slice_builder.hh"
@@ -34,9 +34,10 @@
 #include "test/lib/reader_concurrency_semaphore.hh"
 #include "test/lib/random_utils.hh"
 #include "test/lib/sstable_utils.hh"
+#include "utils/assert.hh"
 #include "utils/throttle.hh"
 
-#include <boost/range/algorithm/min_element.hpp>
+#include <fmt/ranges.h>
 #include "readers/from_mutations_v2.hh"
 #include "readers/delegating_v2.hh"
 #include "readers/empty_v2.hh"
@@ -86,8 +87,8 @@ snapshot_source make_decorated_snapshot_source(snapshot_source src, std::functio
 
 mutation_source make_source_with(mutation m) {
     return mutation_source([m] (schema_ptr s, reader_permit permit, const dht::partition_range&, const query::partition_slice&, tracing::trace_state_ptr, streamed_mutation::forwarding fwd) {
-        assert(m.schema() == s);
-        return make_flat_mutation_reader_from_mutations_v2(s, std::move(permit), m, std::move(fwd));
+        SCYLLA_ASSERT(m.schema() == s);
+        return make_mutation_reader_from_mutations_v2(s, std::move(permit), m, std::move(fwd));
     });
 }
 
@@ -103,7 +104,7 @@ bool has_key(row_cache& cache, const dht::decorated_key& key) {
     auto range = dht::partition_range::make_singular(key);
     auto reader = cache.make_reader(cache.schema(), semaphore.make_permit(), range);
     auto close_reader = deferred_close(reader);
-    auto mo = read_mutation_from_flat_mutation_reader(reader).get0();
+    auto mo = read_mutation_from_mutation_reader(reader).get();
     if (!bool(mo)) {
         return false;
     }
@@ -124,6 +125,8 @@ void verify_has(row_cache& cache, const mutation& m) {
     auto reader = cache.make_reader(cache.schema(), semaphore.make_permit(), range);
     assert_that(std::move(reader)).next_mutation().is_equal_to(m);
 }
+
+BOOST_AUTO_TEST_SUITE(row_cache_test)
 
 SEASTAR_TEST_CASE(test_cache_delegates_to_underlying) {
     return seastar::async([] {
@@ -166,7 +169,7 @@ class partition_counting_reader final : public delegating_reader_v2 {
     int& _counter;
     bool _count_fill_buffer = true;
 public:
-    partition_counting_reader(flat_mutation_reader_v2 mr, int& counter)
+    partition_counting_reader(mutation_reader mr, int& counter)
         : delegating_reader_v2(std::move(mr)), _counter(counter) { }
     virtual future<> fill_buffer() override {
         if (_count_fill_buffer) {
@@ -182,8 +185,8 @@ public:
     }
 };
 
-flat_mutation_reader_v2 make_counting_reader(flat_mutation_reader_v2 mr, int& counter) {
-    return make_flat_mutation_reader_v2<partition_counting_reader>(std::move(mr), counter);
+mutation_reader make_counting_reader(mutation_reader mr, int& counter) {
+    return make_mutation_reader<partition_counting_reader>(std::move(mr), counter);
 }
 
 SEASTAR_TEST_CASE(test_cache_delegates_to_underlying_only_once_empty_full_range) {
@@ -284,9 +287,9 @@ void test_cache_delegates_to_underlying_only_once_with_single_partition(schema_p
             const query::partition_slice&,
             tracing::trace_state_ptr,
             streamed_mutation::forwarding fwd) {
-        assert(m.schema() == s);
+        SCYLLA_ASSERT(m.schema() == s);
         if (range.contains(dht::ring_position(m.decorated_key()), dht::ring_position_comparator(*s))) {
-            return make_counting_reader(make_flat_mutation_reader_from_mutations_v2(s, std::move(permit), m, std::move(fwd)), secondary_calls_count);
+            return make_counting_reader(make_mutation_reader_from_mutations_v2(s, std::move(permit), m, std::move(fwd)), secondary_calls_count);
         } else {
             return make_counting_reader(make_empty_flat_reader_v2(s, std::move(permit)), secondary_calls_count);
         }
@@ -924,7 +927,7 @@ SEASTAR_TEST_CASE(test_eviction_after_schema_change) {
             rd.fill_buffer().get();
         }
 
-        tracker.cleaner().drain().get0();
+        tracker.cleaner().drain().get();
         while (tracker.region().evict_some() == memory::reclaiming_result::reclaimed_something) ;
 
         // The partition should be evictable after schema change
@@ -935,14 +938,14 @@ SEASTAR_TEST_CASE(test_eviction_after_schema_change) {
     });
 }
 
-void test_sliced_read_row_presence(flat_mutation_reader_v2 reader, schema_ptr s, std::deque<int> expected)
+void test_sliced_read_row_presence(mutation_reader reader, schema_ptr s, std::deque<int> expected)
 {
     auto close_reader = deferred_close(reader);
     clustering_key::equality ck_eq(*s);
 
-    auto mfopt = reader().get0();
+    auto mfopt = reader().get();
     BOOST_REQUIRE(mfopt->is_partition_start());
-    while ((mfopt = reader().get0()) && !mfopt->is_end_of_partition()) {
+    while ((mfopt = reader().get()) && !mfopt->is_end_of_partition()) {
         if (mfopt->is_clustering_row()) {
             BOOST_REQUIRE(!expected.empty());
             auto expected_ck = expected.front();
@@ -956,7 +959,7 @@ void test_sliced_read_row_presence(flat_mutation_reader_v2 reader, schema_ptr s,
     }
     BOOST_REQUIRE(expected.empty());
     BOOST_REQUIRE(mfopt && mfopt->is_end_of_partition());
-    BOOST_REQUIRE(!reader().get0());
+    BOOST_REQUIRE(!reader().get());
 }
 
 SEASTAR_TEST_CASE(test_single_partition_update) {
@@ -1190,7 +1193,7 @@ SEASTAR_TEST_CASE(test_update_failure) {
             auto reader = cache.make_reader(s, semaphore.make_permit(), query::full_partition_range);
             auto close_reader = deferred_close(reader);
             for (int i = 0; i < partition_count; i++) {
-                auto mopt = read_mutation_from_flat_mutation_reader(reader).get0();
+                auto mopt = read_mutation_from_mutation_reader(reader).get();
                 if (!mopt) {
                     break;
                 }
@@ -1198,7 +1201,7 @@ SEASTAR_TEST_CASE(test_update_failure) {
                 BOOST_REQUIRE(it != partitions.end());
                 BOOST_REQUIRE(it->second.equal(*s, mopt->partition()));
             }
-            BOOST_REQUIRE(!reader().get0());
+            BOOST_REQUIRE(!reader().get());
         };
 
         if (failed) {
@@ -1219,7 +1222,7 @@ private:
         class reader : public delegating_reader_v2 {
             utils::throttle& _throttle;
         public:
-            reader(utils::throttle& t, flat_mutation_reader_v2 r)
+            reader(utils::throttle& t, mutation_reader r)
                     : delegating_reader_v2(std::move(r))
                     , _throttle(t)
             {}
@@ -1235,9 +1238,9 @@ private:
             , _throttle(t)
         { }
 
-        flat_mutation_reader_v2 make_reader(schema_ptr s, reader_permit permit, const dht::partition_range& pr,
+        mutation_reader make_reader(schema_ptr s, reader_permit permit, const dht::partition_range& pr,
                 const query::partition_slice& slice, tracing::trace_state_ptr trace, streamed_mutation::forwarding fwd) {
-            return make_flat_mutation_reader_v2<reader>(_throttle, _underlying.make_reader_v2(s, std::move(permit), pr, slice, std::move(trace), std::move(fwd)));
+            return make_mutation_reader<reader>(_throttle, _underlying.make_reader_v2(s, std::move(permit), pr, slice, std::move(trace), std::move(fwd)));
         }
     };
     lw_shared_ptr<impl> _impl;
@@ -1542,7 +1545,7 @@ SEASTAR_TEST_CASE(test_mvcc) {
 
             auto m12 = m1 + m2;
 
-            flat_mutation_reader_v2_opt mt1_reader_opt;
+            mutation_reader_opt mt1_reader_opt;
             auto close_mt1_reader = defer([&mt1_reader_opt] {
                 if (mt1_reader_opt) {
                     mt1_reader_opt->close().get();
@@ -1570,8 +1573,8 @@ SEASTAR_TEST_CASE(test_mvcc) {
             assert_that(std::move(rd3)).has_monotonic_positions();
 
             if (with_active_memtable_reader) {
-                assert(mt1_reader_opt);
-                auto mt1_reader_mutation = read_mutation_from_flat_mutation_reader(*mt1_reader_opt).get0();
+                SCYLLA_ASSERT(mt1_reader_opt);
+                auto mt1_reader_mutation = read_mutation_from_mutation_reader(*mt1_reader_opt).get();
                 BOOST_REQUIRE(mt1_reader_mutation);
                 assert_that(*mt1_reader_mutation).is_equal_to_compacted(m2);
             }
@@ -1579,7 +1582,7 @@ SEASTAR_TEST_CASE(test_mvcc) {
             assert_that(std::move(rd4)).produces(m12);
             assert_that(std::move(rd1)).produces(m1);
 
-            cache.invalidate(row_cache::external_updater([] {})).get0();
+            cache.invalidate(row_cache::external_updater([] {})).get();
 
             assert_that(std::move(rd2)).produces(m1);
             assert_that(std::move(rd5)).produces(m12);
@@ -1630,7 +1633,7 @@ SEASTAR_TEST_CASE(test_slicing_mutation_reader) {
         row_cache cache(s, snapshot_source_from_snapshot(mt->as_data_source()), tracker);
 
         auto run_tests = [&] (auto& ps, std::deque<int> expected) {
-            cache.invalidate(row_cache::external_updater([] {})).get0();
+            cache.invalidate(row_cache::external_updater([] {})).get();
 
             auto reader = cache.make_reader(s, semaphore.make_permit(), query::full_partition_range, ps);
             test_sliced_read_row_presence(std::move(reader), s, expected);
@@ -1644,7 +1647,7 @@ SEASTAR_TEST_CASE(test_slicing_mutation_reader) {
             reader = cache.make_reader(s, semaphore.make_permit(), singular_range, ps);
             test_sliced_read_row_presence(std::move(reader), s, expected);
 
-            cache.invalidate(row_cache::external_updater([] {})).get0();
+            cache.invalidate(row_cache::external_updater([] {})).get();
 
             reader = cache.make_reader(s, semaphore.make_permit(), singular_range, ps);
             test_sliced_read_row_presence(std::move(reader), s, expected);
@@ -1698,7 +1701,7 @@ SEASTAR_TEST_CASE(test_slicing_mutation_reader) {
 
 static void evict_one_partition(cache_tracker& tracker) {
     auto initial = tracker.partitions();
-    assert(initial > 0);
+    SCYLLA_ASSERT(initial > 0);
     while (tracker.partitions() == initial) {
         auto ret = tracker.region().evict_some();
         BOOST_REQUIRE(ret == memory::reclaiming_result::reclaimed_something);
@@ -1707,7 +1710,7 @@ static void evict_one_partition(cache_tracker& tracker) {
 
 static void evict_one_row(cache_tracker& tracker) {
     auto initial = tracker.get_stats().rows;
-    assert(initial > 0);
+    SCYLLA_ASSERT(initial > 0);
     while (tracker.get_stats().rows == initial) {
         auto ret = tracker.region().evict_some();
         BOOST_REQUIRE(ret == memory::reclaiming_result::reclaimed_something);
@@ -1953,11 +1956,6 @@ static range_tombstone_change end_change(const range_tombstone& rt) {
     return range_tombstone_change(rt.end_position(), {});
 }
 
-static query::partition_slice make_legacy_reversed(schema_ptr table_schema, query::partition_slice table_slice) {
-    return query::native_reverse_slice_to_legacy_reverse_slice(*table_schema->make_reversed(),
-                                                               query::reverse_slice(*table_schema, std::move(table_slice)));
-}
-
 SEASTAR_TEST_CASE(test_scan_with_partial_partitions_reversed) {
     return seastar::async([] {
         simple_schema s;
@@ -2019,8 +2017,8 @@ SEASTAR_TEST_CASE(test_scan_with_partial_partitions_reversed) {
                     .with_range(s.make_ckey_range(1, 4))
                     .build();
 
-            auto rev_slice = make_legacy_reversed(s.schema(), std::move(slice));
 
+            auto rev_slice = query::reverse_slice(*s.schema(), slice);
             assert_that(cache.make_reader(rev_schema, semaphore.make_permit(), query::full_partition_range, rev_slice))
                     .produces_partition_start(m1.decorated_key())
                     .produces_row_with_key(s.make_ckey(4))
@@ -2047,7 +2045,7 @@ SEASTAR_TEST_CASE(test_scan_with_partial_partitions_reversed) {
                     .with_range(s.make_ckey_range(0, 1))
                     .build();
 
-            auto rev_slice = make_legacy_reversed(s.schema(), std::move(slice));
+            auto rev_slice = query::reverse_slice(*s.schema(), slice);
             auto pr = dht::partition_range::make_singular(m2.decorated_key());
 
             assert_that(cache.make_reader(rev_schema, semaphore.make_permit(), pr, rev_slice))
@@ -2067,7 +2065,7 @@ SEASTAR_TEST_CASE(test_scan_with_partial_partitions_reversed) {
             cache.evict();
 
             auto slice = s.schema()->full_slice();
-            auto rev_slice = make_legacy_reversed(s.schema(), std::move(slice));
+            auto rev_slice = query::reverse_slice(*s.schema(), slice);
             auto pr = dht::partition_range::make_singular(m2.decorated_key());
 
             assert_that(cache.make_reader(rev_schema, semaphore.make_permit(), pr, rev_slice))
@@ -2137,8 +2135,10 @@ SEASTAR_TEST_CASE(test_tombstone_merging_in_partial_partition) {
     });
 }
 
-static void consume_all(flat_mutation_reader_v2& rd) {
-    while (auto mfopt = rd().get0()) {}
+} // row_cache_test namespace
+
+static void consume_all(mutation_reader& rd) {
+    while (auto mfopt = rd().get()) {}
 }
 
 static void populate_range(row_cache& cache, const dht::partition_range& pr = query::full_partition_range,
@@ -2163,6 +2163,8 @@ static void apply(row_cache& cache, memtable_snapshot_source& underlying, replic
     mt1->apply(m, semaphore.make_permit()).get();
     cache.update(row_cache::external_updater([&] { underlying.apply(std::move(mt1)); }), m).get();
 }
+
+namespace row_cache_test {
 
 SEASTAR_TEST_CASE(test_readers_get_all_data_after_eviction) {
     return seastar::async([] {
@@ -2504,7 +2506,7 @@ SEASTAR_TEST_CASE(test_exception_safety_of_update_from_memtable) {
 
             populate_range(cache, population_range);
             auto rd1_v1 = assert_that(make_reader(population_range));
-            flat_mutation_reader_v2_opt snap;
+            mutation_reader_opt snap;
             auto close_snap = defer([&snap] {
                 if (snap) {
                     snap->close().get();
@@ -2531,6 +2533,7 @@ SEASTAR_TEST_CASE(test_exception_safety_of_update_from_memtable) {
             snap->fill_buffer().get();
 
             cache.update(row_cache::external_updater([&] {
+                memory::scoped_critical_alloc_section dfg;
                 auto mt2 = make_memtable(cache.schema(), muts2);
                 underlying.apply(std::move(mt2));
             }), *mt).get();
@@ -2577,9 +2580,9 @@ SEASTAR_TEST_CASE(test_exception_safety_of_reads) {
             memory::with_allocation_failures([&] {
                 auto rd = cache.make_reader(s, semaphore.make_permit(), singular_pr, slice);
                 auto close_rd = deferred_close(rd);
-                auto got_opt = read_mutation_from_flat_mutation_reader(rd).get0();
+                auto got_opt = read_mutation_from_mutation_reader(rd).get();
                 BOOST_REQUIRE(got_opt);
-                BOOST_REQUIRE(!read_mutation_from_flat_mutation_reader(rd).get0());
+                BOOST_REQUIRE(!read_mutation_from_mutation_reader(rd).get());
 
                 assert_that(*got_opt).is_equal_to_compacted(mut, ranges);
                 assert_that(cache.make_reader(s, semaphore.make_permit(), singular_pr, slice))
@@ -2589,9 +2592,9 @@ SEASTAR_TEST_CASE(test_exception_safety_of_reads) {
             memory::with_allocation_failures([&] {
                 auto rd = cache.make_reader(s, semaphore.make_permit(), query::full_partition_range, slice);
                 auto close_rd = deferred_close(rd);
-                auto got_opt = read_mutation_from_flat_mutation_reader(rd).get0();
+                auto got_opt = read_mutation_from_mutation_reader(rd).get();
                 BOOST_REQUIRE(got_opt);
-                BOOST_REQUIRE(!read_mutation_from_flat_mutation_reader(rd).get0());
+                BOOST_REQUIRE(!read_mutation_from_mutation_reader(rd).get());
 
                 assert_that(*got_opt).is_equal_to_compacted(mut, ranges);
                 assert_that(cache.make_reader(s, semaphore.make_permit(), query::full_partition_range, slice))
@@ -2657,9 +2660,9 @@ SEASTAR_TEST_CASE(test_exception_safety_of_transitioning_from_underlying_read_to
 
             auto rd = cache.make_reader(s.schema(), semaphore.make_permit(), pr, slice);
             auto close_rd = deferred_close(rd);
-            auto got_opt = read_mutation_from_flat_mutation_reader(rd).get0();
+            auto got_opt = read_mutation_from_mutation_reader(rd).get();
             BOOST_REQUIRE(got_opt);
-            auto mfopt = rd().get0();
+            auto mfopt = rd().get();
             BOOST_REQUIRE(!mfopt);
 
             assert_that(*got_opt).is_equal_to(mut);
@@ -2904,11 +2907,11 @@ SEASTAR_TEST_CASE(test_random_row_population) {
 
         struct read {
             std::unique_ptr<query::partition_slice> slice;
-            flat_mutation_reader_v2 reader;
+            mutation_reader reader;
             mutation_rebuilder_v2 result_builder;
 
             read() = delete;
-            read(std::unique_ptr<query::partition_slice> slice_, flat_mutation_reader_v2 reader_, mutation_rebuilder_v2 result_builder_) noexcept
+            read(std::unique_ptr<query::partition_slice> slice_, mutation_reader reader_, mutation_rebuilder_v2 result_builder_) noexcept
                     : slice(std::move(slice_))
                     , reader(std::move(reader_))
                     , result_builder(std::move(result_builder_))
@@ -2930,7 +2933,7 @@ SEASTAR_TEST_CASE(test_random_row_population) {
         while (!readers.empty()) {
             std::vector<read> remaining_readers;
             for (auto i = readers.begin(); i != readers.end(); i++) {
-                auto mfo = i->reader().get0();
+                auto mfo = i->reader().get();
                 if (!mfo) {
                     auto&& ranges = i->slice->row_ranges(*s.schema(), pk.key());
                     auto result = *i->result_builder.consume_end_of_stream();
@@ -2970,7 +2973,7 @@ SEASTAR_TEST_CASE(test_no_misses_when_read_is_repeated) {
             auto s2 = tracker.get_stats();
 
             if (s1.reads_with_misses != s2.reads_with_misses) {
-                BOOST_FAIL(format("Got cache miss when repeating read of {} on {}", ranges, m1));
+                BOOST_FAIL(seastar::format("Got cache miss when repeating read of {} on {}", ranges, m1));
             }
         }
     });
@@ -3361,7 +3364,7 @@ SEASTAR_TEST_CASE(test_concurrent_reads_and_eviction) {
 
         auto pr = dht::partition_range::make_singular(m0.decorated_key());
         auto make_reader = [&] (const query::partition_slice& slice) {
-            auto reversed = slice.options.contains<query::partition_slice::option::reversed>();
+            auto reversed = slice.is_reversed();
             auto rd = cache.make_reader(reversed ? rev_s : s, semaphore.make_permit(), pr, slice);
             rd.set_max_buffer_size(3);
             rd.fill_buffer().get();
@@ -3371,14 +3374,14 @@ SEASTAR_TEST_CASE(test_concurrent_reads_and_eviction) {
         const int n_readers = 3;
         std::vector<size_t> generations(n_readers);
         auto gc_versions = [&] {
-            auto n_live = last_generation - *boost::min_element(generations) + 1;
+            auto n_live = last_generation - *std::ranges::min_element(generations) + 1;
             while (versions.size() > n_live) {
                 versions.pop_front();
             }
         };
 
         bool done = false;
-        auto readers = parallel_for_each(boost::irange(0, n_readers), [&] (auto id) {
+        auto readers = parallel_for_each(std::views::iota(0, n_readers), [&] (auto id) {
             generations[id] = last_generation;
             return seastar::async([&, id] {
                 while (!done) {
@@ -3393,25 +3396,23 @@ SEASTAR_TEST_CASE(test_concurrent_reads_and_eviction) {
                         .with_ranges(fwd_ranges)
                         .build();
 
-                    auto native_slice = slice;
                     if (reversed) {
-                        slice = make_legacy_reversed(s, std::move(slice));
-                        native_slice = query::legacy_reverse_slice_to_native_reverse_slice(*s, slice);
+                        slice = query::reverse_slice(*s, std::move(slice));
                     }
 
                     auto rd = make_reader(slice);
                     auto close_rd = deferred_close(rd);
-                    auto actual_opt = read_mutation_from_flat_mutation_reader(rd).get0();
+                    auto actual_opt = read_mutation_from_mutation_reader(rd).get();
                     BOOST_REQUIRE(actual_opt);
                     auto actual = *actual_opt;
 
-                    auto&& ranges = native_slice.row_ranges(*rd.schema(), actual.key());
+                    auto&& ranges = slice.row_ranges(*rd.schema(), actual.key());
                     actual.partition().mutable_row_tombstones().trim(*rd.schema(), ranges);
                     actual = std::move(actual).compacted();
 
                     auto n_to_consider = last_generation - oldest_generation + 1;
-                    auto possible_versions = boost::make_iterator_range(versions.end() - n_to_consider, versions.end());
-                    if (!boost::algorithm::any_of(possible_versions, [&] (const mutation& m) {
+                    auto possible_versions = std::ranges::subrange(versions.end() - n_to_consider, versions.end());
+                    if (!std::ranges::any_of(possible_versions, [&] (const mutation& m) {
                         auto m2 = m.sliced(fwd_ranges);
                         if (reversed) {
                             m2 = reverse(std::move(m2));
@@ -3422,7 +3423,7 @@ SEASTAR_TEST_CASE(test_concurrent_reads_and_eviction) {
                         }
                         return m2 == actual;
                     })) {
-                        BOOST_FAIL(format("Mutation read doesn't match any expected version, slice: {}, read: {}\nexpected: [{}]",
+                        BOOST_FAIL(seastar::format("Mutation read doesn't match any expected version, slice: {}, read: {}\nexpected: [{}]",
                             slice, actual, fmt::join(possible_versions, ",\n")));
                     }
                 }
@@ -3607,8 +3608,8 @@ SEASTAR_TEST_CASE(test_hash_is_cached) {
         {
             auto rd = cache.make_reader(s, semaphore.make_permit());
             auto close_rd = deferred_close(rd);
-            rd().get0()->as_partition_start();
-            clustering_row row = std::move(*rd().get0()).as_clustering_row();
+            rd().get()->as_partition_start();
+            clustering_row row = std::move(*rd().get()).as_clustering_row();
             BOOST_REQUIRE(!row.cells().cell_hash_for(0));
         }
 
@@ -3617,16 +3618,16 @@ SEASTAR_TEST_CASE(test_hash_is_cached) {
             slice.options.set<query::partition_slice::option::with_digest>();
             auto rd = cache.make_reader(s, semaphore.make_permit(), query::full_partition_range, slice);
             auto close_rd = deferred_close(rd);
-            rd().get0()->as_partition_start();
-            clustering_row row = std::move(*rd().get0()).as_clustering_row();
+            rd().get()->as_partition_start();
+            clustering_row row = std::move(*rd().get()).as_clustering_row();
             BOOST_REQUIRE(row.cells().cell_hash_for(0));
         }
 
         {
             auto rd = cache.make_reader(s, semaphore.make_permit());
             auto close_rd = deferred_close(rd);
-            rd().get0()->as_partition_start();
-            clustering_row row = std::move(*rd().get0()).as_clustering_row();
+            rd().get()->as_partition_start();
+            clustering_row row = std::move(*rd().get()).as_clustering_row();
             BOOST_REQUIRE(row.cells().cell_hash_for(0));
         }
 
@@ -3637,8 +3638,8 @@ SEASTAR_TEST_CASE(test_hash_is_cached) {
         {
             auto rd = cache.make_reader(s, semaphore.make_permit());
             auto close_rd = deferred_close(rd);
-            rd().get0()->as_partition_start();
-            clustering_row row = std::move(*rd().get0()).as_clustering_row();
+            rd().get()->as_partition_start();
+            clustering_row row = std::move(*rd().get()).as_clustering_row();
             BOOST_REQUIRE(!row.cells().cell_hash_for(0));
         }
 
@@ -3647,16 +3648,16 @@ SEASTAR_TEST_CASE(test_hash_is_cached) {
             slice.options.set<query::partition_slice::option::with_digest>();
             auto rd = cache.make_reader(s, semaphore.make_permit(), query::full_partition_range, slice);
             auto close_rd = deferred_close(rd);
-            rd().get0()->as_partition_start();
-            clustering_row row = std::move(*rd().get0()).as_clustering_row();
+            rd().get()->as_partition_start();
+            clustering_row row = std::move(*rd().get()).as_clustering_row();
             BOOST_REQUIRE(row.cells().cell_hash_for(0));
         }
 
         {
             auto rd = cache.make_reader(s, semaphore.make_permit());
             auto close_rd = deferred_close(rd);
-            rd().get0()->as_partition_start();
-            clustering_row row = std::move(*rd().get0()).as_clustering_row();
+            rd().get()->as_partition_start();
+            clustering_row row = std::move(*rd().get()).as_clustering_row();
             BOOST_REQUIRE(row.cells().cell_hash_for(0));
         }
     });
@@ -4217,11 +4218,11 @@ SEASTAR_TEST_CASE(test_eviction_of_upper_bound_of_population_range) {
                     .build();
             auto rd = cache.make_reader(s.schema(), semaphore.make_permit(), pr, slice);
             auto close_rd = deferred_close(rd);
-            auto m_cache = read_mutation_from_flat_mutation_reader(rd).get0();
+            auto m_cache = read_mutation_from_mutation_reader(rd).get();
             close_rd.close_now();
             rd = cache_mt->make_flat_reader(s.schema(), semaphore.make_permit(), pr, slice);
             auto close_rd2 = deferred_close(rd);
-            auto m_mt = read_mutation_from_flat_mutation_reader(rd).get0();
+            auto m_mt = read_mutation_from_mutation_reader(rd).get();
             BOOST_REQUIRE(m_mt);
             assert_that(m_cache).has_mutation().is_equal_to(*m_mt);
         };
@@ -4381,19 +4382,28 @@ SEASTAR_TEST_CASE(test_populating_cache_with_expired_and_nonexpired_tombstones) 
         replica::table& t = env.local_db().find_column_family(ks_name, table_name);
         schema_ptr s = t.schema();
 
+        // emulate commitlog behaivor
+        t.get_compaction_manager().get_tombstone_gc_state().set_gc_time_min_source([s](const table_id& id) {
+            return gc_clock::now() - (std::chrono::seconds(s->gc_grace_seconds().count() + 600));
+        });
+
         dht::decorated_key dk = tests::generate_partition_key(s);
 
         auto ck1 = clustering_key::from_deeply_exploded(*s, {1});
         auto ck1_prefix = clustering_key_prefix::from_deeply_exploded(*s, {1});
         auto ck2 = clustering_key::from_deeply_exploded(*s, {2});
         auto ck2_prefix = clustering_key_prefix::from_deeply_exploded(*s, {2});
+        auto ck3 = clustering_key::from_deeply_exploded(*s, {3});
+        auto ck3_prefix = clustering_key_prefix::from_deeply_exploded(*s, {3});
 
         auto dt_noexp = gc_clock::now();
-        auto dt_exp = gc_clock::now() - std::chrono::seconds(s->gc_grace_seconds().count() + 1);
+        auto dt_exp = gc_clock::now() - std::chrono::seconds(s->gc_grace_seconds().count() + 700);
+        auto dt_hold = gc_clock::now() - std::chrono::seconds(s->gc_grace_seconds().count() + 1);
 
         mutation m(s, dk);
         m.partition().apply_delete(*s, ck1_prefix, tombstone(1, dt_noexp)); // create non-expired tombstone
         m.partition().apply_delete(*s, ck2_prefix, tombstone(2, dt_exp)); // create expired tombstone
+        m.partition().apply_delete(*s, ck3_prefix, tombstone(3, dt_hold)); // create held by commit log tombstone
         t.apply(m);
         t.flush().get();
 
@@ -4412,8 +4422,9 @@ SEASTAR_TEST_CASE(test_populating_cache_with_expired_and_nonexpired_tombstones) 
 
         BOOST_REQUIRE_EQUAL(cp.clustered_row(*s, ck1).deleted_at(), row_tombstone(tombstone(1, dt_noexp))); // non-expired tombstone is in cache
         BOOST_REQUIRE(cp.find_row(*s, ck2) == nullptr); // expired tombstone isn't in cache
+        BOOST_REQUIRE(cp.find_row(*s, ck3) == nullptr); // held tombstone isn't in cache
 
-        const auto rows = cp.non_dummy_rows();
+        auto rows = cp.non_dummy_rows();
         BOOST_REQUIRE(std::distance(rows.begin(), rows.end()) == 1); // cache contains non-expired row only
     });
 }
@@ -4459,7 +4470,7 @@ SEASTAR_THREAD_TEST_CASE(test_population_of_subrange_of_expired_partition) {
 // Reproducer for #14110.
 // Forces a scenario where digest is calculated for rows in old MVCC
 // versions, incompatible with the current schema.
-// In the original issue, this crashed the node with an assert failure,
+// In the original issue, this crashed the node with an SCYLLA_ASSERT failure,
 // because the digest calculation was passed the current schema,
 // instead of the row's actual old schema.
 SEASTAR_THREAD_TEST_CASE(test_digest_read_during_schema_upgrade) {
@@ -4515,7 +4526,7 @@ SEASTAR_THREAD_TEST_CASE(test_digest_read_during_schema_upgrade) {
     auto close_rd = deferred_close(rd);
 
     // In the original issue reproduced by this test, the read would crash
-    // on an assert.
+    // on an SCYLLA_ASSERT.
     // So what we are really testing below is that the read doesn't crash.
     // The comparison with m2 is just a sanity check.
     auto m2 = m1;
@@ -4545,8 +4556,10 @@ SEASTAR_TEST_CASE(test_cache_compacts_expired_tombstones_on_read) {
         auto ck1 = make_ck(1);
         auto ck2 = make_ck(2);
         auto ck3 = make_ck(3);
+        auto ck4 = make_ck(4);
         auto dt_noexp = gc_clock::now();
-        auto dt_exp = gc_clock::now() - std::chrono::seconds(s->gc_grace_seconds().count() + 1);
+        auto dt_exp = gc_clock::now() - std::chrono::seconds(s->gc_grace_seconds().count() + 700);
+        auto dt_held = gc_clock::now() - std::chrono::seconds(s->gc_grace_seconds().count() + 1);
 
         auto mt = make_lw_shared<replica::memtable>(s);
         cache_tracker tracker;
@@ -4557,13 +4570,20 @@ SEASTAR_TEST_CASE(test_cache_compacts_expired_tombstones_on_read) {
             m.set_clustered_cell(ck1, "v", data_value(101), 1);
             m.partition().apply_delete(*s, make_prefix(2), tombstone(1, dt_noexp)); // create non-expired tombstone
             m.partition().apply_delete(*s, make_prefix(3), tombstone(2, dt_exp)); // create expired tombstone
+            m.partition().apply_delete(*s, make_prefix(4), tombstone(3, dt_held)); // create expired but held by commit log tombstone
             cache.populate(m);
         }
 
         tombstone_gc_state gc_state(nullptr);
+
+        // emulate commitlog behaivor
+        gc_state.set_gc_time_min_source([&s](const table_id& id) {
+                return gc_clock::now() - (std::chrono::seconds(s->gc_grace_seconds().count() + 600));
+        });
+
         auto rd1 = cache.make_reader(s, semaphore.make_permit(), query::full_partition_range, &gc_state);
         auto close_rd = deferred_close(rd1);
-        rd1.fill_buffer().get(); // cache_flat_mutation_reader compacts cache on fill buffer
+        rd1.fill_buffer().get(); // cache_mutation_reader compacts cache on fill buffer
 
         cache_entry& entry = cache.lookup(pkey);
         auto& cp = entry.partition().version()->partition();
@@ -4571,11 +4591,12 @@ SEASTAR_TEST_CASE(test_cache_compacts_expired_tombstones_on_read) {
         BOOST_REQUIRE(cp.find_row(*s, ck1) != nullptr); // live row is in cache
         BOOST_REQUIRE_EQUAL(cp.clustered_row(*s, ck2).deleted_at(), row_tombstone(tombstone(1, dt_noexp))); // non-expired tombstone is in cache
         BOOST_REQUIRE(cp.find_row(*s, ck3) == nullptr); // expired tombstone isn't in cache
+        BOOST_REQUIRE(cp.find_row(*s, ck4) == nullptr); // held tombstone isn't in cache
 
         // check tracker stats
         auto &tracker_stats = tracker.get_stats();
-        BOOST_REQUIRE(tracker_stats.rows_compacted == 1);
-        BOOST_REQUIRE(tracker_stats.rows_compacted_away == 1);
+        BOOST_REQUIRE(tracker_stats.rows_compacted == 2);
+        BOOST_REQUIRE(tracker_stats.rows_compacted_away == 2);
     });
 }
 
@@ -4675,7 +4696,7 @@ SEASTAR_TEST_CASE(test_compact_range_tombstones_on_read) {
 SEASTAR_THREAD_TEST_CASE(test_cache_reader_semaphore_oom_kill) {
     simple_schema s;
     reader_concurrency_semaphore semaphore(100, 1, get_name(), std::numeric_limits<size_t>::max(), utils::updateable_value<uint32_t>(1),
-            utils::updateable_value<uint32_t>(1));
+            utils::updateable_value<uint32_t>(1), reader_concurrency_semaphore::register_metrics::no);
     auto stop_semaphore = deferred_stop(semaphore);
 
     cache_tracker tracker;
@@ -4697,7 +4718,7 @@ SEASTAR_THREAD_TEST_CASE(test_cache_reader_semaphore_oom_kill) {
     // Check different amounts of memory consumed before the read, so the OOM kill is triggered in different places.
     for (unsigned memory = 1; memory <= 512; memory *= 2) {
         semaphore.set_resources({1, memory});
-        auto permit = semaphore.obtain_permit(s.schema().get(), "read", 0, db::no_timeout, {}).get();
+        auto permit = semaphore.obtain_permit(s.schema(), "read", 0, db::no_timeout, {}).get();
         auto create_reader_and_read_all = [&] {
             auto rd = cache.make_reader(s.schema(), permit, pr, &gc_state);
             auto close_rd = deferred_close(rd);
@@ -4707,3 +4728,175 @@ SEASTAR_THREAD_TEST_CASE(test_cache_reader_semaphore_oom_kill) {
         BOOST_REQUIRE_EQUAL(semaphore.get_stats().total_reads_killed_due_to_kill_limit, ++kill_limit_before);
     }
 }
+
+// Reproducer for #16759.
+//
+#ifdef SCYLLA_ENABLE_PREEMPTION_SOURCE
+SEASTAR_THREAD_TEST_CASE(test_preempt_cache_update) {
+    // Starts requesting preemption after the given number of checks.
+    // On the first yield, blocks on a semaphore until it's later
+    // unblocked by the test.
+    struct preempter : public custom_preemption_source::impl {
+        semaphore wait_for_block{0};
+        semaphore wait_for_unblock{0};
+        uint64_t yields = 0;
+        int64_t until_preempt;
+        preempter(uint64_t count) : until_preempt(count) {}
+        bool should_preempt() override {
+            return (--until_preempt == 0);
+        }
+        void thread_yield() override {
+            if (yields++ == 0) {
+                wait_for_block.signal();
+                wait_for_unblock.wait().get();
+            }
+        }
+    };
+
+    // Create a few mutations with multiple rows.
+    simple_schema s;
+    auto keys = s.make_pkeys(3);
+    std::vector<mutation> mutations;
+    for (const auto& pk : keys) {
+        mutation m(s.schema(), pk);
+        for (int j = 0; j < 3; ++j) {
+            s.add_row(m, s.make_ckey(j), "example_value");
+        }
+        mutations.push_back(std::move(m));
+    }
+
+    // Test all possible preemption points.
+    for (uint64_t preempt_after = 1; true; ++preempt_after) {
+        testlog.trace("preempt after {}", preempt_after);
+        auto preempt_src = custom_preemption_source{std::make_unique<preempter>(preempt_after)};
+        auto& p = dynamic_cast<preempter&>(*preempt_src._impl);
+
+        // Set up the cache and populate it with the second mutation,
+        // so that the update can be preempted in the middle of a partition.
+        // It's a condition for reproducing #16759.
+        cache_tracker tracker;
+        memtable_snapshot_source underlying(s.schema());
+        underlying.apply(mutations[1]);
+        row_cache cache(s.schema(), snapshot_source([&] { return underlying(); }), tracker);
+        cache.populate(mutations[1]);
+
+        tests::reader_concurrency_semaphore_wrapper semaphore;
+
+        // Update the cache (and the underlying source) with the mutations.
+        auto mt = make_lw_shared<replica::memtable>(s.schema());
+        for (const auto& m : mutations) {
+            mt->apply(m);
+        }
+        auto mt_copy = make_lw_shared<replica::memtable>(s.schema());
+        mt_copy->apply(*mt, semaphore.make_permit()).get();
+        auto update_fut = cache.update(row_cache::external_updater([&] { underlying.apply(mt_copy); }), *mt, preempt_src).then([&] {
+            // The update does not have to yield.
+            // We don't want the test to break if it doesn't yield.
+            // So if the test wasn't unblocked by a yield, we have to
+            // do it here.
+            p.wait_for_block.signal();
+        });
+
+        // Wait for the update thread to yield.
+        p.wait_for_block.wait().get();
+
+        {
+            // Read combined cache and memtables, and check that it produces
+            // the inserted data.
+            std::vector<mutation_reader> readers;
+            readers.push_back(cache.make_reader(s.schema(), semaphore.make_permit()));
+            readers.push_back(mt->make_flat_reader(s.schema(), semaphore.make_permit()));
+            auto at = assert_that(make_combined_reader(s.schema(), semaphore.make_permit(), std::move(readers)));
+            for (const auto& m : mutations) {
+                at.produces(m);
+            }
+            at.produces_end_of_stream();
+        }
+
+        // Unblock the update and wait for it to finish.
+        p.wait_for_unblock.signal();
+        update_fut.get();
+
+        {
+            // Read the cache after the update is over and check that it produces the inserted
+            // data.
+            auto at = assert_that(cache.make_reader(s.schema(), semaphore.make_permit()));
+            for (const auto& m : mutations) {
+                at.produces(m);
+            }
+            at.produces_end_of_stream();
+        }
+
+        // If a preemption request wasn't triggered in this loop, this means
+        // we have tested all preemption points and we are done.
+        if (p.until_preempt > 0) {
+            break;
+        }
+    }
+}
+#endif
+
+// Reproducer for scylladb/scylladb#18045.
+SEASTAR_THREAD_TEST_CASE(test_reproduce_18045) {
+    auto s = schema_builder("ks", "cf")
+        .with_column("pk", int32_type, column_kind::partition_key)
+        .with_column("ck", int32_type, column_kind::clustering_key)
+        .with_column("v", int32_type)
+        .build();
+    tests::reader_concurrency_semaphore_wrapper semaphore;
+    auto make_ck = [&s] (int v) {
+        return clustering_key::from_deeply_exploded(*s, {data_value{v}});
+    };
+
+    auto pk = tests::generate_partition_key(s);
+    auto ck1 = make_ck(1);
+    auto ck2 = make_ck(2);
+    auto ck3 = make_ck(3);
+
+    // In the blocks below, we set up the following state:
+    // 1. Underlying row at ck1, live.
+    // 2. Cache entry at ck2, expired, discontinuous.
+    // 3. Cache entry at ck3, live, continuous.
+
+    auto dt_exp = gc_clock::now() - std::chrono::seconds(s->gc_grace_seconds().count() + 1);
+    mutation m(s, pk);
+    m.set_clustered_cell(ck1, "v", data_value(0), 1);
+    m.partition().apply_delete(*s, ck2, tombstone(1, dt_exp));
+    m.set_clustered_cell(ck3, "v", data_value(0), 1);
+
+    memtable_snapshot_source underlying(s);
+    underlying.apply(m);
+
+    cache_tracker tracker;
+    row_cache cache(s, snapshot_source([&] { return underlying(); }), tracker);
+    cache.populate(m);
+
+    with_allocator(tracker.allocator(), [&] {
+        auto& e = *cache.lookup(pk).partition().version()->partition().clustered_rows().begin();
+        tracker.get_lru().remove(e);
+        e.on_evicted(tracker);
+    });
+
+    // We have set up the desired state.
+    // Now we do a reverse query over the partition.
+    // This query will remove the expired entry at ck2, leaving cursor's _latest_it dangling.
+    // Then, it will populate the cache with ck3.
+    // Before the fix for issue #18045, this caused a (ASAN-triggering) use-after-free,
+    // because _latest_it was deferenced during the population.
+
+    tombstone_gc_state gc_state(nullptr);
+    auto slice = query::reverse_slice(*s, s->full_slice());
+    auto rd = cache.make_reader(
+        s->make_reversed(),
+        semaphore.make_permit(),
+        dht::partition_range::make_singular(pk),
+        slice,
+        nullptr,
+        streamed_mutation::forwarding::no,
+        mutation_reader::forwarding::no,
+        &gc_state);
+    auto close_rd = deferred_close(rd);
+    read_mutation_from_mutation_reader(rd).get();
+}
+
+BOOST_AUTO_TEST_SUITE_END()

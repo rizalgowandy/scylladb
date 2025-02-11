@@ -5,13 +5,12 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
-#include <seastar/core/sstring.hh>
-#include "utils/serialization.hh"
+#include <fmt/core.h>
 #include "gms/inet_address.hh"
 #include "gms/generation-number.hh"
 #include "gms/version_generator.hh"
@@ -56,10 +55,13 @@ public:
         return x._max_version <  y._max_version;
     }
 
-    friend inline std::ostream& operator<<(std::ostream& os, const gossip_digest& d) {
-        fmt::print(os, "{}:{}:{}", d._endpoint, d._generation, d._max_version);
-        return os;
-    }
+    friend fmt::formatter<gossip_digest>;
 }; // class gossip_digest
 
 } // namespace gms
+
+template <> struct fmt::formatter<gms::gossip_digest> : fmt::formatter<string_view> {
+    auto format(const gms::gossip_digest& d, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}:{}:{}", d._endpoint, d._generation, d._max_version);
+    }
+};

@@ -3,15 +3,19 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include "api.hh"
+namespace seastar::httpd {
+class routes;
+}
 
 namespace api {
 
-void set_cache_service(http_context& ctx, httpd::routes& r);
+struct http_context;
+void set_cache_service(http_context& ctx, seastar::httpd::routes& r);
+void unset_cache_service(http_context& ctx, seastar::httpd::routes& r);
 
 }

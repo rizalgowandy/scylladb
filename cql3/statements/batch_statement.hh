@@ -4,17 +4,17 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 #pragma once
 
 #include "cql3/cql_statement.hh"
 #include "raw/batch_statement.hh"
 #include "timestamp.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "service_permit.hh"
-#include "exceptions/exceptions.hh"
 #include "exceptions/coordinator_result.hh"
+#include "tracing/trace_state.hh"
 
 namespace cql_transport::messages {
     class result_message;
@@ -71,8 +71,7 @@ private:
     cql_stats& _stats;
 public:
     /**
-     * Creates a new BatchStatement from a list of statements and a
-     * Thrift consistency level.
+     * Creates a new BatchStatement from a list of statements
      *
      * @param type type of the batch
      * @param statements a list of UpdateStatements
@@ -87,6 +86,8 @@ public:
                     std::vector<single_statement> statements,
                     std::unique_ptr<attributes> attrs,
                     cql_stats& stats);
+
+    const std::vector<single_statement>& statements() const { return _statements; }
 
     virtual bool depends_on(std::string_view ks_name, std::optional<std::string_view> cf_name) const override;
 

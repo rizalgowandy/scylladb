@@ -3,16 +3,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include "api.hh"
-#include "api/api-doc/column_family.json.hh"
 #include "replica/database.hh"
-#include <seastar/core/future-util.hh>
+#include <seastar/json/json_elements.hh>
 #include <any>
+#include "api/api_init.hh"
 
 namespace db {
 class system_keyspace;
@@ -23,14 +22,12 @@ namespace api {
 void set_column_family(http_context& ctx, httpd::routes& r, sharded<db::system_keyspace>& sys_ks);
 void unset_column_family(http_context& ctx, httpd::routes& r);
 
-table_id get_uuid(const sstring& name, const replica::database& db);
-future<> foreach_column_family(http_context& ctx, const sstring& name, std::function<void(replica::column_family&)> f);
-
+table_info parse_table_info(const sstring& name, const replica::database& db);
 
 template<class Mapper, class I, class Reducer>
 future<I> map_reduce_cf_raw(http_context& ctx, const sstring& name, I init,
         Mapper mapper, Reducer reducer) {
-    auto uuid = get_uuid(name, ctx.db.local());
+    auto uuid = parse_table_info(name, ctx.db.local()).id;
     using mapper_type = std::function<std::unique_ptr<std::any>(replica::database&)>;
     using reducer_type = std::function<std::unique_ptr<std::any>(std::unique_ptr<std::any>, std::unique_ptr<std::any>)>;
     return ctx.db.map_reduce0(mapper_type([mapper, uuid](replica::database& db) {

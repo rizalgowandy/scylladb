@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -12,6 +12,7 @@
 #include "db/timeout_clock.hh"
 #include "utils/chunked_vector.hh"
 #include "schema/schema_fwd.hh"
+#include "gc_clock.hh"
 
 #include <seastar/core/sharded.hh>
 #include <seastar/core/metrics_registration.hh>
@@ -22,6 +23,10 @@
 using namespace seastar;
 
 struct frozen_mutation_and_schema;
+class mutation;
+class reader_permit;
+class mutation_reader;
+using mutation_reader_opt = optimized_optional<mutation_reader>;
 
 namespace dht {
 class token;
@@ -46,6 +51,7 @@ using allow_hints = bool_class<allow_hints_tag>;
 namespace db::view {
 
 class stats;
+struct view_and_base;
 struct wait_for_all_updates_tag {};
 using wait_for_all_updates = bool_class<wait_for_all_updates_tag>;
 
@@ -72,11 +78,15 @@ public:
     ~view_update_generator();
 
     future<> start();
+    future<> drain();
     future<> stop();
     future<> register_staging_sstable(sstables::shared_sstable sst, lw_shared_ptr<replica::table> table);
 
     replica::database& get_db() noexcept { return _db; }
 
+    const sharded<service::storage_proxy>& get_storage_proxy() const noexcept { return _proxy; };
+
+private:
     future<> mutate_MV(
             schema_ptr base,
             dht::token base_token,
@@ -88,8 +98,27 @@ public:
             service::allow_hints allow_hints,
             wait_for_all_updates wait_for_all);
 
+public:
     ssize_t available_register_units() const { return _registration_sem.available_units(); }
     size_t queued_batches_count() const { return _sstables_with_tables.size(); }
+
+    // Reader's schema must be the same as the base schema of each of the views.
+    future<> populate_views(const replica::table& base,
+            std::vector<view_and_base>,
+            dht::token base_token,
+            mutation_reader&&,
+            gc_clock::time_point);
+
+    future<> generate_and_propagate_view_updates(const replica::table& table,
+            const schema_ptr& base,
+            reader_permit permit,
+            std::vector<view_and_base>&& views,
+            mutation&& m,
+            mutation_reader_opt existings,
+            tracing::trace_state_ptr tr_state,
+            gc_clock::time_point now,
+            db::timeout_clock::time_point timeout);
+
 private:
     bool should_throttle() const;
     void setup_metrics();

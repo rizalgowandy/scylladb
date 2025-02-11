@@ -3,18 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <any>
 
-#include <boost/signals2.hpp>
+#include <boost/signals2/connection.hpp>
+#include <boost/signals2/signal_type.hpp>
 #include <boost/signals2/dummy_mutex.hpp>
 
-#include <seastar/core/shared_future.hh>
 #include <seastar/util/noncopyable_function.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/sstring.hh>
 
 using namespace seastar;
 
@@ -73,9 +75,6 @@ public:
     operator bool() const {
         return _enabled;
     }
-    friend inline std::ostream& operator<<(std::ostream& os, const feature& f) {
-        return os << "{ gossip feature = " << f._name << " }";
-    }
     void when_enabled(listener& callback) const {
         callback.set_connection(_s.connect(callback.get_slot()));
         if (_enabled) {
@@ -84,6 +83,8 @@ public:
     }
     // Will call the callback functor when this feature is enabled, unless
     // the returned listener_registration is destroyed earlier.
+    [[nodiscard("the listener_registration returned by when_enabled must be kept alive "
+                "in order to keep the callback registered")]]
     listener_registration when_enabled(seastar::noncopyable_function<void()> callback) const {
         struct wrapper : public listener {
             seastar::noncopyable_function<void()> _func;

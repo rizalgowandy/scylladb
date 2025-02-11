@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -39,7 +39,7 @@ public:
     }
 };
 
-static inline
+inline
 timestamp_type new_timestamp() {
     return timestamp_clock::now().time_since_epoch().count();
 }

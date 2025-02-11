@@ -3,12 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "replica/memtable.hh"
 #include "readers/from_fragments_v2.hh"
-#include "readers/upgrading_consumer.hh"
 #include "repair/hash.hh"
 #include "repair/row.hh"
 #include "repair/writer.hh"
@@ -19,9 +18,13 @@
 #include "test/lib/cql_test_env.hh"
 #include "service/storage_proxy.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include "test/lib/sstable_utils.hh"
 #include "readers/mutation_fragment_v1_stream.hh"
+#include "schema/schema_registry.hh"
+
+BOOST_AUTO_TEST_SUITE(repair_test)
 
 // Helper mutation_fragment_queue that stores the received stream of
 // mutation_fragments in a passed in deque of mutation_fragment_v2.
@@ -89,6 +92,7 @@ repair_rows_on_wire make_random_repair_rows_on_wire(random_mutation_generator& g
         auto m2 = make_memtable(s, {mut});
         m->apply(mut);
         auto reader = mutation_fragment_v1_stream(m2->make_flat_reader(s, permit));
+        auto close_reader = deferred_close(reader);
         std::list<frozen_mutation_fragment> mfs;
         reader.consume_pausable([s, &mfs](mutation_fragment mf) {
             if ((mf.is_partition_start() && !mf.as_partition_start().partition_tombstone()) || mf.is_end_of_partition()) {
@@ -132,7 +136,7 @@ SEASTAR_TEST_CASE(flush_repair_rows_on_wire_to_sstable) {
         std::list<repair_row> repair_rows = to_repair_rows_list(std::move(input), s, seed, repair_master::yes, permit, repair_hasher(seed, s)).get();
         flush_rows(s, repair_rows, writer);
         writer->wait_for_writer_done().get();
-        compare_readers(*s, m->make_flat_reader(s, permit), make_flat_mutation_reader_from_fragments(s, permit, std::move(fragments)));
+        compare_readers(*s, m->make_flat_reader(s, permit), make_mutation_reader_from_fragments(s, permit, std::move(fragments)));
     });
 }
 
@@ -168,7 +172,7 @@ SEASTAR_TEST_CASE(test_reader_with_different_strategies) {
             co_await storage_proxy.mutate_locally(std::move(mutations), tracing::trace_state_ptr());
         }
 
-        auto do_check = [&](const dht::sharder& remote_sharder,
+        auto do_check = [&](const dht::static_sharder& remote_sharder,
             repair_reader::read_strategy strategy1, repair_reader::read_strategy strategy2) -> future<>
         {
             const auto& s = *cf.schema();
@@ -226,7 +230,7 @@ SEASTAR_TEST_CASE(test_reader_with_different_strategies) {
             }
         };
 
-        co_await do_check(dht::sharder(local_sharder.shard_count() + 1, local_sharder.sharding_ignore_msb()),
+        co_await do_check(dht::static_sharder(local_sharder.shard_count() + 1, local_sharder.sharding_ignore_msb()),
             repair_reader::read_strategy::multishard_split,
             repair_reader::read_strategy::multishard_filter);
         co_await do_check(local_sharder,
@@ -237,3 +241,36 @@ SEASTAR_TEST_CASE(test_reader_with_different_strategies) {
             repair_reader::read_strategy::multishard_split);
     });
 }
+
+SEASTAR_TEST_CASE(repair_rows_size_considers_external_memory) {
+    return seastar::async([&] {
+        tests::reader_concurrency_semaphore_wrapper semaphore;
+        reader_permit permit = semaphore.make_permit();
+        random_mutation_generator gen{random_mutation_generator::generate_counters::no};
+        schema_ptr s = gen.schema();
+        auto m = make_lw_shared<replica::memtable>(s);
+        auto r = *make_random_repair_rows_on_wire(gen, s, permit, m).begin();
+        uint64_t seed = tests::random::get_int<uint64_t>();
+
+        auto& frozen_mf = *r.get_mutation_fragments().begin();
+        auto mf = make_lw_shared<mutation_fragment>(frozen_mf.unfreeze(*s, permit));
+        auto dk_ptr = make_lw_shared<const decorated_key_with_hash>(*s, dht::decorate_key(*s, r.get_key()), seed);
+        position_in_partition pos(mf->position());
+        repair_sync_boundary boundary{dk_ptr->dk, pos};
+        auto fmf_size = frozen_mf.representation().size();
+
+        // Test that frozen mutation fragment memory is counted.
+        repair_row row{frozen_mf, std::nullopt, nullptr, std::nullopt, is_dirty_on_master::no, nullptr};
+        BOOST_REQUIRE_EQUAL(row.size(), fmf_size + sizeof(repair_row));
+
+        // Test that mutation fragment memory is counted.
+        repair_row row_with_mf{frozen_mf, std::nullopt, nullptr, std::nullopt, is_dirty_on_master::no, mf};
+        BOOST_REQUIRE_EQUAL(row_with_mf.size(), fmf_size + mf->memory_usage() + sizeof(repair_row));
+
+        // Test that boundary memory is counted.
+        repair_row row_with_boundary{frozen_mf, pos, dk_ptr, std::nullopt, is_dirty_on_master::no, nullptr};
+        BOOST_REQUIRE_EQUAL(row_with_boundary.size(), fmf_size + boundary.pk.external_memory_usage() + boundary.position.external_memory_usage() + sizeof(repair_row));
+    });
+}
+
+BOOST_AUTO_TEST_SUITE_END()

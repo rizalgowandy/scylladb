@@ -4,13 +4,14 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "db/virtual_table.hh"
 #include "db/chained_delegating_reader.hh"
 #include "readers/queue.hh"
 #include "readers/reversing_v2.hh"
+#include "readers/filtering.hh"
 #include "readers/forwardable_v2.hh"
 #include "readers/slicing_filtering.hh"
 #include "dht/i_partitioner.hh"
@@ -75,12 +76,12 @@ mutation_source memtable_filling_virtual_table::as_mutation_source() {
         };
 
         // populate keeps the memtable alive.
-        return make_flat_mutation_reader_v2<chained_delegating_reader>(s, std::move(populate), units->units.permit());
+        return make_mutation_reader<chained_delegating_reader>(s, std::move(populate), units->units.permit());
     });
 }
 
 mutation_source streaming_virtual_table::as_mutation_source() {
-    return mutation_source([this] (schema_ptr s,
+    return mutation_source([this] (schema_ptr query_schema,
         reader_permit permit,
         const dht::partition_range& pr,
         const query::partition_slice& query_slice,
@@ -91,10 +92,10 @@ mutation_source streaming_virtual_table::as_mutation_source() {
         std::unique_ptr<query::partition_slice> unreversed_slice;
         bool reversed = query_slice.is_reversed();
         if (reversed) {
-            s = s->make_reversed();
-            unreversed_slice = std::make_unique<query::partition_slice>(query::half_reverse_slice(*s, query_slice));
+            unreversed_slice = std::make_unique<query::partition_slice>(query::reverse_slice(*query_schema, query_slice));
         }
         const auto& slice = reversed ? *unreversed_slice : query_slice;
+        auto table_schema = reversed ? query_schema->make_reversed() : query_schema;
 
         // We cannot pass the partition_range directly to execute()
         // because it is not guaranteed to be alive until execute() resolves.
@@ -129,8 +130,8 @@ mutation_source streaming_virtual_table::as_mutation_source() {
             }
         };
 
-        auto reader_and_handle = make_queue_reader_v2(s, permit);
-        auto consumer = std::make_unique<my_result_collector>(s, permit, &pr, std::move(reader_and_handle.second));
+        auto reader_and_handle = make_queue_reader_v2(table_schema, permit);
+        auto consumer = std::make_unique<my_result_collector>(table_schema, permit, &pr, std::move(reader_and_handle.second));
         auto f = execute(permit, *consumer, *consumer);
 
         // It is safe to discard this future because:

@@ -3,11 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include <optional>
 #include <string_view>
 #include <functional>
 
@@ -29,8 +30,6 @@ namespace roles_table {
 std::string_view creation_query();
 
 constexpr std::string_view name{"roles", 5};
-
-extern const std::string_view qualified_name;
 
 constexpr std::string_view role_col_name{"role", 4};
 

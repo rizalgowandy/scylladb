@@ -5,19 +5,15 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include <sstream>
-#include <string>
 #include <chrono>
 #include <optional>
 #include "production_snitch_base.hh"
-#include "exceptions/exceptions.hh"
-#include <seastar/core/file.hh>
-#include "log.hh"
 
 namespace locator {
 
@@ -35,7 +31,7 @@ public:
         return std::chrono::seconds(60);
     }
 
-    virtual std::list<std::pair<gms::application_state, gms::versioned_value>> get_app_states() const override;
+    virtual gms::application_state_map get_app_states() const override;
     virtual future<> stop() override;
     virtual future<> start() override;
     virtual future<> pause_io() override;

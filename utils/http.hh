@@ -3,10 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <seastar/core/coroutine.hh>
+#pragma once
+
 #include <seastar/core/seastar.hh>
 #include <seastar/core/shared_future.hh>
 #include <seastar/coroutine/all.hh>
@@ -15,7 +16,7 @@
 #include <seastar/net/tls.hh>
 
 #include "seastarx.hh"
-#include "log.hh"
+#include "utils/log.hh"
 
 namespace utils::http {
 
@@ -62,7 +63,7 @@ public:
     {
     }
 
-    virtual future<connected_socket> make() override {
+    virtual future<connected_socket> make(abort_source*) override {
         if (!_state->initialized) {
             _logger.debug("Waiting for factory to initialize");
             co_await _done.get_future();

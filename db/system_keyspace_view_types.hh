@@ -3,14 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <seastar/core/seastar.hh>
 #include <seastar/core/sstring.hh>
-#include <seastar/core/smp.hh>
 #include <utility>
 #include <optional>
 #include "dht/token.hh"

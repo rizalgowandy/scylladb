@@ -30,6 +30,7 @@ in individual sections
         | sstable_origin
         | scylla_build_id
         | scylla_version
+        | ext_timestamp_stats
 
 `sharding_metadata` (tag 1): describes what token sub-ranges are included in this
 sstable. This is used, when loading the sstable, to determine which shard(s)
@@ -54,6 +55,18 @@ Scylla executable that created the sstable.
 
 `scylla_version` (tag 8): a string containing the version of the
 Scylla executable that created the sstable.
+
+`ext_timestamp_stats` (tag 9): a `map<ext_timestamp_stats_type, int64_t>` with statistics
+about timestamps in the sstable, like: `min_live_timestamp`, and `min_live_row_marker_timestamp`.
+
+`sstable_identifier` (tag 10): a uuid identifying the sstable for its whole lifetime.
+It is derived from the sstable uuid generation, upon creation (or uniquely generated
+if the sstable has numerical generation).  Yet, unlike the sstable that may
+change if the sstable is migrated to a different shard or node, the sstable
+identifier is stable and copied with the rest of the scylla metadata.
+
+The [scylla sstable dump-scylla-metadata](https://github.com/scylladb/scylladb/blob/master/docs/operating-scylla/admin-tools/scylla-sstable.rst#dump-scylla-metadata) tool
+can be used to dump the scylla metadata in JSON format.
 
 ## sharding_metadata subcomponent
 
@@ -95,6 +108,9 @@ Scylla with issue #4363 fixed)
 
 bit 5: CorrectUDTsInCollections (if set, indicates that the sstable was generated
 by Scylla with issue #6130 fixed)
+
+bit 6: CorrectLastPiBlockWidth (if set, indicates that the width of the last promoted index block never includes
+the partition end marker)
 
 ## extension_attributes subcomponent
 

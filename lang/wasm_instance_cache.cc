@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "lang/wasm_instance_cache.hh"
@@ -286,10 +286,6 @@ future<> instance_cache::stop() {
 }
 
 namespace std {
-
-inline std::ostream& operator<<(std::ostream& out, const seastar::scheduling_group& sg) {
-    return out << sg.name();
-}
 
 template <>
 struct equal_to<seastar::scheduling_group> {

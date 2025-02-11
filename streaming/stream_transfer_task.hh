@@ -5,15 +5,14 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include "streaming/stream_fwd.hh"
 #include "streaming/stream_task.hh"
-#include "streaming/stream_detail.hh"
-#include <map>
+#include "dht/i_partitioner_fwd.hh"
 #include <seastar/core/semaphore.hh>
 
 namespace streaming {

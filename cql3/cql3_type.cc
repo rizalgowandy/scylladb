@@ -3,10 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <iostream>
+#include "utils/assert.hh"
 #include <iterator>
 #include <boost/regex.hpp>
 
@@ -20,6 +20,7 @@
 #include "types/map.hh"
 #include "types/set.hh"
 #include "types/list.hh"
+#include "types/vector.hh"
 #include "concrete_types.hh"
 
 namespace cql3 {
@@ -48,8 +49,9 @@ static cql3_type::kind get_cql3_kind(const abstract_type& t) {
         cql3_type::kind operator()(const uuid_type_impl&) { return cql3_type::kind::UUID; }
         cql3_type::kind operator()(const varint_type_impl&) { return cql3_type::kind::VARINT; }
         cql3_type::kind operator()(const reversed_type_impl& r) { return get_cql3_kind(*r.underlying_type()); }
-        cql3_type::kind operator()(const tuple_type_impl&) { assert(0 && "no kind for this type"); }
-        cql3_type::kind operator()(const collection_type_impl&) { assert(0 && "no kind for this type"); }
+        cql3_type::kind operator()(const tuple_type_impl&) { SCYLLA_ASSERT(0 && "no kind for this type"); }
+        cql3_type::kind operator()(const vector_type_impl&) { SCYLLA_ASSERT(0 && "no kind for this type"); }
+        cql3_type::kind operator()(const collection_type_impl&) { SCYLLA_ASSERT(0 && "no kind for this type"); }
     };
     return visit(t, visitor{});
 }
@@ -148,7 +150,7 @@ public:
     }
 
     virtual cql3_type prepare_internal(const sstring& keyspace, const data_dictionary::user_types_metadata& user_types) override {
-        assert(_values); // "Got null values type for a collection";
+        SCYLLA_ASSERT(_values); // "Got null values type for a collection";
 
         if (_values->is_counter()) {
             throw exceptions::invalid_request_exception(format("Counters are not allowed inside collections: {}", *this));
@@ -188,7 +190,7 @@ private:
             }
             return cql3_type(set_type_impl::get_instance(_values->prepare_internal(keyspace, user_types).get_type(), !is_frozen()));
         } else if (_kind == abstract_type::kind::map) {
-            assert(_keys); // "Got null keys type for a collection";
+            SCYLLA_ASSERT(_keys); // "Got null keys type for a collection";
             if (_keys->is_duration()) {
                 throw exceptions::invalid_request_exception(format("Durations are not allowed as map keys: {}", *this));
             }
@@ -262,7 +264,7 @@ class cql3_type::raw_tuple : public raw {
     std::vector<shared_ptr<raw>> _types;
 
     virtual sstring to_string() const override {
-        return format("tuple<{}>", fmt::join(_types, ", "));
+        return seastar::format("tuple<{}>", fmt::join(_types, ", "));
     }
 public:
     raw_tuple(std::vector<shared_ptr<raw>> types)
@@ -300,6 +302,56 @@ public:
         return std::any_of(_types.begin(), _types.end(), [&name](auto t) {
             return t->references_user_type(name);
         });
+    }
+};
+
+class cql3_type::raw_vector : public raw {
+    shared_ptr<raw> _type;
+    size_t _dimension;
+
+    // This limitation is acquired from the maximum number of dimensions in OpenSearch. 
+    static constexpr size_t MAX_VECTOR_DIMENSION = 16000;
+
+    virtual sstring to_string() const override {
+        return seastar::format("vector<{}, {}>", _type, _dimension);
+    }
+
+public:
+    raw_vector(shared_ptr<raw> type, size_t dimension)
+            : _type(std::move(type)), _dimension(dimension) {
+    }
+
+    virtual bool supports_freezing() const override {
+        return true;
+    }
+
+    virtual bool is_collection() const override {
+        return false;
+    }
+
+    virtual void freeze() override {
+        _frozen = true;
+    }
+
+    virtual cql3_type prepare_internal(const sstring& keyspace, const data_dictionary::user_types_metadata& user_types) override {
+        if (!is_frozen()) {
+            freeze();
+        }
+
+        if (_dimension == 0) {
+            throw exceptions::invalid_request_exception("Vectors must have a dimension greater than 0");
+        }
+
+        if (_dimension > MAX_VECTOR_DIMENSION) {
+            throw exceptions::invalid_request_exception(
+                    format("Vectors must have a dimension less than or equal to {}", MAX_VECTOR_DIMENSION));
+        }
+
+        return vector_type_impl::get_instance(_type->prepare_internal(keyspace, user_types).get_type(), _dimension)->as_cql3_type();
+    }
+
+    bool references_user_type(const sstring& name) const override {
+        return _type->references_user_type(name);
     }
 };
 
@@ -365,6 +417,11 @@ cql3_type::raw::tuple(std::vector<shared_ptr<raw>> ts) {
 }
 
 shared_ptr<cql3_type::raw>
+cql3_type::raw::vector(shared_ptr<raw> t, size_t dimension) {
+    return ::make_shared<raw_vector>(std::move(t), dimension);
+}
+
+shared_ptr<cql3_type::raw>
 cql3_type::raw::frozen(shared_ptr<raw> t) {
     t->freeze();
     return t;
@@ -420,14 +477,9 @@ cql3_type::values() {
     return v;
 }
 
-std::ostream&
-operator<<(std::ostream& os, const cql3_type::raw& r) {
-    return os << r.to_string();
-}
-
 namespace util {
 
-sstring maybe_quote(const sstring& identifier) {
+sstring maybe_quote(const std::string_view identifier) {
     // quote empty string
     if (identifier.empty()) {
         return "\"\"";
@@ -454,8 +506,9 @@ sstring maybe_quote(const sstring& identifier) {
         // many keywords but allow keywords listed as "unreserved keywords".
         // So we can use any of them, for example cident.
         try {
-            cql3::util::do_with_parser(identifier, std::mem_fn(&cql3_parser::CqlParser::cident));
-            return identifier;
+            // In general it's not a good idea to use the default dialect, but for parsing an identifier, it's okay.
+            cql3::util::do_with_parser(identifier, dialect{}, std::mem_fn(&cql3_parser::CqlParser::cident));
+            return sstring{identifier};
         } catch(exceptions::syntax_exception&) {
             // This alphanumeric string is not a valid identifier, so fall
             // through to have it quoted:
@@ -474,7 +527,7 @@ sstring maybe_quote(const sstring& identifier) {
 }
 
 template <char C>
-static sstring quote_with(const sstring& str) {
+static sstring quote_with(const std::string_view str) {
     static const std::string quote_str{C};
 
     // quote empty string
@@ -499,11 +552,11 @@ static sstring quote_with(const sstring& str) {
     return result;
 }
 
-sstring quote(const sstring& identifier) {
+sstring quote(const std::string_view identifier) {
     return quote_with<'"'>(identifier);
 }
 
-sstring single_quote(const sstring& str) {
+sstring single_quote(const std::string_view str) {
     return quote_with<'\''>(str);
 }
 

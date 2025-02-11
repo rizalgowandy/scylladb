@@ -5,11 +5,11 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include <set>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include "index_prop_defs.hh"
 #include "index/secondary_index.hh"
 #include "exceptions/exceptions.hh"

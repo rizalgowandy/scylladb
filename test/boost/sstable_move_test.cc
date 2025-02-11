@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <filesystem>
@@ -20,14 +20,14 @@ namespace fs = std::filesystem;
 
 // Must be called from a seastar thread
 static auto copy_sst_to_tmpdir(fs::path tmp_path, test_env& env, sstables::schema_ptr schema_ptr, fs::path src_path, sstables::generation_type gen) {
-    auto sst = env.reusable_sst(schema_ptr, src_path.native(), gen).get0();
+    auto sst = env.reusable_sst(schema_ptr, src_path.native(), gen).get();
     auto dst_path = tmp_path / src_path.filename() / format("gen-{}", gen);
     recursive_touch_directory(dst_path.native()).get();
     for (auto p : sst->all_components()) {
         auto src_path = test(sst).filename(p.first);
         copy_file(src_path, dst_path / src_path.filename());
     }
-    return std::make_pair(env.reusable_sst(schema_ptr, dst_path.native(), gen).get0(), dst_path.native());
+    return std::make_pair(env.reusable_sst(schema_ptr, dst_path.native(), gen).get(), dst_path.native());
 }
 
 SEASTAR_THREAD_TEST_CASE(test_sstable_move) {
@@ -41,7 +41,7 @@ SEASTAR_THREAD_TEST_CASE(test_sstable_move) {
     generation_type gen{0};
     for (auto i = 0; i < 2; i++) {
         gen = gen_generator();
-        auto new_dir = format("{}/gen-{}", fs::path(cur_dir).parent_path().native(), gen);
+        auto new_dir = seastar::format("{}/gen-{}", fs::path(cur_dir).parent_path().native(), gen);
         touch_directory(new_dir).get();
         test(sst).move_to_new_dir(new_dir, gen).get();
         // the source directory must be empty now
@@ -51,7 +51,7 @@ SEASTAR_THREAD_TEST_CASE(test_sstable_move) {
 
     // close  the sst and make we can load it from the new directory.
     sst->close_files().get();
-    sst = env.reusable_sst(uncompressed_schema(), cur_dir, gen).get0();
+    sst = env.reusable_sst(uncompressed_schema(), cur_dir, gen).get();
 }
 
 SEASTAR_THREAD_TEST_CASE(test_sstable_move_idempotent) {
@@ -110,7 +110,7 @@ SEASTAR_THREAD_TEST_CASE(test_sstable_move_replay) {
     int count = 0;
     do {
         auto gen = gen_generator();
-        auto new_dir = format("{}/gen-{}", fs::path(cur_dir).parent_path().native(), gen);
+        auto new_dir = seastar::format("{}/gen-{}", fs::path(cur_dir).parent_path().native(), gen);
         touch_directory(new_dir).get();
         done = partial_create_links(sst, fs::path(new_dir), gen, count++);
         test(sst).move_to_new_dir(new_dir, gen).get();

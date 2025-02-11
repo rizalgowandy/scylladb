@@ -3,35 +3,35 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include "cql3/statements/property_definitions.hh"
 #include "compaction_backlog_manager.hh"
 #include "compaction_strategy.hh"
 #include "db_clock.hh"
 #include "compaction_descriptor.hh"
-#include "tombstone_gc.hh"
 
 namespace sstables {
 
 class sstable_set_impl;
-class resharding_descriptor;
 
 class compaction_strategy_impl {
 public:
     static constexpr float DEFAULT_TOMBSTONE_THRESHOLD = 0.2f;
     // minimum interval needed to perform tombstone removal compaction in seconds, default 86400 or 1 day.
     static constexpr std::chrono::seconds DEFAULT_TOMBSTONE_COMPACTION_INTERVAL() { return std::chrono::seconds(86400); }
+    static constexpr auto DEFAULT_UNCHECKED_TOMBSTONE_COMPACTION = false;
     static constexpr auto TOMBSTONE_THRESHOLD_OPTION = "tombstone_threshold";
     static constexpr auto TOMBSTONE_COMPACTION_INTERVAL_OPTION = "tombstone_compaction_interval";
+    static constexpr auto UNCHECKED_TOMBSTONE_COMPACTION_OPTION = "unchecked_tombstone_compaction";
 protected:
     bool _use_clustering_key_filter = false;
     bool _disable_tombstone_compaction = false;
     float _tombstone_threshold = DEFAULT_TOMBSTONE_THRESHOLD;
     db_clock::duration _tombstone_compaction_interval = DEFAULT_TOMBSTONE_COMPACTION_INTERVAL();
+    bool _unchecked_tombstone_compaction = DEFAULT_UNCHECKED_TOMBSTONE_COMPACTION;
 public:
     static std::optional<sstring> get_value(const std::map<sstring, sstring>& options, const sstring& name);
     static void validate_min_max_threshold(const std::map<sstring, sstring>& options, std::map<sstring, sstring>& unchecked_options);
@@ -70,12 +70,24 @@ public:
 
     virtual uint64_t adjust_partition_estimate(const mutation_source_metadata& ms_meta, uint64_t partition_estimate, schema_ptr schema) const;
 
+    /// Creates a decorated consumer that adds processing steps before the final consumer
+    ///
+    /// This factory function takes an end consumer functor and returns a new functor that
+    /// extends the processing pipeline. The returned functor "interposes" (inserts) additional
+    /// processing steps before delegating to the original end consumer. This enables building
+    /// layered processing pipelines where each layer can transform or filter the mutation
+    /// fragments before they reach their final destination.
+    ///
+    /// @param end_consumer The final consumer functor that processes mutation fragments
+    /// @return A new functor that wraps the end consumer with additional processing capabilities
+    /// @note The returned functor preserves the original consumer's semantics while allowing
+    ///       preprocessing of data
     virtual reader_consumer_v2 make_interposer_consumer(const mutation_source_metadata& ms_meta, reader_consumer_v2 end_consumer) const;
 
     virtual bool use_interposer_consumer() const {
         return false;
     }
 
-    virtual compaction_descriptor get_reshaping_job(std::vector<shared_sstable> input, schema_ptr schema, reshape_mode mode) const;
+    virtual compaction_descriptor get_reshaping_job(std::vector<shared_sstable> input, schema_ptr schema, reshape_config cfg) const;
 };
 }

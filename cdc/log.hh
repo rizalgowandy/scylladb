@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 /*
@@ -14,10 +14,6 @@
 
 #pragma once
 
-#include <functional>
-#include <optional>
-#include <map>
-#include <string>
 #include <vector>
 
 #include <seastar/core/future.hh>
@@ -25,7 +21,6 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
 
-#include "exceptions/exceptions.hh"
 #include "timestamp.hh"
 #include "tracing/trace_state.hh"
 #include "utils/UUID.hh"
@@ -109,7 +104,7 @@ enum class operation : int8_t {
 bool is_log_for_some_table(const replica::database& db, const sstring& ks_name, const std::string_view& table_name);
 
 schema_ptr get_base_table(const replica::database&, const schema&);
-schema_ptr get_base_table(const replica::database&, sstring_view, std::string_view);
+schema_ptr get_base_table(const replica::database&, std::string_view, std::string_view);
 
 seastar::sstring base_name(std::string_view log_name);
 seastar::sstring log_name(std::string_view table_name);

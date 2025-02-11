@@ -2,7 +2,7 @@
  * Copyright 2020-present ScyllaDB
  */
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -11,9 +11,7 @@
 
 #include <seastar/core/sstring.hh>
 
-#include "bytes.hh"
-#include "serializer.hh"
-#include "db/extensions.hh"
+#include "bytes_fwd.hh"
 #include "cdc/cdc_options.hh"
 #include "schema/schema.hh"
 #include "serializer_impl.hh"
@@ -36,7 +34,7 @@ public:
         return ser::serialize_to_buffer<bytes>(_cdc_options.to_map());
     }
     static std::map<sstring, sstring> deserialize(const bytes_view& buffer) {
-        return ser::deserialize_from_buffer(buffer, boost::type<std::map<sstring, sstring>>());
+        return ser::deserialize_from_buffer(buffer, std::type_identity<std::map<sstring, sstring>>());
     }
     const options& get_options() const {
         return _cdc_options;

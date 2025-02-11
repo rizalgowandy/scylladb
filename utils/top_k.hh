@@ -19,7 +19,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -45,13 +45,13 @@
 
 #include <cstdio>
 #include <list>
+#include <optional>
 #include <unordered_map>
-#include <memory>
 #include <tuple>
 #include <assert.h>
 
 #include <seastar/core/shared_ptr.hh>
-#include <seastar/core/sstring.hh>
+#include "utils/assert.hh"
 #include "utils/chunked_vector.hh"
 
 namespace utils {
@@ -146,9 +146,9 @@ public:
                     (*counter_it)->bucket_it = new_bucket_it;
                 } else {
                     buckets_iterator min_bucket = _buckets.begin();
-                    assert(min_bucket != _buckets.end());
+                    SCYLLA_ASSERT(min_bucket != _buckets.end());
                     counter_it = min_bucket->counters.begin();
-                    assert(counter_it != min_bucket->counters.end());
+                    SCYLLA_ASSERT(counter_it != min_bucket->counters.end());
                     counter_ptr ctr = *counter_it;
                     _counters_map.erase(ctr->item);
                     dropped_item = std::exchange(ctr->item, std::move(item));

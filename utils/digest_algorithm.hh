@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -14,8 +14,6 @@ namespace query {
 
 enum class digest_algorithm : uint8_t {
     none = 0,  // digest not required
-    MD5 = 1,
-    legacy_xxHash_without_null_digest = 2,
     xxHash = 3, // default algorithm
 };
 

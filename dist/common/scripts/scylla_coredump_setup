@@ -5,7 +5,7 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 import os
 import sys
@@ -17,16 +17,47 @@ import shutil
 from scylla_util import *
 from subprocess import run
 
+
+def has_zstd():
+    coredump_version = out('coredumpctl --version').split('\n')
+    features = coredump_version[1].split(' ')
+    return '+ZSTD' in features
+
 if __name__ == '__main__':
     if os.getuid() > 0:
         print('Requires root permission.')
         sys.exit(1)
+
+    if is_debian_variant() or is_suse_variant():
+        if not shutil.which('coredumpctl'):
+            pkg_install('systemd-coredump')
+
     parser = argparse.ArgumentParser(description='Optimize coredump settings for Scylla.')
     parser.add_argument('--dump-to-raiddir', action='store_true', default=False,
                         help='store coredump to /var/lib/scylla')
-    parser.add_argument('--compress', action='store_true', default=False,
+    # Enable compress by default when zstd support available
+    parser.add_argument('--compress', action='store_true', default=has_zstd(),
                         help='enable compress on systemd-coredump')
     args = parser.parse_args()
+
+    # Seems like a specific version of systemd package on RHEL9 has a bug on
+    # SELinux configuration, it introduced "systemd-container-coredump" module
+    # to provide rule for systemd-coredump but not enabled by default.
+    # We have to manually load it, otherwise it causes permission error.
+    # (#19325)
+    if is_redhat_variant() and distro.major_version() == '9':
+        if not shutil.which('getenforce'):
+            pkg_install('libselinux-utils')
+        if not shutil.which('semodule'):
+            pkg_install('policycoreutils')
+        enforce = out('getenforce')
+        if enforce != "Disabled":
+            if os.path.exists('/usr/share/selinux/packages/targeted/systemd-container-coredump.pp.bz2'):
+                modules = out('semodule -l')
+                match = re.match(r'^systemd-container-coredump$', modules, re.MULTILINE)
+                if not match:
+                    run('semodule -v -i /usr/share/selinux/packages/targeted/systemd-container-coredump.pp.bz2', shell=True, check=True)
+                    run('semodule -v -e systemd-container-coredump', shell=True, check=True)
 
     # abrt-ccpp.service needs to stop before enabling systemd-coredump,
     # since both will try to install kernel coredump handler
@@ -41,11 +72,8 @@ if __name__ == '__main__':
         run('sysctl -p /etc/sysctl.d/99-scylla-coredump.conf', shell=True, check=True)
 # Other distributions can use systemd-coredump, so setup it
     else:
-        if is_debian_variant() or is_suse_variant():
-            if not shutil.which('coredumpctl'):
-                pkg_install('systemd-coredump')
-                if is_suse_variant():
-                    systemd_unit('systemd-coredump.socket').restart()
+        if is_suse_variant():
+            systemd_unit('systemd-coredump.socket').restart()
         # Some older distribution does not have this unit
         if systemd_unit.available('systemd-coredump@.service'):
             dropin = '''
@@ -110,7 +138,7 @@ WantedBy=local-fs.target scylla-server.service
         try:
             coreinfo = run('coredumpctl --no-pager --no-legend info {}'.format(pid), shell=True, check=True, capture_output=True, encoding='utf-8').stdout.strip()
         except subprocess.CalledProcessError:
-            print('Does not able to detect coredump, failed to configure systemd-coredump.')
+            print('Unable to detect coredump, failed to configure systemd-coredump.')
             sys.exit(1)
 
         print(coreinfo)

@@ -25,20 +25,22 @@ Production grade configuration requires tuning a few kernel parameters
 such that limiting the number of available cores (with `--smp 1`) is
 the simplest way to go.
 
-Using multiple cores requires setting a proper value to the `/proc/sys/fs/aio-max-nr`.
-On many non-production systems, it will be equal to 65K. The formula
-to calculate the proper value is:
+Using multiple cores requires storing a proper value to `/proc/sys/fs/aio-max-nr`.
+While the default value for `aio-max-nr` on many non-production systems is 64K,
+this may not be optimal for high-performance workloads. The ideal value depends
+on the current value of `/proc/sys/fs/aio-nr` and also on the number of cores to
+be used by ScyllaDB:
 
-    Available AIO on the system - (request AIO per-cpu * ncpus) =
-    aio_max_nr - aio_nr < (reactor::max_aio + detect_aio_poll + reactor_backend_aio::max_polls) * cpu_cores =
-    aio_max_nr - aio_nr < (1024 + 2 + 10000) * cpu_cores =
-    aio_max_nr - aio_nr < 11026 * cpu_cores
+    Available AIO on the system >= (AIO requests per-cpu) * ncpus
 
-    where
+Expanding the definitions on both sides, we get:
 
-    reactor::max_aio = max_aio_per_queue * max_queues,
-    max_aio_per_queue = 128,
-    max_queues = 8.
+    aio_max_nr - aio_nr >= (storage_iocbs + preempt_iocbs + network_iocbs) * ncpus
+                                     1024               2           50000
+
+Which yields, for `/proc/sys/fs/aio-max-nr`:
+
+    aio_max_nr >= aio_nr + 51026 * ncpus
 
 ## How to use this image
 
@@ -46,6 +48,13 @@ to calculate the proper value is:
 
 ```console
 $ docker run --name some-scylla --hostname some-scylla -d scylladb/scylla
+```
+
+If you're on macOS and plan to start a multi-node cluster (3 nodes or more), start ScyllaDB with
+`–reactor-backend=epoll` to override the default `linux-aio` reactor backend:
+
+```console
+$ docker run --name some-scylla --hostname some-scylla -d scylladb/scylla --reactor-backend=epoll
 ```
 
 ### Run `nodetool` utility
@@ -74,6 +83,11 @@ cqlsh>
 
 ```console
 $ docker run --name some-scylla2  --hostname some-scylla2 -d scylladb/scylla --seeds="$(docker inspect --format='{{ .NetworkSettings.IPAddress }}' some-scylla)"
+```
+If you're on macOS, ensure to add the `–reactor-backend=epoll` option when adding new nodes:
+
+```console
+$ docker run --name some-scylla2  --hostname some-scylla2 -d scylladb/scylla --reactor-backend=epoll --seeds="$(docker inspect --format='{{ .NetworkSettings.IPAddress }}' some-scylla)"
 ```
 
 #### Make a cluster with Docker Compose
@@ -118,7 +132,6 @@ INFO  2016-08-04 06:57:40,836 [shard 7] database - Setting compaction strategy o
 INFO  2016-08-04 06:57:40,837 [shard 6] database - Setting compaction strategy of system_traces.events to SizeTieredCompactionStrategy
 INFO  2016-08-04 06:57:40,839 [shard 0] database - Schema version changed to fea14d93-9c5a-34f5-9d0e-2e49dcfa747e
 INFO  2016-08-04 06:57:40,839 [shard 0] storage_service - Starting listening for CQL clients on 172.17.0.2:9042...
-INFO  2016-08-04 06:57:40,840 [shard 0] storage_service - Thrift server listening on 172.17.0.2:9160 ...
 ```
 
 ### Configuring data volume for storage
@@ -140,7 +153,7 @@ $ docker run --name some-scylla --volume /var/lib/scylla:/var/lib/scylla -d scyl
 ### Configuring resource limits
 
 The ScyllaDB docker image defaults to running on overprovisioned mode and won't apply any CPU pinning optimizations, which it normally does in non-containerized environments.
-For better performance, it is recommended to configure resource limits for your Docker container using the `--smp`, `--memory`, and `--cpuset` command line options, as well as 
+For better performance, it is recommended to configure resource limits for your Docker container using the `--smp`, `--memory`, and `--cpuset` command line options, as well as
 disabling the overprovisioned flag as documented in the section "Command-line options".
 
 ### Restart ScyllaDB
@@ -313,16 +326,16 @@ For example, to disable developer mode:
 $ docker run --name some-scylla -d scylladb/scylla --developer-mode 0
 ```
 
-#### `--experimental ENABLE`
+#### `--experimental-features FEATURE`
 
-The `--experimental` command line option enables ScyllaDB's experimental mode
-If no `--experimental` command line option is defined, ScyllaDB defaults to running with experimental mode *disabled*.
-It is highly recommended to disable experimental mode for production deployments.
+The `--experimental-features` command line option enables ScyllaDB's experimental feature individually. If no feature flags are specified, ScyllaDB runs with only *stable* features enabled.
 
-For example, to enable experimental mode:
+Running experimental features in production environments is not recommended.
+
+For example, to enable the User Defined Functions (UDF) feature:
 
 ```console
-$ docker run --name some-scylla -d scylladb/scylla --experimental 1
+$ docker run --name some-scylla -d scylladb/scylla --experimental-feature=udf
 ```
 
 **Since: 2.0**
@@ -341,91 +354,7 @@ The `--authenticator` command lines option allows to provide the authenticator c
 
 #### `--authorizer AUTHORIZER`
 
-The `--authorizer` command lines option allows to provide the authorizer class ScyllaDB will use. By default ScyllaDB uses the `AllowAllAuthorizer` which allows any action to any user. The second option is using the `CassandraAuthorizer` parameter, which stores permissions in `system_auth.permissions` table.
-
-**Since: 2.3**
-
-### JMX parameters
-
-JMX ScyllaDB service is initialized from the `/scylla-jmx-service.sh` on
-container startup. By default the script uses `/etc/sysconfig/scylla-jmx`
-to read the default configuration. It then can be overridden by setting 
-environmental parameters.
-
-An example:
-
-    docker run -d -e "SCYLLA_JMX_ADDR=-ja 0.0.0.0" -e SCYLLA_JMX_REMOTE=-r --publish 7199:7199 scylladb/scylla
-
-#### SCYLLA_JMX_PORT
-
-Scylla JMX listening port.
-
-Default value:
-
-    SCYLLA_JMX_PORT="-jp 7199"
-
-#### SCYLLA_API_PORT
-
-Scylla API port for JMX to connect to.
-
-Default value:
-
-    SCYLLA_API_PORT="-p 10000"
-
-#### SCYLLA_API_ADDR
-
-Scylla API address for JMX to connect to.
-
-Default value:
-
-    SCYLLA_API_ADDR="-a localhost"
-
-#### SCYLLA_JMX_ADDR
-
-JMX address to bind on.
-
-Default value:
-
-    SCYLLA_JMX_ADDR="-ja localhost"
-
-For example, it is possible to make JMX available to the outer world
-by changing its bind address to `0.0.0.0`:
-
-    docker run -d -e "SCYLLA_JMX_ADDR=-ja 0.0.0.0" -e SCYLLA_JMX_REMOTE=-r --publish 7199:7199 scylladb/scylla
-
-`cassandra-stress` requires direct access to the JMX.
-
-#### SCYLLA_JMX_FILE
-
-A JMX service configuration file path.
-
-Example value:
-
-    SCYLLA_JMX_FILE="-cf /etc/scylla.d/scylla-user.cfg"
-
-#### SCYLLA_JMX_LOCAL
-
-The location of the JMX executable.
-
-Example value:
-
-    SCYLLA_JMX_LOCAL="-l /opt/scylladb/jmx
-
-#### SCYLLA_JMX_REMOTE
-
-Allow JMX to run remotely.
-
-Example value:
-
-    SCYLLA_JMX_REMOTE="-r"
-
-#### SCYLLA_JMX_DEBUG
-
-Enable debugger.
-
-Example value:
-
-    SCYLLA_JMX_DEBUG="-d"
+The `--authorizer` command lines option allows to provide the authorizer class ScyllaDB will use. By default ScyllaDB uses the `AllowAllAuthorizer` which allows any action to any user. The second option is using the `CassandraAuthorizer` parameter, which stores permissions in `system.permissions` table.
 
 ### Related Links
 

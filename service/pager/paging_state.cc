@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "bytes.hh"
@@ -14,6 +14,7 @@
 #include <seastar/core/simple-stream.hh>
 #include "idl/paging_state.dist.hh"
 #include "idl/paging_state.dist.impl.hh"
+#include "exceptions/exceptions.hh"
 #include "message/messaging_service.hh"
 #include "utils/bit_cast.hh"
 
@@ -70,7 +71,7 @@ lw_shared_ptr<service::pager::paging_state> service::pager::paging_state::deseri
     seastar::simple_input_stream in(reinterpret_cast<char*>(data.value().begin() + sizeof(uint32_t)), data.value().size() - sizeof(uint32_t));
 
     try {
-        return make_lw_shared<paging_state>(ser::deserialize(in, boost::type<paging_state>()));
+        return make_lw_shared<paging_state>(ser::deserialize(in, std::type_identity<paging_state>()));
     } catch (...) {
         std::throw_with_nested(
                 exceptions::protocol_exception(

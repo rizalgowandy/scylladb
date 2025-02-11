@@ -3,11 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "init.hh"
-#include "utils/to_string.hh"
 #include "gms/inet_address.hh"
 #include "seastarx.hh"
 #include "db/config.hh"
@@ -17,10 +16,12 @@
 
 logging::logger startlog("init");
 
-std::set<gms::inet_address> get_seeds_from_db_config(const db::config& cfg, gms::inet_address broadcast_address) {
+std::set<gms::inet_address> get_seeds_from_db_config(const db::config& cfg,
+                                                     const gms::inet_address broadcast_address,
+                                                     const bool fail_on_lookup_error) {
     auto preferred = cfg.listen_interface_prefer_ipv6() ? std::make_optional(net::inet_address::family::INET6) : std::nullopt;
     auto family = cfg.enable_ipv6_dns_lookup() || preferred ? std::nullopt : std::make_optional(net::inet_address::family::INET);
-    const auto listen = gms::inet_address::lookup(cfg.listen_address(), family).get0();
+    const auto listen = gms::inet_address::lookup(cfg.listen_address(), family).get();
     auto seed_provider = cfg.seed_provider();
 
     std::set<gms::inet_address> seeds;
@@ -31,10 +32,15 @@ std::set<gms::inet_address> get_seeds_from_db_config(const db::config& cfg, gms:
         while (begin < seeds_str.length() && begin != (next=seeds_str.find(",",begin))) {
             auto seed = boost::trim_copy(seeds_str.substr(begin,next-begin));
             try {
-                seeds.emplace(gms::inet_address::lookup(seed, family, preferred).get0());
+                seeds.emplace(gms::inet_address::lookup(seed, family, preferred).get());
             } catch (...) {
-                startlog.error("Bad configuration: invalid value in 'seeds': '{}': {}", seed, std::current_exception());
-                throw bad_configuration_error();
+                if (fail_on_lookup_error) {
+                    startlog.error("Bad configuration: invalid value in 'seeds': '{}': {}", seed, std::current_exception());
+                    throw bad_configuration_error();
+                }
+                startlog.warn("Bad configuration: invalid value in 'seeds': '{}': {}. Node will continue booting since already bootstrapped.",
+                               seed,
+                               std::current_exception());
             }
             begin = next+1;
         }

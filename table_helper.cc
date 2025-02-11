@@ -4,9 +4,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include "table_helper.hh"
@@ -15,16 +16,17 @@
 #include "cql3/statements/modification_statement.hh"
 #include "replica/database.hh"
 #include "service/migration_manager.hh"
+#include "service/storage_proxy.hh"
 
 static logging::logger tlogger("table_helper");
 
 static schema_ptr parse_new_cf_statement(cql3::query_processor& qp, const sstring& create_cql) {
     auto db = qp.db();
 
-    auto parsed = cql3::query_processor::parse_statement(create_cql);
+    auto parsed = cql3::query_processor::parse_statement(create_cql, cql3::dialect{});
 
     cql3::statements::raw::cf_statement* parsed_cf_stmt = static_cast<cql3::statements::raw::cf_statement*>(parsed.get());
-    (void)parsed_cf_stmt->keyspace(); // This will assert if cql statement did not contain keyspace
+    (void)parsed_cf_stmt->keyspace(); // This will SCYLLA_ASSERT if cql statement did not contain keyspace
     ::shared_ptr<cql3::statements::create_table_statement> statement =
                     static_pointer_cast<cql3::statements::create_table_statement>(
                                     parsed_cf_stmt->prepare(db, qp.get_cql_stats())->statement);
@@ -67,38 +69,52 @@ future<> table_helper::setup_table(cql3::query_processor& qp, service::migration
     } catch (...) {}
 }
 
+future<bool> table_helper::try_prepare(bool fallback, cql3::query_processor& qp, service::query_state& qs, cql3::dialect dialect) {
+    // Note: `_insert_cql_fallback` is known to be engaged if `fallback` is true, see cache_table_info below.
+    auto& stmt = fallback ? _insert_cql_fallback.value() : _insert_cql;
+    try {
+        shared_ptr<cql_transport::messages::result_message::prepared> msg_ptr = co_await qp.prepare(stmt, qs.get_client_state(), dialect);
+        _prepared_stmt = std::move(msg_ptr->get_prepared());
+        shared_ptr<cql3::cql_statement> cql_stmt = _prepared_stmt->statement;
+        _insert_stmt = dynamic_pointer_cast<cql3::statements::modification_statement>(cql_stmt);
+        _is_fallback_stmt = fallback;
+        co_return true;
+    } catch (exceptions::invalid_request_exception& eptr) {
+        // the non-fallback statement can't be prepared, and there is no possible fallback
+        if (!fallback && !_insert_cql_fallback) {
+            throw;
+        }
+        // We're trying to prepare the fallback statement, but it can't be prepared; signal an
+        // unrecoverable error
+        if (fallback) {
+            throw;
+        }
+
+        // There's still a chance to prepare the fallback statement
+        co_return false;
+    }
+}
+
 future<> table_helper::cache_table_info(cql3::query_processor& qp, service::migration_manager& mm, service::query_state& qs) {
     if (!_prepared_stmt) {
         // if prepared statement has been invalidated - drop cached pointers
         _insert_stmt = nullptr;
     } else if (!_is_fallback_stmt) {
         // we've already prepared the non-fallback statement
-        return now();
+        co_return;
     }
 
-    return qp.prepare(_insert_cql, qs.get_client_state(), false)
-            .then([this] (shared_ptr<cql_transport::messages::result_message::prepared> msg_ptr) noexcept {
-        _prepared_stmt = std::move(msg_ptr->get_prepared());
-        shared_ptr<cql3::cql_statement> cql_stmt = _prepared_stmt->statement;
-        _insert_stmt = dynamic_pointer_cast<cql3::statements::modification_statement>(cql_stmt);
-        _is_fallback_stmt = false;
-    }).handle_exception_type([this, &qs, &qp] (exceptions::invalid_request_exception& eptr) {
-        // the non-fallback statement can't be prepared
-        if (!_insert_cql_fallback) {
-            return make_exception_future(eptr);
-        }
+    try {
+        bool success = co_await try_prepare(false, qp, qs, cql3::internal_dialect());
         if (_is_fallback_stmt && _prepared_stmt) {
-            // we have already prepared the fallback statement
-            return now();
+            co_return;
         }
-        return qp.prepare(_insert_cql_fallback.value(), qs.get_client_state(), false)
-                .then([this] (shared_ptr<cql_transport::messages::result_message::prepared> msg_ptr) noexcept {
-            _prepared_stmt = std::move(msg_ptr->get_prepared());
-            shared_ptr<cql3::cql_statement> cql_stmt = _prepared_stmt->statement;
-            _insert_stmt = dynamic_pointer_cast<cql3::statements::modification_statement>(cql_stmt);
-            _is_fallback_stmt = true;
-        });
-    }).handle_exception([this, &qp, &mm] (auto eptr) {
+        if (!success) {
+            co_await try_prepare(true, qp, qs, cql3::internal_dialect()); // Can only return true or exception when preparing the fallback statement
+        }
+    } catch (...) {
+        auto eptr = std::current_exception();
+
         // One of the possible causes for an error here could be the table that doesn't exist.
         //FIXME: discarded future.
         (void)qp.container().invoke_on(0, [&mm = mm.container(), create_cql = _create_cql] (cql3::query_processor& qp) -> future<> {
@@ -114,19 +130,18 @@ future<> table_helper::cache_table_info(cql3::query_processor& qp, service::migr
         } catch (...) {
             throw bad_column_family(_keyspace, _name);
         }
-    });
+    }
 }
 
 future<> table_helper::insert(cql3::query_processor& qp, service::migration_manager& mm, service::query_state& qs, noncopyable_function<cql3::query_options ()> opt_maker) {
-    return cache_table_info(qp, mm, qs).then([this, &qp, &qs, opt_maker = std::move(opt_maker)] () mutable {
-        return do_with(opt_maker(), [this, &qp, &qs] (auto& opts) {
-            opts.prepare(_prepared_stmt->bound_names);
-            return _insert_stmt->execute(qp, qs, opts, std::nullopt);
-        });
-    }).discard_result();
+    co_await cache_table_info(qp, mm, qs);
+    auto opts = opt_maker();
+    opts.prepare(_prepared_stmt->bound_names);
+    co_await _insert_stmt->execute(qp, qs, opts, std::nullopt);
 }
 
-future<> table_helper::setup_keyspace(cql3::query_processor& qp, service::migration_manager& mm, std::string_view keyspace_name, sstring replication_factor, service::query_state& qs, std::vector<table_helper*> tables) {
+future<> table_helper::setup_keyspace(cql3::query_processor& qp, service::migration_manager& mm, std::string_view keyspace_name, sstring replication_strategy_name,
+                                      sstring replication_factor, service::query_state& qs, std::vector<table_helper*> tables) {
     if (this_shard_id() != 0) {
         co_return;
     }
@@ -145,16 +160,25 @@ future<> table_helper::setup_keyspace(cql3::query_processor& qp, service::migrat
 
     std::map<sstring, sstring> opts;
     opts["replication_factor"] = replication_factor;
-    auto ksm = keyspace_metadata::new_keyspace(keyspace_name, "org.apache.cassandra.locator.SimpleStrategy", std::move(opts), true);
+    auto ksm = keyspace_metadata::new_keyspace(keyspace_name, "org.apache.cassandra.locator.SimpleStrategy", std::move(opts), std::nullopt);
 
     while (!db.has_keyspace(keyspace_name)) {
         auto group0_guard = co_await mm.start_group0_operation();
         auto ts = group0_guard.write_timestamp();
 
         if (!db.has_keyspace(keyspace_name)) {
+            std::map<sstring, sstring> opts;
+            if (replication_strategy_name == "org.apache.cassandra.locator.NetworkTopologyStrategy") {
+                for (const auto &dc: qp.proxy().get_token_metadata_ptr()->get_topology().get_datacenters())
+                    opts[dc] = replication_factor;
+            }
+            else {
+                opts["replication_factor"] = replication_factor;
+            }
+            auto ksm = keyspace_metadata::new_keyspace(keyspace_name, replication_strategy_name, std::move(opts), std::nullopt, true);
             try {
                 co_await mm.announce(service::prepare_new_keyspace_announcement(db.real_database(), ksm, ts),
-                        std::move(group0_guard), format("table_helper: create {} keyspace", keyspace_name));
+                        std::move(group0_guard), seastar::format("table_helper: create {} keyspace", keyspace_name));
             } catch (service::group0_concurrent_modification&) {
                 tlogger.info("Concurrent operation is detected while creating {} keyspace, retrying.", keyspace_name);
             }
@@ -181,7 +205,7 @@ future<> table_helper::setup_keyspace(cql3::query_processor& qp, service::migrat
 
         try {
             co_return co_await mm.announce(std::move(table_mutations), std::move(group0_guard),
-                    format("table_helper: create tables for {} keyspace", keyspace_name));
+                    seastar::format("table_helper: create tables for {} keyspace", keyspace_name));
         } catch (service::group0_concurrent_modification&) {
             tlogger.info("Concurrent operation is detected while creating tables for {} keyspace, retrying.", keyspace_name);
         }

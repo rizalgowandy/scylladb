@@ -3,14 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "redis/query_processor.hh"
 #include "redis/request.hh"
 #include "redis/reply.hh"
 #include "redis/command_factory.hh"
-#include "timeout_config.hh"
 #include "redis/options.hh"
 #include "service_permit.hh"
 

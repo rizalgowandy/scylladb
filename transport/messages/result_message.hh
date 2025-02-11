@@ -4,11 +4,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include <concepts>
 
 #include "cql3/result_set.hh"
@@ -17,8 +18,8 @@
 
 #include "transport/messages/result_message_base.hh"
 #include "transport/event.hh"
-#include "exceptions/exceptions.hh"
 #include "exceptions/coordinator_result.hh"
+#include "types/types.hh"
 
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
@@ -48,7 +49,6 @@ public:
     }
 
     class cql;
-    class thrift;
 private:
     static ::shared_ptr<const cql3::metadata> extract_result_metadata(::shared_ptr<cql3::cql_statement> statement);
 };
@@ -58,7 +58,6 @@ public:
     virtual void visit(const result_message::void_message&) = 0;
     virtual void visit(const result_message::set_keyspace&) = 0;
     virtual void visit(const result_message::prepared::cql&) = 0;
-    virtual void visit(const result_message::prepared::thrift&) = 0;
     virtual void visit(const result_message::schema_change&) = 0;
     virtual void visit(const result_message::rows&) = 0;
     virtual void visit(const result_message::bounce_to_shard&) = 0;
@@ -70,10 +69,9 @@ public:
     void visit(const result_message::void_message&) override {};
     void visit(const result_message::set_keyspace&) override {};
     void visit(const result_message::prepared::cql&) override {};
-    void visit(const result_message::prepared::thrift&) override {};
     void visit(const result_message::schema_change&) override {};
     void visit(const result_message::rows&) override {};
-    void visit(const result_message::bounce_to_shard&) override { assert(false); };
+    void visit(const result_message::bounce_to_shard&) override { SCYLLA_ASSERT(false); };
     void visit(const result_message::exception&) override;
 };
 
@@ -188,24 +186,6 @@ public:
 
 std::ostream& operator<<(std::ostream& os, const result_message::prepared::cql& msg);
 
-class result_message::prepared::thrift : public result_message::prepared {
-    int32_t _id;
-public:
-    thrift(int32_t id, cql3::statements::prepared_statement::checked_weak_ptr prepared, bool support_lwt_opt)
-        : result_message::prepared(std::move(prepared), support_lwt_opt)
-        , _id{id}
-    { }
-
-    int32_t get_id() const {
-        return _id;
-    }
-
-    virtual void accept(result_message::visitor& v) const override {
-        v.visit(*this);
-    }
-};
-
-std::ostream& operator<<(std::ostream& os, const result_message::prepared::thrift& msg);
 
 class result_message::schema_change : public result_message {
 private:
@@ -217,10 +197,6 @@ public:
 
     shared_ptr<event::schema_change> get_change() const {
         return _change;
-    }
-
-    virtual bool is_schema_change() const override {
-        return true;
     }
 
     virtual void accept(result_message::visitor& v) const override {

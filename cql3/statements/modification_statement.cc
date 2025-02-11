@@ -5,11 +5,11 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
+#include "utils/assert.hh"
 #include "cql3/cql_statement.hh"
-#include "types/map.hh"
 #include "cql3/statements/modification_statement.hh"
 #include "cql3/statements/strongly_consistent_modification_statement.hh"
 #include "cql3/statements/raw/modification_statement.hh"
@@ -21,19 +21,16 @@
 #include "db/consistency_level_validations.hh"
 #include <optional>
 #include <seastar/core/shared_ptr.hh>
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/range/adaptor/map.hpp>
-#include <boost/range/adaptor/indirected.hpp>
-#include "db/config.hh"
 #include "transport/messages/result_message.hh"
 #include "data_dictionary/data_dictionary.hh"
+#include "replica/database.hh"
 #include <seastar/core/execution_stage.hh>
-#include "utils/UUID_gen.hh"
-#include "partition_slice_builder.hh"
 #include "cas_request.hh"
 #include "cql3/query_processor.hh"
 #include "service/storage_proxy.hh"
 #include "service/broadcast_tables/experimental/lang.hh"
+
+#include <boost/lexical_cast.hpp>
 
 template<typename T = void>
 using coordinator_result = exceptions::coordinator_result<T>;
@@ -69,6 +66,8 @@ modification_statement::modification_statement(statement_type type_, uint32_t bo
     , _stats(stats_)
     , _ks_sel(::is_internal_keyspace(schema_->ks_name()) ? ks_selector::SYSTEM : ks_selector::NONSYSTEM)
 { }
+
+modification_statement::~modification_statement() = default;
 
 uint32_t modification_statement::get_bound_terms() const {
     return _bound_terms;
@@ -291,7 +290,7 @@ modification_statement::do_execute(query_processor& qp, service::query_state& qs
     auto result = seastar::make_shared<cql_transport::messages::result_message::void_message>();
     if (keys_size_one) {
         auto&& table = s->table();
-        if (_may_use_token_aware_routing && table.uses_tablets()) {
+        if (_may_use_token_aware_routing && table.uses_tablets() && qs.get_client_state().is_protocol_extension_set(cql_transport::cql_protocol_extension::TABLETS_ROUTING_V1)) {
             auto erm = table.get_effective_replication_map();
             auto tablet_info = erm->check_locality(token);
             if (tablet_info.has_value()) {
@@ -315,6 +314,62 @@ modification_statement::execute_without_condition(query_processor& qp, service::
         return qp.proxy().mutate_with_triggers(std::move(mutations), cl, timeout, false, qs.get_trace_state(), qs.get_permit(), db::allow_per_partition_rate_limit::yes, this->is_raw_counter_shard_write());
     });
 }
+
+namespace {
+
+future<::shared_ptr<cql_transport::messages::result_message>>
+process_forced_rebounce(unsigned shard, query_processor& qp, const query_options& options) {
+    static int64_t counter = {0};
+    static logging::logger logger("modification_statement");
+    if (counter <= 0) {
+        const auto counter_opt = utils::get_local_injector().inject_parameter<decltype(counter)>("forced_bounce_to_shard_counter");
+        decltype(counter) counter_value = 0;
+        if (!counter_opt) {
+            logger.warn("forced_bounce_to_shard_counter is not set. Using default value 1.");
+        } else {
+            try {
+                counter_value = boost::lexical_cast<decltype(counter_value)>(*counter_opt);
+            } catch (const boost::bad_lexical_cast& e) {
+                logger.warn("Incorrect forced_bounce_to_shard_counter value: [{}]. Using default value 1.", *counter_opt);
+            }
+        }
+        if (counter_value <= 0) {
+            counter_value = 1;
+        }
+        counter = counter_value;
+    }
+
+    const auto prev_counter_value = counter;
+    if (prev_counter_value <= 1) {
+        logger.info("Disabling forced_bounce_to_shard_counter.");
+        co_await utils::error_injection_type::disable_on_all("forced_bounce_to_shard_counter");
+        counter = 0;
+    } else {
+        --counter;
+    }
+
+    // While counter > 1 select a different shard to re-bounce to.
+    // On the last iteration, re-bounce to the correct shard.
+    if (counter != 0) {
+        const auto shard_num = smp::count;
+        assert(shard_num > 0);
+        const auto local_shard = this_shard_id();
+        auto target_shard = local_shard + 1;
+        if (target_shard == shard) {
+            ++target_shard;
+        }
+        if (target_shard > shard_num - 1) {
+            target_shard = 0;
+        }
+        shard = target_shard;
+    }
+
+    logger.info("Applying forced_bounce_to_shard_counter, re-bouncing to shard {}.", shard);
+    co_return co_await make_ready_future<shared_ptr<cql_transport::messages::result_message>>(
+        qp.bounce_to_shard(shard, std::move(const_cast<cql3::query_options&>(options).take_cached_pk_function_calls())));
+}
+
+} // namespace
 
 future<::shared_ptr<cql_transport::messages::result_message>>
 modification_statement::execute_with_condition(query_processor& qp, service::query_state& qs, const query_options& options) const {
@@ -349,6 +404,11 @@ modification_statement::execute_with_condition(query_processor& qp, service::que
     auto token = request->key()[0].start()->value().as_decorated_key().token();
 
     auto shard = service::storage_proxy::cas_shard(*s, token);
+
+    if (utils::get_local_injector().is_enabled("forced_bounce_to_shard_counter")) {
+        return process_forced_rebounce(shard, qp, options);
+    }
+
     if (shard != this_shard_id()) {
         return make_ready_future<shared_ptr<cql_transport::messages::result_message>>(
                 qp.bounce_to_shard(shard, std::move(const_cast<cql3::query_options&>(options).take_cached_pk_function_calls()))
@@ -358,7 +418,7 @@ modification_statement::execute_with_condition(query_processor& qp, service::que
     std::optional<locator::tablet_routing_info> tablet_info = locator::tablet_routing_info{locator::tablet_replica_set(), std::pair<dht::token, dht::token>()};
 
     auto&& table = s->table();
-    if (_may_use_token_aware_routing && table.uses_tablets()) {
+    if (_may_use_token_aware_routing && table.uses_tablets() && qs.get_client_state().is_protocol_extension_set(cql_transport::cql_protocol_extension::TABLETS_ROUTING_V1)) {
         auto erm = table.get_effective_replication_map();
         tablet_info = erm->check_locality(token);
     }
@@ -415,15 +475,15 @@ void modification_statement::build_cas_result_set_metadata() {
 
 void
 modification_statement::process_where_clause(data_dictionary::database db, expr::expression where_clause, prepare_context& ctx) {
-    _restrictions = restrictions::statement_restrictions(db, s, type, where_clause, ctx,
-            applies_only_to_static_columns(), _selects_a_collection, false);
+    _restrictions = restrictions::analyze_statement_restrictions(db, s, type, where_clause, ctx,
+            applies_only_to_static_columns(), _selects_a_collection, false /* allow_filtering */, restrictions::check_indexes::no);
     /*
      * If there's no clustering columns restriction, we may assume that EXISTS
      * check only selects static columns and hence we can use any row from the
      * partition to check conditions.
      */
     if (_if_exists || _if_not_exists) {
-        assert(!_has_static_column_conditions && !_has_regular_column_conditions);
+        SCYLLA_ASSERT(!_has_static_column_conditions && !_has_regular_column_conditions);
         if (s->has_static_columns() && !_restrictions->has_clustering_columns_restriction()) {
             _has_static_column_conditions = true;
         } else {
@@ -435,11 +495,12 @@ modification_statement::process_where_clause(data_dictionary::database db, expr:
                 to_string(_restrictions->get_partition_key_restrictions())));
     }
     if (!_restrictions->get_non_pk_restriction().empty()) {
-        auto column_names = fmt::join(_restrictions->get_non_pk_restriction()
-                                         | boost::adaptors::map_keys
-                                         | boost::adaptors::indirected
-                                         | boost::adaptors::transformed(std::mem_fn(&column_definition::name_as_text)), ", ");
-        throw exceptions::invalid_request_exception(format("Invalid where clause contains non PRIMARY KEY columns: {}", column_names));
+        throw exceptions::invalid_request_exception(seastar::format("Invalid where clause contains non PRIMARY KEY columns: {}",
+                                                                    fmt::join(_restrictions->get_non_pk_restriction()
+                                         | std::views::keys
+                                         | std::views::transform([](const column_definition* c) {
+                                             return c->name_as_text();
+                                         }), ", ")));
     }
     const expr::expression& ck_restrictions = _restrictions->get_clustering_columns_restrictions();
     if (has_slice(ck_restrictions) && !allow_clustering_key_slices()) {
@@ -505,7 +566,7 @@ modification_statement::prepare(data_dictionary::database db, cql_stats& stats) 
     auto meta = get_prepare_context();
     auto statement = prepare_statement(db, meta, stats);
     auto partition_key_bind_indices = meta.get_partition_key_bind_indexes(*schema);
-    return std::make_unique<prepared_statement>(std::move(statement), meta, std::move(partition_key_bind_indices));
+    return std::make_unique<prepared_statement>(audit_info(), std::move(statement), meta, std::move(partition_key_bind_indices));
 }
 
 ::shared_ptr<cql3::statements::modification_statement>
@@ -605,13 +666,13 @@ modification_statement::prepare_conditions(data_dictionary::database db, const s
 
         if (_if_not_exists) {
             // To have both 'IF NOT EXISTS' and some other conditions doesn't make sense.
-            // So far this is enforced by the parser, but let's assert it for sanity if ever the parse changes.
-            assert(!_conditions);
-            assert(!_if_exists);
+            // So far this is enforced by the parser, but let's SCYLLA_ASSERT it for sanity if ever the parse changes.
+            SCYLLA_ASSERT(!_conditions);
+            SCYLLA_ASSERT(!_if_exists);
             stmt.set_if_not_exist_condition();
         } else if (_if_exists) {
-            assert(!_conditions);
-            assert(!_if_not_exists);
+            SCYLLA_ASSERT(!_conditions);
+            SCYLLA_ASSERT(!_if_not_exists);
             stmt.set_if_exist_condition();
         } else {
             stmt._condition = column_condition_prepare(*_conditions, db, keyspace(), schema);
@@ -620,6 +681,10 @@ modification_statement::prepare_conditions(data_dictionary::database db, const s
         }
         stmt.build_cas_result_set_metadata();
     }
+}
+
+audit::statement_category modification_statement::category() const {
+    return audit::statement_category::DML;
 }
 
 }  // namespace raw

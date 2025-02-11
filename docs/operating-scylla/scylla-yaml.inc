@@ -77,7 +77,7 @@ seeds           IP address of an existing node in the cluster. It allows a new n
 --------------  --------------------------------------------------  
 listen_address  IP address that the Scylla use to connect to other Scylla nodes in the cluster
 --------------  --------------------------------------------------  
-rpc_address     IP address of the interface for client connections (Thrift, CQL)  
+rpc_address     IP address of the interface for CQL client connections
 ==============  ==================================================  
 
 .. _yaml_enabling_experimental_features:
@@ -118,7 +118,7 @@ For example:
 IPv6 Addresses
 --------------
 
-Starting with Scylla Open Source 3.2, Scylla Enterprise 2019.1.4, Manager 2.0, and Monitoring 3.0, you can use IPv6 addresses wherever an IPv4 address is used, including client-to-node and node-to-node communication, Scylla Manager to Scylla nodes (Scylla Manager Agent), and Monitoring to nodes.
+You can use IPv6 addresses wherever an IPv4 address is used, including client-to-node and node-to-node communication, Scylla Manager to Scylla nodes (Scylla Manager Agent), and Monitoring to nodes.
 
 For example:
 

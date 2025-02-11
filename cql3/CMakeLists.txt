@@ -32,6 +32,7 @@ target_sources(cql3
     attributes.cc
     cf_name.cc
     cql3_type.cc
+    description.cc
     operation.cc
     index_name.cc
     keyspace_element_name.cc
@@ -131,6 +132,7 @@ target_link_libraries(cql3
     idl
     wasmtime_bindings
     Seastar::seastar
+    absl::headers
     xxHash::xxhash
     ANTLR3::antlr3
   PRIVATE

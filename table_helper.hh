@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -18,6 +18,7 @@ class migration_manager;
 
 namespace cql3 {
 class query_processor;
+class dialect;
 namespace statements {
 class modification_statement;
 }}
@@ -41,7 +42,9 @@ private:
      * Should be changed alongside every _insert_stmt reassignment
      * */
     bool _is_fallback_stmt = false;
-
+private:
+    // Returns true is prepare succeeded, false if failed and there's still a chance to recover, exception if prepare failed and it's not possible to recover
+    future<bool> try_prepare(bool fallback, cql3::query_processor& qp, service::query_state& qs, cql3::dialect dialect);
 public:
     table_helper(std::string_view keyspace, std::string_view name, sstring create_cql, sstring insert_cql, std::optional<sstring> insert_cql_fallback = std::nullopt)
         : _keyspace(keyspace)
@@ -96,7 +99,8 @@ public:
 
     future<> insert(cql3::query_processor& qp, service::migration_manager& mm, service::query_state& qs, noncopyable_function<cql3::query_options ()> opt_maker);
 
-    static future<> setup_keyspace(cql3::query_processor& qp, service::migration_manager& mm, std::string_view keyspace_name, sstring replication_factor, service::query_state& qs, std::vector<table_helper*> tables);
+    static future<> setup_keyspace(cql3::query_processor& qp, service::migration_manager& mm, std::string_view keyspace_name, sstring replication_strategy_name,
+                                   sstring replication_factor, service::query_state& qs, std::vector<table_helper*> tables);
 
     /**
      * Makes a monotonically increasing value in 100ns ("nanos") based on the given time

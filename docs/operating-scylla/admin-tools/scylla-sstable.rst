@@ -1,5 +1,5 @@
-Scylla SStable
-==============
+ScyllaDB SStable
+================
 
 Introduction
 -------------
@@ -34,19 +34,14 @@ You can specify more than one SStable.
 Schema
 ------
 
-All operations need a schema to interpret the SStables with.
-This tool tries to auto-detect the location of the ScyllaDB data directories and the name of the table the SStable belongs to.
-If the SStable is located in a ScyllaDB data directory, it works out-of-the-box, without any additional input from the user.
-If the SStable is located at an external path, you need to specify the names of the keyspace and table to which the SStable belongs. In addition, some hints as to where the ScyllaDB data directory is located may also be required.
+All operations need a schema to interpret the SStables with. By default the tool tries to auto-detect the schema of the SSTable. This should work out-of-the-box in most cases.
 
-The schema can be obtained in the following ways:
+Although the tool tries to auto-detect the schema of the SStable by default, it provides options for the user to control where it obtains the schema from. The following schema-sources can be provided (more details on each one below):
 
-* Auto-detected - If the SStable is located in the table's directory within the ScyllaDB data directory.
-* ``--keyspace=KEYSPACE --table=TABLE`` - If the SStable is located at an external location, but the ScyllaDB data directory or the config file are located at the standard location. The tool also reads the ``SCYLLA_CONF`` and ``SCYLLA_HOME`` environment variables to try to locate the configuration file.
-* ``--schema-file FILENAME`` - Read the schema definition from a file.
+* ``--schema-file FILENAME`` - Read the schema definition from a file containing DDL for the table and optionally the keyspace.
 * ``--system-schema --keyspace=KEYSPACE --table=TABLE`` - Use the known definition of built-in tables (only works for system tables).
-* ``--scylla-data-dir SCYLLA_DATA_DIR_PATH --keyspace=KEYSPACE --table=TABLE`` - Read the schema tables from the data directory at the provided location, needs the keyspace and table name to be provided with ``--keyspace`` and ``--table``.
-* ``--scylla-yaml-file SCYLLA_YAML_FILE_PATH --keyspace=KEYSPACE --table=TABLE`` - Read the schema tables from the data directory path obtained from the configuration, needs the keyspace and table name to be provided with ``--keyspace`` and ``--table``.
+* ``--schema-tables [--keyspace KEYSPACE_NAME --table TABLE_NAME] [--scylla-yaml-file SCYLLA_YAML_FILE_PATH] [--scylla-data-dir SCYLLA_DATA_DIR_PATH]`` - Read the schema tables from the data directory.
+* ``--sstable-schema --keyspace=KEYSPACE --table=TABLE`` - Read the schema from the SSTable's own serialization headers (statistics component).
 
 By default (no schema-related options are provided), the tool will try the following sequence:
 
@@ -56,12 +51,13 @@ By default (no schema-related options are provided), the tool will try the follo
   ``SCYLLA_CONF`` and ``SCYLLA_HOME`` environment variables are also checked.
   If the configuration file cannot be located, the default ScyllaDB data directory path (``/var/lib/scylla``) is used.
   For this to succeed, the table name has to be provided via ``--keyspace`` and ``--table``.
+* Try to load the schema from the SSTable serialization headers.
 
 The tool stops after the first successful attempt. If none of the above succeed, an error message will be printed.
 A user provided schema in ``schema.cql`` (if present) always takes precedence over other methods. This is deliberate, to allow to manually override the schema to be used.
 
-schema.cql
-^^^^^^^^^^
+Schema file
+^^^^^^^^^^^
 
 The schema file should contain all definitions needed to interpret data belonging to the table.
 
@@ -89,6 +85,7 @@ Note:
 * In addition to the table itself, the definition also has to includes any user defined types the table uses.
 * The keyspace definition is optional, if missing one will be auto-generated.
 * The schema file doesn't have to be called ``schema.cql``, this is just the default name. Any file name is supported (with any extension).
+* The schema file is allowed to contain a single ``CREATE TABLE`` statement. If the table is a view, the schema file can contain a ``CREATE TABLE`` and a ``CREATE INDEX`` or ``CREATE MATERIALIZED VIEW`` statements.
 
 Dropped columns
 ~~~~~~~~~~~~~~~
@@ -114,14 +111,37 @@ Dropped columns can be provided to the tool in the form of insert statements int
 
     CREATE TABLE ks.cf (pk int PRIMARY KEY, v2 int);
 
-System tables
+System schema
 ^^^^^^^^^^^^^
 
-If the examined table is a system table -- it belongs to one of the system keyspaces (``system``, ``system_schema``, ``system_distributed`` or ``system_distributed_everywhere``) -- you can just tell the tool to use the known built-in definition of said table. This is possible with the ``--system-schema`` flag. Example:
+If the examined table is a system table -- it belongs to one of the system keyspaces (``system``, ``system_schema``, ``system_distributed`` or ``system_distributed_everywhere``) -- the tool can be instructed to use the known built-in definition of said table. This is possible with the ``--system-schema`` flag. Example:
 
 .. code-block:: console
 
-    scylla sstable dump-data --system-schema system.local ./path/to/md-123456-big-Data.db
+    scylla sstable dump-data --system-schema --keyspace system --table local ./path/to/md-123456-big-Data.db
+
+Schema tables
+^^^^^^^^^^^^^
+
+Load the schema from ScyllaDB's schema tables, located on the disk. The tool has to be able to locate ScyllaDB data directory for this to work. The path to the data directory can be provided the following ways:
+
+* Deduced from the SSTable's path. This only works if the SSTable itself is located in the ScyllaDB's data directory.
+* Provided directly via ``--scylla-data-dir`` parameter.
+* Provided indirectly via ``--scylla-yaml-file`` parameter. The path to the data directory is obtained from the configuration.
+* Provided indirectly via the ``SCYLLA_HOME`` environment variable. The ``scylla.yaml`` file is expected to be found at the ``SCYLLA_HOME/conf/scylla.yaml`` path.
+* Provided indirectly via the ``SCYLLA_CONF`` environment variable. The ``scylla.yaml`` file is expected to be found at the ``SCYLLA_CONF/scylla.yaml`` path.
+
+In all except the first case, the keyspace and table names have to be provided via the ``--keyspace`` and ``--table`` parameters respectively.
+
+Common problems:
+
+* If the schema tables are read while the ScyllaDB node is running, ScyllaDB might compact an SStable that the tool is trying to read, resulting in failure to load the schema. The simplest solution is to retry the operation. To avoid the problem, disable autocompation on the ``system_schema`` keyspace, or stop the node. This is intrusive and might not be possible, in this case use another schema source.
+* The schema of the SSTable could be still in memtables, not yet flushed to disk. In this case, simply flush the ``system_schema`` keyspace memtables and retry the operation.
+
+SStable schema
+^^^^^^^^^^^^^^
+
+Each SStable contains a schema in its Statistics component. This schema is incomplete: it doesn't contain names for primary key columns and contains no schema options. That said, this schema is good enough for most operations and is always available.
 
 .. _scylla-sstable-sstable-content:
 
@@ -131,7 +151,7 @@ SStable Content
 .. _SStable: /architecture/sstable
 
 All operations target either one specific sstable component or all of them as a whole.
-For more information about the sstable components and the format itself, visit SStable_.
+For more information about the sstable components and the format itself, visit :doc:`SSTable Format </architecture/sstable/index>`.
 
 On a conceptual level, the data in SStables is represented by objects called mutation fragments. There are the following kinds of fragments:
 
@@ -169,7 +189,7 @@ It is possible to filter the data to print via the ``--partitions`` or
 ``--partitions-file`` options. Both expect partition key values in the hexdump
 format.
 
-Supports both a text and JSON output. The text output uses the built-in Scylla
+Supports both a text and JSON output. The text output uses the built-in ScyllaDB
 printers, which are also used when logging mutation-related data structures.
 
 The schema of the JSON output is the following:
@@ -430,8 +450,8 @@ The content is dumped in JSON, using the following schema:
         "estimated_tombstone_drop_time": $STREAMING_HISTOGRAM,
         "sstable_level": Uint,
         "repaired_at": Uint64,
-        "min_column_names": [Uint, ...],
-        "max_column_names": [Uint, ...],
+        "min_column_names": [String, ...],
+        "max_column_names": [String, ...],
         "has_legacy_counter_shards": Bool,
         "columns_count": Int64, // >= MC only
         "rows_count": Int64, // >= MC only
@@ -479,7 +499,7 @@ The content is dumped in JSON, using the following schema:
 dump-scylla-metadata
 ^^^^^^^^^^^^^^^^^^^^
 
-Dumps the content of the scylla-metadata component. Contains Scylla-specific
+Dumps the content of the scylla-metadata component. Contains ScyllaDB-specific
 metadata about the data component. This component won't be present in SStables
 produced by Apache Cassandra.
 
@@ -497,6 +517,10 @@ The content is dumped in JSON, using the following schema:
         "run_identifier": String, // UUID
         "large_data_stats": {"$key": $LARGE_DATA_STATS_METADATA, ...}
         "sstable_origin": String
+        "scylla_build_id": String
+        "scylla_version": String
+        "ext_timestamp_stats": {"$key": int64, ...}
+        "sstable_identifier": String, // UUID
     }
 
     $SHARDING_METADATA := {
@@ -573,6 +597,7 @@ validate-checksums
 ^^^^^^^^^^^^^^^^^^
 
 There are two kinds of checksums for SStable data files:
+
 * The digest (full checksum), stored in the ``Digest.crc32`` file. It is calculated over the entire content of ``Data.db``.
 * The per-chunk checksum. For uncompressed SStables, it is stored in ``CRC.db``; for compressed SStables, it is stored inline after each compressed chunk in ``Data.db``.
 
@@ -580,14 +605,22 @@ During normal reads, ScyllaDB validates the per-chunk checksum for compressed SS
 The digest and the per-chunk checksum of uncompressed SStables are currently not checked on any code paths.
 
 This operation reads the entire ``Data.db`` and validates both kinds of checksums against the data.
-Errors found are logged to stderr. The output contains a bool for each SStable that is true if the SStable matches all checksums.
+Errors found are logged to stderr. The output contains an object for each SStable that indicates if the SStable has checksums (false only for uncompressed SStables
+for which ``CRC.db`` is not present in ``TOC.txt``), if the SStable has a digest, and if the SStable matches all checksums and the digest. If no digest is available,
+validation will proceed using only the per-chunk checksums.
 
 The content is dumped in JSON, using the following schema:
 
 .. code-block:: none
     :class: hide-copy-button
 
-    $ROOT := { "$sstable_path": Bool, ... }
+    $ROOT := { "$sstable_path": $RESULT, ... }
+
+    $RESULT := {
+        "has_checksums": Bool,
+        "has_digest": Bool,
+        "valid": Bool, // optional
+    }
 
 decompress
 ^^^^^^^^^^
@@ -648,6 +681,22 @@ Note that levels are cumulative - each contains all the checks of the previous l
 By default, the strictest level is used.
 This can be relaxed, for example, if you want to produce intentionally corrupt SStables for tests.
 
+shard-of
+^^^^^^^^
+
+Print out the shards which own the specified SSTables.
+
+The content is dumped in JSON, using the following schema when ``--vnodes`` command option is specified:
+
+.. code-block:: none
+    :class: hide-copy-button
+
+    $ROOT := { "$sstable_path": $SHARD_IDS, ... }
+
+    $SHARD_IDS := [$SHARD_ID, ...]
+
+    $SHARD_ID := Uint
+
 script
 ^^^^^^
 
@@ -698,7 +747,7 @@ consume_sstable_start(sst)
 
 * Part of the Consume API.
 * Called on the start of each stable. 
-* The parameter is of type `Scylla.sstable <scylla-sstable-type_>`_. 
+* The parameter is of type `ScyllaDB.sstable <scylla-sstable-type_>`_. 
 * When SStables are merged (``--merge``), the parameter is ``nil``.
 
 Returns whether to stop. If ``true``, `consume_sstable_end() <scylla-consume-sstable-end-method_>`_ is called, skipping the content of the sstable (or that of the entire stream if ``--merge`` is used). If ``false``, consumption follows with the content of the sstable.
@@ -709,7 +758,7 @@ consume_partition_start(ps)
 """""""""""""""""""""""""""
 
 * Part of the Consume API. Called on the start of each partition. 
-* The parameter is of type `Scylla.partition_start <scylla-partition-start-type_>`_.
+* The parameter is of type `ScyllaDB.partition_start <scylla-partition-start-type_>`_.
 * Returns whether to stop. If ``true``, `consume_partition_end() <scylla-consume-partition-end-method_>`_ is called, skipping the content of the partition. If ``false``, consumption follows with the content of the partition.
 
 consume_static_row(sr)
@@ -717,7 +766,7 @@ consume_static_row(sr)
 
 * Part of the Consume API. 
 * Called if the partition has a static row. 
-* The parameter is of type `Scylla.static_row <scylla-static-row-type_>`_.
+* The parameter is of type `ScyllaDB.static_row <scylla-static-row-type_>`_.
 * Returns whether to stop. If ``true``, `consume_partition_end() <scylla-consume-partition-end-method_>`_ is called, and the remaining content of the partition is skipped. If ``false``, consumption follows with the remaining content of the partition.
 
 consume_clustering_row(cr)
@@ -725,7 +774,7 @@ consume_clustering_row(cr)
 
 * Part of the Consume API. 
 * Called for each clustering row. 
-* The parameter is of type `Scylla.clustering_row <scylla-clustering-row-type_>`_.
+* The parameter is of type `ScyllaDB.clustering_row <scylla-clustering-row-type_>`_.
 * Returns whether to stop. If ``true``, `consume_partition_end() <scylla-consume-partition-end-method_>`_ is called, the remaining content of the partition is skipped. If ``false``, consumption follows with the remaining content of the partition.
 
 consume_range_tombstone_change(crt)
@@ -733,7 +782,7 @@ consume_range_tombstone_change(crt)
 
 * Part of the Consume API.
 * Called for each range tombstone change. 
-* The parameter is of type `Scylla.range_tombstone_change <scylla-range-tombstone-change-type_>`_.
+* The parameter is of type `ScyllaDB.range_tombstone_change <scylla-range-tombstone-change-type_>`_.
 * Returns whether to stop. If ``true``, `consume_partition_end() <scylla-consume-partition-end-method_>`_ is called, the remaining content of the partition is skipped. If ``false``, consumption follows with the remaining content of the partition.
 
 .. _scylla-consume-partition-end-method:
@@ -762,8 +811,8 @@ consume_stream_end()
 * Part of the Consume API. 
 * Called at the very end of the stream.
 
-Scylla LUA API
-~~~~~~~~~~~~~~
+ScyllaDB LUA API
+~~~~~~~~~~~~~~~~
 
 In addition to the `ScyllaDB Consume API <scylla-consume-api_>`_, the Lua bindings expose various types and methods that allow you to work with ScyllaDB types and values.
 The listing uses the following terminology:
@@ -790,8 +839,8 @@ Magic methods have their signature defined by Lua and so that is not described h
 
 .. _scylla-atomic-cell-type:
 
-Scylla.atomic_cell
-""""""""""""""""""
+ScyllaDB.atomic_cell
+""""""""""""""""""""
 
 Attributes:
 
@@ -800,14 +849,14 @@ Attributes:
 * type (string) - one of: ``regular``, ``counter-update``, ``counter-shards``, ``frozen-collection`` or ``collection``.
 * has_ttl (boolean) - is the cell expiring?
 * ttl (integer) - time to live in seconds, ``nil`` if cell is not expiring.
-* expiry (`Scylla.gc_clock_time_point <scylla-gc-clock-time-point-type_>`_) - time at which cell expires, ``nil`` if cell is not expiring.
-* deletion_time (`Scylla.gc_clock_time_point <scylla-gc-clock-time-point-type_>`_) - time at which cell was deleted, ``nil`` unless cell is dead or expiring.
+* expiry (`ScyllaDB.gc_clock_time_point <scylla-gc-clock-time-point-type_>`_) - time at which cell expires, ``nil`` if cell is not expiring.
+* deletion_time (`ScyllaDB.gc_clock_time_point <scylla-gc-clock-time-point-type_>`_) - time at which cell was deleted, ``nil`` unless cell is dead or expiring.
 * value:
 
     - ``nil`` if cell is dead.
     - appropriate Lua native type if type == ``regular``.
     - integer if type == ``counter-update``.
-    - `Scylla.counter_shards_value <scylla-counter-shards-value-type_>`_ if type == ``counter-shards``.
+    - `ScyllaDB.counter_shards_value <scylla-counter-shards-value-type_>`_ if type == ``counter-shards``.
 
 A counter-shard table has the following keys:
 
@@ -817,12 +866,12 @@ A counter-shard table has the following keys:
 
 .. _scylla-clustering-key-type:
 
-Scylla.clustering_key
-"""""""""""""""""""""
+ScyllaDB.clustering_key
+"""""""""""""""""""""""
 
 Attributes:
 
-* components (table) - the column values (`Scylla.data_value <scylla-data-value-type_>`_) making up the composite clustering key.
+* components (table) - the column values (`ScyllaDB.data_value <scylla-data-value-type_>`_) making up the composite clustering key.
 
 Methods:
 
@@ -830,50 +879,50 @@ Methods:
 
 Magic methods:
 
-* __tostring - can be converted to string with tostring(), uses the built-in operator<< in Scylla.
+* __tostring - can be converted to string with tostring(), uses the built-in operator<< in ScyllaDB.
 
 .. _scylla-clustering-row-type:
 
-Scylla.clustering_row
-"""""""""""""""""""""
+ScyllaDB.clustering_row
+"""""""""""""""""""""""
 
 Attributes:
 
 * key ($TYPE) - the clustering key's value as the appropriate Lua native type.
-* tombstone (`Scylla.tombstone <scylla-tombstone-type_>`_) - row tombstone, ``nil`` if no tombstone.
-* shadowable_tombstone (`Scylla.tombstone <scylla-tombstone-type_>`_) - shadowable tombstone of the row tombstone, ``nil`` if no tombstone.
-* marker (`Scylla.row_marker <scylla-row-marker-type_>`_) - the row marker, ``nil`` if row doesn't have one.
-* cells (table) - table of cells, where keys are the column names and the values are either of type `Scylla.atomic_cell <scylla-atomic-cell-type_>`_ or `Scylla.collection <scylla-collection-type_>`_.
+* tombstone (`ScyllaDB.tombstone <scylla-tombstone-type_>`_) - row tombstone, ``nil`` if no tombstone.
+* shadowable_tombstone (`ScyllaDB.tombstone <scylla-tombstone-type_>`_) - shadowable tombstone of the row tombstone, ``nil`` if no tombstone.
+* marker (`ScyllaDB.row_marker <scylla-row-marker-type_>`_) - the row marker, ``nil`` if row doesn't have one.
+* cells (table) - table of cells, where keys are the column names and the values are either of type `ScyllaDB.atomic_cell <scylla-atomic-cell-type_>`_ or `ScyllaDB.collection <scylla-collection-type_>`_.
 
 See also:
 
-* `Scylla.unserialize_clustering_key() <scylla-unserialize-clustering-key-method_>`_.
+* `ScyllaDB.unserialize_clustering_key() <scylla-unserialize-clustering-key-method_>`_.
 
 .. _scylla-collection-type:
 
-Scylla.collection
-"""""""""""""""""
+ScyllaDB.collection
+"""""""""""""""""""
 
 Attributes:
 
 * type (string) - always ``collection`` for collection.
-* tombstone (`Scylla.tombstone <scylla-tombstone-type_>`_) - ``nil`` if no tombstone.
-* cells (table) - the collection cells, each collection cell is a table, with a ``key`` and ``value`` attribute. The key entry is the key of the collection cell for actual collections (list, set and map) and is of type `Scylla.data-value <scylla-data-value-type_>`_. For tuples and UDT this is just an empty string. The value entry is the value of the collection cell and is of type `Scylla.atomic-cell <scylla-atomic-cell-type_>`_. 
+* tombstone (`ScyllaDB.tombstone <scylla-tombstone-type_>`_) - ``nil`` if no tombstone.
+* cells (table) - the collection cells, each collection cell is a table, with a ``key`` and ``value`` attribute. The key entry is the key of the collection cell for actual collections (list, set and map) and is of type `ScyllaDB.data-value <scylla-data-value-type_>`_. For tuples and UDT this is just an empty string. The value entry is the value of the collection cell and is of type `ScyllaDB.atomic-cell <scylla-atomic-cell-type_>`_. 
 
 .. _scylla-collection-cell-value-type:
 
-Scylla.collection_cell_value
-""""""""""""""""""""""""""""
+ScyllaDB.collection_cell_value
+""""""""""""""""""""""""""""""
 
 Attributes:
 
 * key (sstring) - collection cell key in human readable form.
-* value (`Scylla.atomic_cell <scylla-atomic-cell-type_>`_) - collection cell value.
+* value (`ScyllaDB.atomic_cell <scylla-atomic-cell-type_>`_) - collection cell value.
 
 .. _scylla-column-definition-type:
 
-Scylla.column_definition
-""""""""""""""""""""""""
+ScyllaDB.column_definition
+""""""""""""""""""""""""""
 
 Attributes:
 
@@ -883,8 +932,8 @@ Attributes:
 
 .. _scylla-counter-shards-value-type:
 
-Scylla.counter_shards_value
-"""""""""""""""""""""""""""
+ScyllaDB.counter_shards_value
+"""""""""""""""""""""""""""""
 
 Attributes:
 
@@ -901,8 +950,8 @@ Magic methods:
 
 .. _scylla-data-value-type:
 
-Scylla.data_value
-"""""""""""""""""
+ScyllaDB.data_value
+"""""""""""""""""""
 
 Attributes:
 
@@ -914,8 +963,8 @@ Magic methods:
 
 .. _scylla-gc-clock-time-point-type:
 
-Scylla.gc_clock_time_point
-""""""""""""""""""""""""""
+ScyllaDB.gc_clock_time_point
+""""""""""""""""""""""""""""
 
 A time point belonging to the gc_clock, in UTC.
 
@@ -937,13 +986,13 @@ Magic methods:
 
 See also:
 
-* `Scylla.now() <scylla-now-method_>`_.
-* `Scylla.time_point_from_string() <scylla-time-point-from-string-method_>`_.
+* `ScyllaDB.now() <scylla-now-method_>`_.
+* `ScyllaDB.time_point_from_string() <scylla-time-point-from-string-method_>`_.
 
 .. _scylla-json-writer-type:
 
-Scylla.json_writer
-""""""""""""""""""
+ScyllaDB.json_writer
+""""""""""""""""""""
 
 A JSON writer object, with both low-level and high-level APIs.
 The low-level API allows you to write custom JSON and it loosely follows the API of `rapidjson::Writer <https://rapidjson.org/classrapidjson_1_1_writer.html>`_ (upon which it is implemented).
@@ -976,57 +1025,57 @@ High level API Methods:
 
 .. _scylla-new-json-writer-method:
 
-Scylla.new_json_writer()
-""""""""""""""""""""""""
+ScyllaDB.new_json_writer()
+""""""""""""""""""""""""""
 
-Create a `Scylla.json_writer <scylla-json-writer-type_>`_ instance.
+Create a `ScyllaDB.json_writer <scylla-json-writer-type_>`_ instance.
 
 .. _scylla-new-position-in-partition-method:
 
-Scylla.new_position_in_partition()
-""""""""""""""""""""""""""""""""""
+ScyllaDB.new_position_in_partition()
+""""""""""""""""""""""""""""""""""""
 
-Creates a `Scylla.position_in_partition <scylla-position-in-partition-type_>`_ instance.
+Creates a `ScyllaDB.position_in_partition <scylla-position-in-partition-type_>`_ instance.
 
 Arguments:
 
 * weight (integer) - the weight of the key.
-* key (`Scylla.clustering_key <scylla-clustering-key-type_>`_) - the clustering key, optional.
+* key (`ScyllaDB.clustering_key <scylla-clustering-key-type_>`_) - the clustering key, optional.
 
 .. _scylla-new-ring-position-method:
 
-Scylla.new_ring_position()
-""""""""""""""""""""""""""
+ScyllaDB.new_ring_position()
+""""""""""""""""""""""""""""
 
-Creates a `Scylla.ring_position <scylla-ring-position-type_>`_ instance.
+Creates a `ScyllaDB.ring_position <scylla-ring-position-type_>`_ instance.
 
 Has several overloads:
 
-* ``Scylla.new_ring_position(weight, key)``.
-* ``Scylla.new_ring_position(weight, token)``.
-* ``Scylla.new_ring_position(weight, key, token)``.
+* ``ScyllaDB.new_ring_position(weight, key)``.
+* ``ScyllaDB.new_ring_position(weight, token)``.
+* ``ScyllaDB.new_ring_position(weight, key, token)``.
 
 Where:
 
 * weight (integer) - the weight of the key.
-* key (`Scylla.partition_key <scylla-partition-key-type_>`_) - the partition key.
+* key (`ScyllaDB.partition_key <scylla-partition-key-type_>`_) - the partition key.
 * token (integer) - the token (of the key if a key is provided).
 
 .. _scylla-now-method:
 
-Scylla.now()
-""""""""""""
+ScyllaDB.now()
+""""""""""""""
 
-Create a `Scylla.gc_clock_time_point <scylla-gc-clock-time-point-type_>`_ instance, representing the current time.
+Create a `ScyllaDB.gc_clock_time_point <scylla-gc-clock-time-point-type_>`_ instance, representing the current time.
 
 .. _scylla-partition-key-type:
 
-Scylla.partition_key
-""""""""""""""""""""
+ScyllaDB.partition_key
+""""""""""""""""""""""
 
 Attributes:
 
-* components (table) - the column values (`Scylla.data_value <scylla-data-value-type_>`_) making up the composite partition key.
+* components (table) - the column values (`ScyllaDB.data_value <scylla-data-value-type_>`_) making up the composite partition key.
 
 Methods:
 
@@ -1034,34 +1083,34 @@ Methods:
 
 Magic methods:
 
-* __tostring - can be converted to string with tostring(), uses the built-in operator<< in Scylla.
+* __tostring - can be converted to string with tostring(), uses the built-in operator<< in ScyllaDB.
 
 See also:
 
-* :ref:`Scylla.unserialize_partition_key() <scylla-unserialize-partition-key-method>`.
-* :ref:`Scylla.token_of() <scylla-token-of-method>`.
+* :ref:`ScyllaDB.unserialize_partition_key() <scylla-unserialize-partition-key-method>`.
+* :ref:`ScyllaDB.token_of() <scylla-token-of-method>`.
 
 .. _scylla-partition-start-type:
 
-Scylla.partition_start
-""""""""""""""""""""""
+ScyllaDB.partition_start
+""""""""""""""""""""""""
 
 Attributes:
 
 * key - the partition key's value as the appropriate Lua native type.
 * token (integer) - the partition key's token.
-* tombstone (`Scylla.tombstone <scylla-tombstone-type_>`_) - the partition tombstone, ``nil`` if no tombstone.
+* tombstone (`ScyllaDB.tombstone <scylla-tombstone-type_>`_) - the partition tombstone, ``nil`` if no tombstone.
 
 .. _scylla-position-in-partition-type:
 
-Scylla.position_in_partition
-""""""""""""""""""""""""""""
+ScyllaDB.position_in_partition
+""""""""""""""""""""""""""""""
 
 Currently used only for clustering positions.
 
 Attributes:
 
-* key (`Scylla.clustering_key <scylla-clustering-key-type_>`_) - the clustering key, ``nil`` if the position in partition represents the min or max clustering positions.
+* key (`ScyllaDB.clustering_key <scylla-clustering-key-type_>`_) - the clustering key, ``nil`` if the position in partition represents the min or max clustering positions.
 * weight (integer) - weight of the position, either -1 (before key), 0 (at key) or 1 (after key). If key attribute is ``nil``, the weight is never 0.
 
 Methods:
@@ -1070,28 +1119,28 @@ Methods:
 
 See also:
 
-* `Scylla.new_position_in_partition() <scylla-new-position-in-partition-method_>`_.
+* `ScyllaDB.new_position_in_partition() <scylla-new-position-in-partition-method_>`_.
 
 .. _scylla-range-tombstone-change-type:
 
-Scylla.range_tombstone_change
-"""""""""""""""""""""""""""""
+ScyllaDB.range_tombstone_change
+"""""""""""""""""""""""""""""""
 
 Attributes:
 
 * key ($TYPE) - the clustering key's value as the appropriate Lua native type.
 * key_weight (integer) - weight of the position, either -1 (before key), 0 (at key) or 1 (after key).
-* tombstone (`Scylla.tombstone <scylla-tombstone-type_>`_) - tombstone, ``nil`` if no tombstone.
+* tombstone (`ScyllaDB.tombstone <scylla-tombstone-type_>`_) - tombstone, ``nil`` if no tombstone.
 
 .. _scylla-ring-position-type:
 
-Scylla.ring_position
-""""""""""""""""""""
+ScyllaDB.ring_position
+""""""""""""""""""""""
 
 Attributes:
 
 * token (integer) - the token, ``nil`` if the ring position represents the min or max ring positions.
-* key (`Scylla.partition_key <scylla-partition-key-type_>`_) - the partition key, ``nil`` if the ring position represents a position before/after a token.
+* key (`ScyllaDB.partition_key <scylla-partition-key-type_>`_) - the partition key, ``nil`` if the ring position represents a position before/after a token.
 * weight (integer) - weight of the position, either -1 (before key/token), 0 (at key) or 1 (after key/token). If key attribute is ``nil``, the weight is never 0.
 
 Methods:
@@ -1100,12 +1149,12 @@ Methods:
 
 See also:
 
-* `Scylla.new_ring_position() <scylla-new-ring-position-method_>`_.
+* `ScyllaDB.new_ring_position() <scylla-new-ring-position-method_>`_.
 
 .. _scylla-row-marker-type:
 
-Scylla.row_marker
-"""""""""""""""""
+ScyllaDB.row_marker
+"""""""""""""""""""
 
 Attributes:
 
@@ -1113,26 +1162,26 @@ Attributes:
 * is_live (boolean) - is the marker live?
 * has_ttl (boolean) - is the marker expiring?
 * ttl (integer) - time to live in seconds, ``nil`` if marker is not expiring.
-* expiry (`Scylla.gc_clock_time_point <scylla-gc-clock-time-point-type_>`_) - time at which marker expires, ``nil`` if marker is not expiring.
-* deletion_time (`Scylla.gc_clock_time_point <scylla-gc-clock-time-point-type_>`_) - time at which marker was deleted, ``nil`` unless marker is dead or expiring.
+* expiry (`ScyllaDB.gc_clock_time_point <scylla-gc-clock-time-point-type_>`_) - time at which marker expires, ``nil`` if marker is not expiring.
+* deletion_time (`ScyllaDB.gc_clock_time_point <scylla-gc-clock-time-point-type_>`_) - time at which marker was deleted, ``nil`` unless marker is dead or expiring.
 
 .. _scylla-schema-type:
 
-Scylla.schema
-"""""""""""""
+ScyllaDB.schema
+"""""""""""""""
 
 Attributes:
 
-* partition_key_columns (table) - list of `Scylla.column_definition <scylla-column-definition-type_>`_ of the key columns making up the partition key.
-* clustering_key_columns (table) - list of `Scylla.column_definition <scylla-column-definition-type_>`_ of the key columns making up the clustering key.
-* static_columns (table) - list of `Scylla.column_definition <scylla-column-definition-type_>`_ of the static columns.
-* regular_columns (table) - list of `Scylla.column_definition <scylla-column-definition-type_>`_ of the regular columns.
-* all_columns (table) - list of `Scylla.column_definition <scylla-column-definition-type_>`_ of all columns.
+* partition_key_columns (table) - list of `ScyllaDB.column_definition <scylla-column-definition-type_>`_ of the key columns making up the partition key.
+* clustering_key_columns (table) - list of `ScyllaDB.column_definition <scylla-column-definition-type_>`_ of the key columns making up the clustering key.
+* static_columns (table) - list of `ScyllaDB.column_definition <scylla-column-definition-type_>`_ of the static columns.
+* regular_columns (table) - list of `ScyllaDB.column_definition <scylla-column-definition-type_>`_ of the regular columns.
+* all_columns (table) - list of `ScyllaDB.column_definition <scylla-column-definition-type_>`_ of all columns.
 
 .. _scylla-sstable-type:
 
-Scylla.sstable
-""""""""""""""
+ScyllaDB.sstable
+""""""""""""""""
 
 Attributes:
 
@@ -1140,53 +1189,53 @@ Attributes:
 
 .. _scylla-static-row-type:
 
-Scylla.static_row
-"""""""""""""""""
+ScyllaDB.static_row
+"""""""""""""""""""
 
 Attributes:
 
-* cells (table) - table of cells, where keys are the column names and the values are either of type `Scylla.atomic_cell <scylla-atomic-cell-type_>`_ or `Scylla.collection <scylla-collection-type_>`_.
+* cells (table) - table of cells, where keys are the column names and the values are either of type `ScyllaDB.atomic_cell <scylla-atomic-cell-type_>`_ or `ScyllaDB.collection <scylla-collection-type_>`_.
 
 .. _scylla-time-point-from-string-method:
 
-Scylla.time_point_from_string()
-"""""""""""""""""""""""""""""""
+ScyllaDB.time_point_from_string()
+"""""""""""""""""""""""""""""""""
 
-Create a `Scylla.gc_clock_time_point <scylla-gc-clock-time-point-type_>`_ instance from the passed in string.
+Create a `ScyllaDB.gc_clock_time_point <scylla-gc-clock-time-point-type_>`_ instance from the passed in string.
 Argument is string, using the same format as the CQL timestamp type, see https://en.wikipedia.org/wiki/ISO_8601.
 
 .. _scylla-token-of-method:
 
-Scylla.token_of()
-"""""""""""""""""
+ScyllaDB.token_of()
+"""""""""""""""""""
 
-Compute and return the token (integer) for a `Scylla.partition_key <scylla-partition-key-type_>`_.
+Compute and return the token (integer) for a `ScyllaDB.partition_key <scylla-partition-key-type_>`_.
 
 .. _scylla-tombstone-type:
 
-Scylla.tombstone
-""""""""""""""""
+ScyllaDB.tombstone
+""""""""""""""""""
 
 Attributes:
 
 * timestamp (integer)
-* deletion_time (`Scylla.gc_clock_time_point <scylla-gc-clock-time-point-type_>`_) - the point in time at which the tombstone was deleted.
+* deletion_time (`ScyllaDB.gc_clock_time_point <scylla-gc-clock-time-point-type_>`_) - the point in time at which the tombstone was deleted.
 
 .. _scylla-unserialize-clustering-key-method:
 
-Scylla.unserialize_clustering_key()
-"""""""""""""""""""""""""""""""""""
+ScyllaDB.unserialize_clustering_key()
+"""""""""""""""""""""""""""""""""""""
 
-Create a `Scylla.clustering_key <scylla-clustering-key-type_>`_ instance.
+Create a `ScyllaDB.clustering_key <scylla-clustering-key-type_>`_ instance.
 
 Argument is a string representing serialized clustering key in hex format.
 
 .. _scylla-unserialize-partition-key-method:
 
-Scylla.unserialize_partition_key()
-""""""""""""""""""""""""""""""""""
+ScyllaDB.unserialize_partition_key()
+""""""""""""""""""""""""""""""""""""
 
-Create a `Scylla.partition_key <scylla-partition-key-type_>`_ instance.
+Create a `ScyllaDB.partition_key <scylla-partition-key-type_>`_ instance.
 
 Argument is a string representing serialized partition key in hex format.
 

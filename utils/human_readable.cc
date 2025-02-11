@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 /*
@@ -12,14 +12,6 @@
 #include <ostream>
 
 namespace utils {
-
-std::ostream& operator<<(std::ostream& os, const human_readable_value& val) {
-    os << val.value;
-    if (val.suffix) {
-        os << val.suffix;
-    }
-    return os;
-}
 
 static human_readable_value to_human_readable_value(uint64_t value, uint64_t step, uint64_t precision, const std::array<char, 5>& suffixes) {
     if (!value) {
@@ -48,3 +40,12 @@ human_readable_value to_hr_size(uint64_t size) {
 }
 
 } // namespace utils
+
+auto fmt::formatter<utils::human_readable_value>::format(const utils::human_readable_value& val, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    auto out = fmt::format_to(ctx.out(), "{}", val.value);
+    if (val.suffix) {
+        out = fmt::format_to(out, "{}", val.suffix);
+    }
+    return out;
+}

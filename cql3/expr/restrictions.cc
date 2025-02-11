@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "cql3/statements/request_validations.hh"
@@ -111,10 +111,8 @@ void validate_token_relation(const std::vector<const column_definition*> column_
                 "The token() function must be applied to all partition key components or none of them");
         }
         throw exceptions::invalid_request_exception(
-                format("The token function arguments must be in the partition key order: {}",
-                       fmt::join(boost::adaptors::transform(pk, [](const column_definition& cd) {
-                           return cd.name_as_text();
-                       }), ", ")));
+                seastar::format("The token function arguments must be in the partition key order: {}",
+                       fmt::join(pk | std::views::transform(std::mem_fn(&column_definition::name_as_text)), ", ")));
     }
 }
 

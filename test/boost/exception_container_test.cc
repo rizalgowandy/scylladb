@@ -3,10 +3,9 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <stdexcept>
 #include "utils/exception_container.hh"
 
 #include "test/lib/scylla_test_case.hh"
@@ -56,7 +55,7 @@ SEASTAR_TEST_CASE(test_exception_container) {
     BOOST_REQUIRE_THROW(bar.throw_me(), bar_exception);
 
     // Construct the futures outside BOOST_REQUIRE_THROW
-    // otherwise the checks would pass if as_exception_future throwed
+    // otherwise the checks would pass if as_exception_future throws
     // and we don't want that
     auto f_empty = empty.as_exception_future();
     auto f_foo = foo.as_exception_future();

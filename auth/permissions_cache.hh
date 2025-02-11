@@ -3,34 +3,28 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <chrono>
-#include <string_view>
-#include <functional>
 #include <iostream>
-#include <optional>
 #include <utility>
 
+#include <fmt/core.h>
 #include <seastar/core/future.hh>
-#include <seastar/core/shared_ptr.hh>
-#include <seastar/core/sstring.hh>
 
-#include "auth/authenticated_user.hh"
 #include "auth/permission.hh"
 #include "auth/resource.hh"
 #include "auth/role_or_anonymous.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "utils/hash.hh"
 #include "utils/loading_cache.hh"
 
 namespace std {
 
 inline std::ostream& operator<<(std::ostream& os, const pair<auth::role_or_anonymous, auth::resource>& p) {
-    os << "{role: " << p.first << ", resource: " << p.second << "}";
+    fmt::print(os, "{{role: {}, resource: {}}}", p.first, p.second);
     return os;
 }
 

@@ -22,9 +22,6 @@
 Global Secondary Indexes
 ------------------------
 
-Global Secondary Indexes is production ready in Scylla Open Source 3.0 and Scylla Enterprise 2019.1.x
-
-
 CQL supports creating secondary indexes on tables, allowing queries on the table to use those indexes. A secondary index
 is identified by a name defined by:
 
@@ -43,7 +40,7 @@ Creating a secondary index on a table uses the ``CREATE INDEX`` statement:
 
 .. code-block::
    
-   create_index_statement: CREATE INDEX [ `index_name` ]
+   create_index_statement: CREATE INDEX [IF NOT EXISTS] [ `index_name` ]
                          :     ON `table_name` '(' `index_identifier` ')'
                          :     [ USING `string` [ WITH OPTIONS = `map_literal` ] ]
    index_identifier: `column_name`
@@ -62,7 +59,7 @@ automatically at insertion time.
 Local Secondary Index
 ^^^^^^^^^^^^^^^^^^^^^
 
-:doc:`Local Secondary Indexes </using-scylla/local-secondary-indexes>` is an enhancement of :doc:`Global Secondary Indexes </using-scylla/secondary-indexes>`, which allows Scylla to optimize the use case in which the partition key of the base table is also the partition key of the index. Local Secondary Index syntax is the same as above, with extra parentheses on the partition key.
+:doc:`Local Secondary Indexes </features/local-secondary-indexes>` is an enhancement of :doc:`Global Secondary Indexes </features/secondary-indexes>`, which allows ScyllaDB to optimize the use case in which the partition key of the base table is also the partition key of the index. Local Secondary Index syntax is the same as above, with extra parentheses on the partition key.
 
 .. code-block::
 
@@ -76,12 +73,12 @@ Example:
           CREATE TABLE menus (location text, name text, price float, dish_type text, PRIMARY KEY(location, name));
           CREATE INDEX ON menus((location),dish_type);
 
-More on :doc:`Local Secondary Indexes </using-scylla/local-secondary-indexes>`
+More on :doc:`Local Secondary Indexes </features/local-secondary-indexes>`
 
 .. Attempting to create an already existing index will return an error unless the ``IF NOT EXISTS`` option is used. If it
 .. is used, the statement will be a no-op if the index already exists.
 
-.. Indexes on Map Keys (supported in Scylla 2.2)
+.. Indexes on Map Keys (supported in ScyllaDB 2.2)
 .. ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. When creating an index on a :ref:`maps <maps>`, you may index either the keys or the values. If the column identifier is
@@ -108,10 +105,10 @@ name, which may optionally specify the keyspace of the index.
 Additional Information
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-* :doc:`Global Secondary Indexes </using-scylla/secondary-indexes/>`
-* :doc:`Local Secondary Indexes </using-scylla/local-secondary-indexes/>`
+* :doc:`Global Secondary Indexes </features/secondary-indexes/>`
+* :doc:`Local Secondary Indexes </features/local-secondary-indexes/>`
 
-The following courses are available from Scylla University:
+The following courses are available from ScyllaDB University:
 
 * `Materialized Views and Secondary Indexes <https://university.scylladb.com/courses/data-modeling/lessons/materialized-views-secondary-indexes-and-filtering/>`_
 * `Global Secondary Indexes <https://university.scylladb.com/courses/data-modeling/lessons/materialized-views-secondary-indexes-and-filtering/topic/global-secondary-indexes/>`_

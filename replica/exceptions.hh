@@ -3,22 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <cstdint>
 #include <exception>
-#include <optional>
 #include <variant>
 
 #include <seastar/core/abort_source.hh>
+#include <seastar/core/format.hh>
 #include <seastar/core/sstring.hh>
-#include <seastar/core/timed_out_error.hh>
-
-#include "utils/exception_container.hh"
-#include "utils/result.hh"
 
 namespace replica {
 

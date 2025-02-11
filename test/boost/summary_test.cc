@@ -3,16 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
 #define BOOST_TEST_MODULE core
 
 #include <boost/test/unit_test.hpp>
-#include <iostream>
 #include "utils/histogram.hh"
-#include "utils/histogram_metrics_helper.hh"
 #include <algorithm>
 #include <sstream>
 

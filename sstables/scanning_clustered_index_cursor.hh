@@ -3,15 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include "sstables/index_entry.hh"
 #include "sstables/promoted_index_blocks_reader.hh"
 #include "schema/schema.hh"
-#include "log.hh"
+#include "utils/log.hh"
 
 namespace sstables {
 
@@ -32,6 +33,7 @@ extern logging::logger sstlog;
 class scanning_clustered_index_cursor : public clustered_index_cursor {
     const schema& _s;
     uint64_t _current_pi_idx = 0; // Points to upper bound of the cursor.
+    skip_info _skip_info = {0, tombstone(), position_in_partition::before_all_clustered_rows()};
     promoted_index_blocks_reader _reader;
     bool _reader_closed = false;
 private:
@@ -95,7 +97,7 @@ private:
             // End open marker can be only engaged in SSTables 3.x ('mc' format) and never in ka/la
             auto end_pos = prev->end(_s);
             position_in_partition_view* open_rt_pos = std::get_if<position_in_partition_view>(&end_pos);
-            assert(open_rt_pos);
+            SCYLLA_ASSERT(open_rt_pos);
             return skip_info{offset, tombstone(*prev->end_open_marker()), position_in_partition{*open_rt_pos}};
         }
     }
@@ -138,6 +140,7 @@ public:
             auto info = get_info_from_promoted_block(i, *pi_blocks);
             sstlog.trace("scanning_clustered_index_cursor {}: lower bound skipped to cell, _current_pi_idx={}, offset={}",
                 fmt::ptr(this), _current_pi_idx, info.offset);
+            _skip_info = info;
             return make_ready_future<std::optional<skip_info>>(std::move(info));
         }
 
@@ -150,8 +153,13 @@ public:
             auto info = get_info_from_promoted_block(i, *pi_blocks);
             sstlog.trace("scanning_clustered_index_cursor {}: skipped to cell, _current_pi_idx={}, offset={}",
                 fmt::ptr(this), _current_pi_idx, info.offset);
+            _skip_info = info;
             return std::make_optional(std::move(info));
         });
+    }
+
+    skip_info current_block() override {
+        return _skip_info;
     }
 
     future<std::optional<offset_in_partition>> probe_upper_bound(position_in_partition_view pos) override {

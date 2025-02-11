@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -36,7 +36,7 @@ public:
 
 struct session_complete_event : public stream_event {
     using inet_address = gms::inet_address;
-    inet_address peer;
+    locator::host_id peer;
     bool success;
 
     session_complete_event(shared_ptr<stream_session> session)

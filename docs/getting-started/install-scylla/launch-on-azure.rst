@@ -38,11 +38,12 @@ Launching ScyllaDB on Azure
     
         az group create --name my-group --location eastus
 
-#. Go to `ScyllaDB for Azure <https://www.scylladb.com/download/?platform=azure#open-source>`_ in ScyllaDB's download center to obtain the image information:
+#. See the following table to obtain image information for the latest patch release. 
+   For earlier releases, see :doc:`Azure Images </reference/azure-images/>`
 
-   * gallery-image-definition
-   * gallery-image-version
-   * public-gallery-name
+   .. scylladb_azure_images_template::
+      :exclude: rc,dev
+      :only_latest:
 
 #. Get the ScyllaDB image ID using the information from the previous step:
 
@@ -76,7 +77,7 @@ Launching ScyllaDB on Azure
         
         ssh -i ~/.ssh/ssh-key.pem scyllaadm@public-ip
  
-   To check that the ScyllaDB server and the JMX component are running, run:
+   To check that the ScyllaDB server is running, run:
 
    .. code-block:: console
       

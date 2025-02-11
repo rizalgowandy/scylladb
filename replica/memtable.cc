@@ -3,9 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include "memtable.hh"
 #include "replica/database.hh"
 #include "mutation/frozen_mutation.hh"
@@ -14,10 +15,11 @@
 #include "mutation/mutation_partition_view.hh"
 #include "readers/empty_v2.hh"
 #include "readers/forwardable_v2.hh"
+#include "sstables/types.hh"
 
 namespace replica {
 
-static flat_mutation_reader_v2 make_partition_snapshot_flat_reader_from_snp_schema(
+static mutation_reader make_partition_snapshot_flat_reader_from_snp_schema(
         bool is_reversed,
         reader_permit permit,
         dht::decorated_key dk,
@@ -29,30 +31,26 @@ static flat_mutation_reader_v2 make_partition_snapshot_flat_reader_from_snp_sche
         std::any pointer_to_container,
         streamed_mutation::forwarding fwd, memtable& memtable);
 
-void memtable::memtable_encoding_stats_collector::update_timestamp(api::timestamp_type ts) noexcept {
-    if (ts != api::missing_timestamp) {
-        encoding_stats_collector::update_timestamp(ts);
-        min_max_timestamp.update(ts);
-    }
-}
-
 memtable::memtable_encoding_stats_collector::memtable_encoding_stats_collector() noexcept
     : min_max_timestamp(0, 0)
+    , min_live_timestamp(api::max_timestamp)
+    , min_live_row_marker_timestamp(api::max_timestamp)
 {}
 
 void memtable::memtable_encoding_stats_collector::update(atomic_cell_view cell) noexcept {
-    update_timestamp(cell.timestamp());
+    is_live is_live = ::is_live(cell.is_live());
+    update_timestamp(cell.timestamp(), is_live);
     if (cell.is_live_and_has_ttl()) {
         update_ttl(cell.ttl());
         update_local_deletion_time(cell.expiry());
-    } else if (!cell.is_live()) {
+    } else if (!is_live) {
         update_local_deletion_time(cell.deletion_time());
     }
 }
 
 void memtable::memtable_encoding_stats_collector::update(tombstone tomb) noexcept {
     if (tomb) {
-        update_timestamp(tomb.timestamp);
+        update_timestamp(tomb.timestamp, is_live::no);
         update_local_deletion_time(tomb.deletion_time);
     }
 }
@@ -83,12 +81,18 @@ void memtable::memtable_encoding_stats_collector::update(const range_tombstone& 
 }
 
 void memtable::memtable_encoding_stats_collector::update(const row_marker& marker) noexcept {
-    update_timestamp(marker.timestamp());
-    if (!marker.is_missing()) {
-        if (!marker.is_live()) {
-            update_ttl(gc_clock::duration(sstables::expired_liveness_ttl));
-            update_local_deletion_time(marker.deletion_time());
-        } else if (marker.is_expiring()) {
+    if (marker.is_missing()) {
+        return;
+    }
+    auto timestamp = marker.timestamp();
+    if (!marker.is_live()) {
+        update_timestamp(timestamp, is_live::no);
+        update_ttl(gc_clock::duration(sstables::expired_liveness_ttl));
+        update_local_deletion_time(marker.deletion_time());
+    } else {
+        update_timestamp(timestamp, is_live::yes);
+        update_live_row_marker_timestamp(timestamp);
+        if (marker.is_expiring()) {
             update_ttl(marker.ttl());
             update_local_deletion_time(marker.expiry());
         }
@@ -115,8 +119,7 @@ void memtable::memtable_encoding_stats_collector::update(const ::schema& s, cons
 }
 
 memtable::memtable(schema_ptr schema, dirty_memory_manager& dmm,
-    logalloc::allocating_section& read_section,
-    logalloc::allocating_section& allocating_section,
+    memtable_table_shared_data& table_shared_data,
     replica::table_stats& table_stats,
     memtable_list* memtable_list, seastar::scheduling_group compaction_scheduling_group)
         : dirty_memory_manager_logalloc::size_tracked_region()
@@ -125,8 +128,7 @@ memtable::memtable(schema_ptr schema, dirty_memory_manager& dmm,
                    [this] (size_t freed) { remove_flushed_memory(freed); })
         , _memtable_list(memtable_list)
         , _schema(std::move(schema))
-        , _read_section(read_section)
-        , _allocating_section(allocating_section)
+        , _table_shared_data(table_shared_data)
         , partitions(dht::raw_token_less_comparator{})
         , _table_stats(table_stats) {
     logalloc::region::listen(&dmm.region_group());
@@ -134,12 +136,11 @@ memtable::memtable(schema_ptr schema, dirty_memory_manager& dmm,
 
 static thread_local dirty_memory_manager mgr_for_tests;
 static thread_local replica::table_stats stats_for_tests;
-static thread_local logalloc::allocating_section memtable_read_section_for_tests;
-static thread_local logalloc::allocating_section memtable_allocating_section_for_tests;
+static thread_local memtable_table_shared_data memtable_shared_data_for_tests;
 
 memtable::memtable(schema_ptr schema)
         : memtable(std::move(schema), mgr_for_tests,
-                 memtable_read_section_for_tests, memtable_allocating_section_for_tests, stats_for_tests)
+                 memtable_shared_data_for_tests, stats_for_tests)
 { }
 
 memtable::~memtable() {
@@ -207,7 +208,7 @@ future<> memtable::clear_gently() noexcept {
 
 partition_entry&
 memtable::find_or_create_partition_slow(partition_key_view key) {
-    assert(!reclaiming_enabled());
+    SCYLLA_ASSERT(!reclaiming_enabled());
 
     // FIXME: Perform lookup using std::pair<token, partition_key_view>
     // to avoid unconditional copy of the partition key.
@@ -225,7 +226,7 @@ memtable::find_or_create_partition_slow(partition_key_view key) {
 
 partition_entry&
 memtable::find_or_create_partition(const dht::decorated_key& key) {
-    assert(!reclaiming_enabled());
+    SCYLLA_ASSERT(!reclaiming_enabled());
 
     // call lower_bound so we have a hint for the insert, just in case.
     partitions_type::bound_hint hint;
@@ -247,15 +248,20 @@ memtable::find_or_create_partition(const dht::decorated_key& key) {
     return i->partition();
 }
 
-boost::iterator_range<memtable::partitions_type::const_iterator>
+bool
+memtable::contains_partition(const dht::decorated_key& key) const {
+    return partitions.find(key, dht::ring_position_comparator(*_schema)) != partitions.end();
+}
+
+std::ranges::subrange<memtable::partitions_type::const_iterator>
 memtable::slice(const dht::partition_range& range) const {
     if (query::is_single_partition(range)) {
         const query::ring_position& pos = range.start()->value();
         auto i = partitions.find(pos, dht::ring_position_comparator(*_schema));
         if (i != partitions.end()) {
-            return boost::make_iterator_range(i, std::next(i));
+            return {i, std::next(i)};
         } else {
-            return boost::make_iterator_range(i, i);
+            return {i, i};
         }
     } else {
         auto cmp = dht::ring_position_comparator(*_schema);
@@ -272,7 +278,7 @@ memtable::slice(const dht::partition_range& range) const {
                         : partitions.lower_bound(range.end()->value(), cmp))
                   : partitions.cend();
 
-        return boost::make_iterator_range(i1, i2);
+        return {i1, i2};
     }
 }
 
@@ -346,7 +352,7 @@ protected:
     }
 
     logalloc::allocating_section& read_section() {
-        return _memtable->_read_section;
+        return _memtable->_table_shared_data.read_section;
     }
 
     lw_shared_ptr<memtable> mtbl() {
@@ -369,7 +375,7 @@ protected:
         return {};
     }
 
-    flat_mutation_reader_v2 delegate_reader(reader_permit permit,
+    mutation_reader delegate_reader(reader_permit permit,
                                     const dht::partition_range& delegate,
                                     const query::partition_slice& slice,
                                     streamed_mutation::forwarding fwd,
@@ -404,9 +410,9 @@ public:
     void operator()(const partition_end& eop) {}
 };
 
-class scanning_reader final : public flat_mutation_reader_v2::impl, private iterator_reader {
+class scanning_reader final : public mutation_reader::impl, private iterator_reader {
     std::optional<dht::partition_range> _delegate_range;
-    flat_mutation_reader_v2_opt _delegate;
+    mutation_reader_opt _delegate;
     const query::partition_slice& _slice;
     mutation_reader::forwarding _fwd_mr;
 
@@ -473,11 +479,7 @@ public:
                     if (key_and_snp) {
                         update_last(key_and_snp->first);
 
-                        const query::clustering_row_ranges& ranges = _slice.row_ranges(*schema(), key_and_snp->first.key());
-                        // TODO: when the slice passed from query finally changes format from half-reversed into native reversed, this line needs to change.
-                        auto cr = query::clustering_key_filter_ranges(ranges);
-
-                        auto snp_schema = key_and_snp->second->schema();
+                        auto cr = query::clustering_key_filter_ranges::get_ranges(*schema(), _slice, key_and_snp->first.key());
                         bool digest_requested = _slice.options.contains<query::partition_slice::option::with_digest>();
                         bool is_reversed = _slice.is_reversed();
                         _delegate = make_partition_snapshot_flat_reader_from_snp_schema(is_reversed, _permit, std::move(key_and_snp->first), std::move(cr), std::move(key_and_snp->second), digest_requested, region(), read_section(), mtbl(), streamed_mutation::forwarding::no, *mtbl());
@@ -552,7 +554,7 @@ public:
         : _mt(mt)
 	{}
     ~flush_memory_accounter() {
-        assert(_mt._flushed_memory <= _mt.occupancy().total_space());
+        SCYLLA_ASSERT(_mt._flushed_memory <= _mt.occupancy().total_space());
     }
     uint64_t compute_size(memtable_entry& e, partition_snapshot& snp) {
         return e.size_in_allocator_without_rows(_mt.allocator())
@@ -596,7 +598,7 @@ public:
     }
 };
 
-static flat_mutation_reader_v2 make_partition_snapshot_flat_reader_from_snp_schema(
+static mutation_reader make_partition_snapshot_flat_reader_from_snp_schema(
         bool is_reversed,
         reader_permit permit,
         dht::decorated_key dk,
@@ -616,12 +618,12 @@ static flat_mutation_reader_v2 make_partition_snapshot_flat_reader_from_snp_sche
     }
 }
 
-class flush_reader final : public flat_mutation_reader_v2::impl, private iterator_reader {
+class flush_reader final : public mutation_reader::impl, private iterator_reader {
     // FIXME: Similarly to scanning_reader we have an underlying
-    // flat_mutation_reader for each partition. This is suboptimal.
+    // mutation_reader for each partition. This is suboptimal.
     // Partition snapshot reader should be devirtualised and called directly
     // without using any intermediate buffers.
-    flat_mutation_reader_v2_opt _partition_reader;
+    mutation_reader_opt _partition_reader;
     flush_memory_accounter _flushed_memory;
 public:
     flush_reader(schema_ptr s, reader_permit permit, lw_shared_ptr<memtable> m)
@@ -703,8 +705,8 @@ partition_snapshot_ptr memtable_entry::snapshot(memtable& mtbl) {
     return _pe.read(mtbl.region(), mtbl.cleaner(), no_cache_tracker);
 }
 
-flat_mutation_reader_v2_opt
-memtable::make_flat_reader_opt(schema_ptr s,
+mutation_reader_opt
+memtable::make_flat_reader_opt(schema_ptr query_schema,
                       reader_permit permit,
                       const dht::partition_range& range,
                       const query::partition_slice& slice,
@@ -714,7 +716,7 @@ memtable::make_flat_reader_opt(schema_ptr s,
     bool is_reversed = slice.is_reversed();
     if (query::is_single_partition(range) && !fwd_mr) {
         const query::ring_position& pos = range.start()->value();
-        auto snp = _read_section(*this, [&] () -> partition_snapshot_ptr {
+        auto snp = _table_shared_data.read_section(*this, [&] () -> partition_snapshot_ptr {
             auto i = partitions.find(pos, dht::ring_position_comparator(*_schema));
             if (i != partitions.end()) {
                 upgrade_entry(*i);
@@ -727,17 +729,13 @@ memtable::make_flat_reader_opt(schema_ptr s,
             return {};
         }
         auto dk = pos.as_decorated_key();
-
-        const query::clustering_row_ranges& ranges = slice.row_ranges(*s, dk.key());
-        // TODO: when the slice passed from query finally changes format from half-reversed into native reversed, this line needs to change.
-        auto cr = query::clustering_key_filter_ranges(ranges);
-
+        auto cr = query::clustering_key_filter_ranges::get_ranges(*query_schema, slice, dk.key());
         bool digest_requested = slice.options.contains<query::partition_slice::option::with_digest>();
-        auto rd = make_partition_snapshot_flat_reader_from_snp_schema(is_reversed, std::move(permit), std::move(dk), std::move(cr), std::move(snp), digest_requested, *this, _read_section, shared_from_this(), fwd, *this);
-        rd.upgrade_schema(s);
+        auto rd = make_partition_snapshot_flat_reader_from_snp_schema(is_reversed, std::move(permit), std::move(dk), std::move(cr), std::move(snp), digest_requested, *this, _table_shared_data.read_section, shared_from_this(), fwd, *this);
+        rd.upgrade_schema(query_schema);
         return rd;
     } else {
-        auto res = make_flat_mutation_reader_v2<scanning_reader>(std::move(s), shared_from_this(), std::move(permit), range, slice, fwd_mr);
+        auto res = make_mutation_reader<scanning_reader>(std::move(query_schema), shared_from_this(), std::move(permit), range, slice, fwd_mr);
         if (fwd == streamed_mutation::forwarding::yes) {
             return make_forwardable(std::move(res));
         } else {
@@ -746,13 +744,13 @@ memtable::make_flat_reader_opt(schema_ptr s,
     }
 }
 
-flat_mutation_reader_v2
+mutation_reader
 memtable::make_flush_reader(schema_ptr s, reader_permit permit) {
     if (!_merged_into_cache) {
-        return make_flat_mutation_reader_v2<flush_reader>(std::move(s), std::move(permit), shared_from_this());
+        return make_mutation_reader<flush_reader>(std::move(s), std::move(permit), shared_from_this());
     } else {
         auto& full_slice = s->full_slice();
-        return make_flat_mutation_reader_v2<scanning_reader>(std::move(s), shared_from_this(), std::move(permit),
+        return make_mutation_reader<scanning_reader>(std::move(s), shared_from_this(), std::move(permit),
                       query::full_partition_range, full_slice, mutation_reader::forwarding::no);
     }
 }
@@ -782,7 +780,7 @@ memtable::apply(memtable& mt, reader_permit permit) {
 void
 memtable::apply(const mutation& m, db::rp_handle&& h) {
     with_allocator(allocator(), [this, &m] {
-        _allocating_section(*this, [&, this] {
+        _table_shared_data.allocating_section(*this, [&, this] {
             auto& p = find_or_create_partition(m.decorated_key());
             _stats_collector.update(*m.schema(), m.partition());
             p.apply(region(), cleaner(), *_schema, m.partition(), *m.schema(), _table_stats.memtable_app_stats);
@@ -794,7 +792,7 @@ memtable::apply(const mutation& m, db::rp_handle&& h) {
 void
 memtable::apply(const frozen_mutation& m, const schema_ptr& m_schema, db::rp_handle&& h) {
     with_allocator(allocator(), [this, &m, &m_schema] {
-        _allocating_section(*this, [&, this] {
+        _table_shared_data.allocating_section(*this, [&, this] {
             auto& p = find_or_create_partition_slow(m.key());
             mutation_partition mp(*m_schema);
             partition_builder pb(*m_schema, mp);
@@ -848,7 +846,7 @@ void memtable_entry::upgrade_schema(logalloc::region& r, const schema_ptr& s, mu
 
 void memtable::upgrade_entry(memtable_entry& e) {
     if (e.schema() != _schema) {
-        assert(!reclaiming_enabled());
+        SCYLLA_ASSERT(!reclaiming_enabled());
         e.upgrade_schema(region(), _schema, cleaner());
     }
 }
@@ -861,14 +859,15 @@ size_t memtable_entry::object_memory_size(allocation_strategy& allocator) {
     return memtable::partitions_type::estimated_object_memory_size_in_allocator(allocator, this);
 }
 
-std::ostream& operator<<(std::ostream& out, memtable& mt) {
+}
+
+auto fmt::formatter<replica::memtable_entry>::format(const replica::memtable_entry& mt,
+                                                     fmt::format_context& ctx) const -> decltype(ctx.out()) {
+    return fmt::format_to(ctx.out(), "{{{}: {}}}", mt.key(), partition_entry::printer(mt.partition()));
+}
+
+auto fmt::formatter<replica::memtable>::format(replica::memtable& mt,
+                                        fmt::format_context& ctx) const -> decltype(ctx.out()) {
     logalloc::reclaim_lock rl(mt);
-    fmt::print(out, "{{memtable: [{}]}}", fmt::join(mt.partitions, ",\n"));
-    return out;
-}
-
-std::ostream& operator<<(std::ostream& out, const memtable_entry& mt) {
-    return out << "{" << mt.key() << ": " << partition_entry::printer(mt.partition()) << "}";
-}
-
+    return fmt::format_to(ctx.out(), "{{memtable: [{}]}}", fmt::join(mt.partitions, ",\n"));
 }

@@ -5,14 +5,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include <seastar/core/sstring.hh>
 #include "seastarx.hh"
-#include <iosfwd>
 #include <functional>
 
 namespace db {
@@ -52,7 +51,7 @@ public:
 }
 
 template <>
-struct fmt::formatter<db::functions::function_name> : fmt::formatter<std::string_view> {
+struct fmt::formatter<db::functions::function_name> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const db::functions::function_name& fn, FormatContext& ctx) const {
         auto out = ctx.out();

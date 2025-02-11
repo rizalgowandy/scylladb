@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -60,7 +60,6 @@ public:
 };
 
 struct time_window_compaction_strategy_state {
-    int64_t estimated_remaining_tasks = 0;
     db_clock::time_point last_expired_check;
     // As api::timestamp_type is an int64_t, a primitive type, it must be initialized here.
     api::timestamp_type highest_window_seen = 0;
@@ -76,6 +75,7 @@ public:
     // To prevent an explosion in the number of sstables we cap it.
     // Better co-locate some windows into the same sstables than OOM.
     static constexpr uint64_t max_data_segregation_window_count = 100;
+    static constexpr float reshape_target_space_overhead = 0.1f;
 
     using bucket_t = std::vector<shared_sstable>;
     enum class bucket_compaction_mode { none, size_tiered, major };
@@ -142,15 +142,9 @@ public:
         return api::timestamp_type(std::chrono::duration_cast<std::chrono::microseconds>(options.get_sstable_window_size()).count());
     }
 private:
-    void update_estimated_compaction_by_tasks(time_window_compaction_strategy_state& state,
-        std::map<api::timestamp_type, std::vector<shared_sstable>>& tasks,
-        int min_threshold, int max_threshold);
-
     friend class time_window_backlog_tracker;
 public:
-    virtual int64_t estimated_pending_compactions(table_state& table_s) const override {
-        return get_state(table_s).estimated_remaining_tasks;
-    }
+    virtual int64_t estimated_pending_compactions(table_state& table_s) const override;
 
     virtual compaction_strategy_type type() const override {
         return compaction_strategy_type::time_window;
@@ -168,7 +162,7 @@ public:
         return true;
     }
 
-    virtual compaction_descriptor get_reshaping_job(std::vector<shared_sstable> input, schema_ptr schema, reshape_mode mode) const override;
+    virtual compaction_descriptor get_reshaping_job(std::vector<shared_sstable> input, schema_ptr schema, reshape_config cfg) const override;
 };
 
 }

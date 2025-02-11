@@ -3,12 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include "mutation_partition.hh"
 #include "mutation_fragment.hh"
 #include "position_in_partition.hh"
 
@@ -16,9 +15,6 @@
 #include <optional>
 #include <seastar/util/optimized_optional.hh>
 
-#include <seastar/core/future-util.hh>
-
-#include "db/timeout_clock.hh"
 #include "reader_permit.hh"
 
 // Mutation fragment which represents a range tombstone boundary.
@@ -78,7 +74,7 @@ public:
 };
 
 template<>
-struct fmt::formatter<range_tombstone_change> : fmt::formatter<std::string_view> {
+struct fmt::formatter<range_tombstone_change> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const range_tombstone_change& rt, FormatContext& ctx) const {
         return fmt::format_to(ctx.out(), "{{range_tombstone_change: pos={}, {}}}", rt.position(), rt.tombstone());
@@ -360,9 +356,9 @@ public:
         printer(const printer&) = delete;
         printer(printer&&) = delete;
 
-        friend std::ostream& operator<<(std::ostream& os, const printer& p);
+        friend fmt::formatter<printer>;
     };
-    friend std::ostream& operator<<(std::ostream& os, const printer& p);
+    friend fmt::formatter<printer>;
 
 private:
     size_t calculate_memory_usage(const schema& s) const {
@@ -370,7 +366,36 @@ private:
     }
 };
 
+template <> struct fmt::formatter<mutation_fragment_v2::printer> : fmt::formatter<string_view> {
+    auto format(const mutation_fragment_v2::printer&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
 std::ostream& operator<<(std::ostream&, mutation_fragment_v2::kind);
+
+template <> struct fmt::formatter<mutation_fragment_v2::kind> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(mutation_fragment_v2::kind k, FormatContext& ctx) const {
+        string_view name = "UNEXPECTED";
+        switch (k) {
+        case mutation_fragment_v2::kind::static_row:
+            name = "static row";
+            break;
+        case mutation_fragment_v2::kind::clustering_row:
+            name = "clustering row";
+            break;
+       case mutation_fragment_v2::kind::range_tombstone_change:
+            name = "range tombstone change";
+            break;
+        case mutation_fragment_v2::kind::partition_start:
+            name = "partition start";
+            break;
+        case mutation_fragment_v2::kind::partition_end:
+            name = "partition end";
+            break;
+        }
+        return formatter<string_view>::format(name, ctx);
+    }
+};
 
 // F gets a stream element as an argument and returns the new value which replaces that element
 // in the transformed stream.

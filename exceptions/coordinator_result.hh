@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -32,7 +32,8 @@ using coordinator_exception_container = utils::exception_container<
     mutation_write_timeout_exception,
     read_timeout_exception,
     read_failure_exception,
-    rate_limit_exception
+    rate_limit_exception,
+    overloaded_exception
 >;
 
 template<typename T = void>

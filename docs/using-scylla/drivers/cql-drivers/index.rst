@@ -20,43 +20,36 @@ We recommend using ScyllaDB drivers. All ScyllaDB drivers are shard-aware and pr
 benefits over third-party drivers.
 
 ScyllaDB supports the CQL binary protocol version 3, so any Apache Cassandra/CQL driver that implements 
-the same version works with Scylla.
+the same version works with ScyllaDB.
 
 The following table lists the available ScyllaDB drivers, specifying which support
 `ScyllaDB Cloud Serversless <https://cloud.docs.scylladb.com/stable/serverless/index.html>`_ 
-or include a library for :doc:`CDC </using-scylla/cdc/cdc-intro>`.
+or include a library for :doc:`CDC </features/cdc/cdc-intro>`.
 
 .. list-table:: 
-   :widths: 25 25 25 25
+   :widths: 30 35 35 
    :header-rows: 1
 
    * - 
      - ScyllaDB Driver
-     - ScyllaDB Cloud Serverless
      - CDC Connector
    * - :doc:`Python</using-scylla/drivers/cql-drivers/scylla-python-driver>`
      - |v| 
-     - |v|
      - |x| 
    * - :doc:`Java </using-scylla/drivers/cql-drivers/scylla-java-driver>`
      - |v| 
      - |v|
-     - |v|
    * - :doc:`Go </using-scylla/drivers/cql-drivers/scylla-go-driver>`
      - |v| 
-     - |v|
      - |v|
    * - :doc:`Go Extension </using-scylla/drivers/cql-drivers/scylla-gocqlx-driver>`
      - |v|
      - |x| 
-     - |x| 
    * - :doc:`C++ </using-scylla/drivers/cql-drivers/scylla-cpp-driver>`
      - |v|
      - |x| 
-     - |x| 
    * - :doc:`Rust </using-scylla/drivers/cql-drivers/scylla-rust-driver>`
      - |v| 
-     - |v|
      - |v| 
 
 
@@ -73,7 +66,6 @@ You can find the third-party driver documentation on the GitHub pages for each d
 * `DataStax C++ Driver <https://github.com/datastax/cpp-driver/>`_
 * `DataStax PHP Driver (Supported versions: 7.1)  <https://github.com/datastax/php-driver>`_
 * `He4rt PHP Driver (Supported versions: 8.1 and 8.2)  <https://github.com/he4rt/scylladb-php-driver/>`_
-* `Rust <https://github.com/AlexPikalov/cdrs>`_
 * `Scala Phantom Project <https://github.com/outworkers/phantom>`_
 * `Xandra Elixir Driver <https://github.com/lexhide/xandra>`_
 

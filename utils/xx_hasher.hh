@@ -3,12 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include "bytes.hh"
+#include "bytes_fwd.hh"
 #include "utils/serialization.hh"
 
 #pragma GCC diagnostic push
@@ -53,11 +53,4 @@ private:
         serialize_int64(out, 0);
         serialize_int64(out, finalize_uint64());
     }
-};
-
-// Used to specialize templates in order to fix a bug
-// in handling null values: #4567
-class legacy_xx_hasher_without_null_digest : public xx_hasher {
-public:
-    explicit legacy_xx_hasher_without_null_digest(uint64_t seed = 0) noexcept : xx_hasher(seed) {}
 };

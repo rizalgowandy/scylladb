@@ -3,15 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include "sstables/consumer.hh"
 #include "sstables/types.hh"
 #include "sstables/column_translation.hh"
-#include "sstables/m_format_read_helpers.hh"
+#include "sstables/mx/types.hh"
 #include "mutation/position_in_partition.hh"
 
 namespace sstables {
@@ -25,20 +26,22 @@ namespace mc {
 //   while (cp.consume(next_buf()) == read_status::waiting) {}
 //   position_in_partition pos = cp.get();
 //
+template <ContiguousSharedBuffer Buffer>
 class clustering_parser {
+    using FragmentedBuffer = basic_fragmented_buffer<Buffer>;
     const schema& _s;
-    column_values_fixed_lengths _clustering_values_fixed_lengths;
+    const column_values_fixed_lengths& _clustering_values_fixed_lengths;
     bool _parsing_start_key;
-    boost::iterator_range<column_values_fixed_lengths::const_iterator> ck_range;
+    std::ranges::subrange<column_values_fixed_lengths::const_iterator> ck_range;
 
-    std::vector<fragmented_temporary_buffer> clustering_key_values;
+    std::vector<FragmentedBuffer> clustering_key_values;
     bound_kind_m kind{};
 
-    fragmented_temporary_buffer column_value;
+    FragmentedBuffer column_value;
     uint64_t ck_blocks_header = 0;
     uint32_t ck_blocks_header_offset = 0;
     std::optional<position_in_partition> _pos;
-    data_consumer::primitive_consumer _primitive;
+    data_consumer::primitive_consumer_impl<Buffer> _primitive;
 
     enum class state {
         CLUSTERING_START,
@@ -62,7 +65,7 @@ class clustering_parser {
     bool no_more_ck_blocks() const { return ck_range.empty(); }
 
     void move_to_next_ck_block() {
-        ck_range.advance_begin(1);
+        ck_range.advance(1);
         ++ck_blocks_header_offset;
         if (ck_blocks_header_offset == 32u) {
             ck_blocks_header_offset = 0u;
@@ -77,8 +80,8 @@ class clustering_parser {
     }
 
     position_in_partition make_position() {
-        auto key = clustering_key_prefix::from_range(clustering_key_values | boost::adaptors::transformed(
-            [] (const fragmented_temporary_buffer& b) { return fragmented_temporary_buffer::view(b); }));
+        auto key = clustering_key_prefix::from_range(clustering_key_values | std::views::transform(
+            [] (const FragmentedBuffer & b) { return typename FragmentedBuffer::view(b); }));
 
         if (kind == bound_kind_m::clustering) {
             return position_in_partition::for_key(std::move(key));
@@ -92,9 +95,9 @@ class clustering_parser {
 public:
     using read_status = data_consumer::read_status;
 
-    clustering_parser(const schema& s, reader_permit permit, column_values_fixed_lengths cvfl, bool parsing_start_key)
+    clustering_parser(const schema& s, reader_permit permit, const column_values_fixed_lengths& cvfl, bool parsing_start_key)
         : _s(s)
-        , _clustering_values_fixed_lengths(std::move(cvfl))
+        , _clustering_values_fixed_lengths(cvfl)
         , _parsing_start_key(parsing_start_key)
         , _primitive(std::move(permit))
     { }
@@ -107,7 +110,7 @@ public:
 
     // Feeds the data into the state machine.
     // Returns read_status::ready when !active() after the call.
-    read_status consume(temporary_buffer<char>& data) {
+    read_status consume(Buffer& data) {
         if (_primitive.consume(data) == read_status::waiting) {
             return read_status::waiting;
         }
@@ -117,7 +120,7 @@ public:
         case state::CLUSTERING_START:
             clustering_key_values.clear();
             clustering_key_values.reserve(_clustering_values_fixed_lengths.size());
-            ck_range = boost::make_iterator_range(_clustering_values_fixed_lengths);
+            ck_range = std::ranges::subrange(_clustering_values_fixed_lengths);
             ck_blocks_header_offset = 0u;
             if (_primitive.read_8(data) != read_status::ready) {
                 _state = state::CK_KIND;
@@ -137,7 +140,9 @@ public:
             [[fallthrough]];
         case state::CK_SIZE:
             if (_primitive._u16 < _s.clustering_key_size()) {
-                ck_range.drop_back(_s.clustering_key_size() - _primitive._u16);
+                auto num_to_drop = _s.clustering_key_size() - _primitive._u16;
+                ck_range = std::ranges::subrange(ck_range.begin(),
+                                                 ck_range.end() - num_to_drop);
             }
             [[fallthrough]];
         case state::CK_BLOCK:
@@ -201,12 +206,15 @@ public:
     }
 
     void reset() {
+        _parsing_start_key = true;
         _state = state::CLUSTERING_START;
+        _primitive.reset();
     }
 };
 
+template <ContiguousSharedBuffer Buffer>
 class promoted_index_block_parser {
-    clustering_parser _clustering;
+    clustering_parser<Buffer> _clustering;
 
     std::optional<position_in_partition> _start_pos;
     std::optional<position_in_partition> _end_pos;
@@ -227,12 +235,12 @@ class promoted_index_block_parser {
         DONE,
     } _state = state::START;
 
-    data_consumer::primitive_consumer _primitive;
+    data_consumer::primitive_consumer_impl<Buffer> _primitive;
 public:
     using read_status = data_consumer::read_status;
 
-    promoted_index_block_parser(const schema& s, reader_permit permit, column_values_fixed_lengths cvfl)
-        : _clustering(s, permit, std::move(cvfl), true)
+    promoted_index_block_parser(const schema& s, reader_permit permit, const column_values_fixed_lengths& cvfl)
+        : _clustering(s, permit, cvfl, true)
         , _primitive(permit)
     { }
 
@@ -245,7 +253,7 @@ public:
     // Feeds the data into the state machine.
     // Returns read_status::ready when whole block was parsed.
     // If returns read_status::waiting then data.empty() after the call.
-    read_status consume(temporary_buffer<char>& data) {
+    read_status consume(Buffer& data) {
         static constexpr size_t width_base = 65536;
         if (_primitive.consume(data) == read_status::waiting) {
             return read_status::waiting;
@@ -282,7 +290,7 @@ public:
             }
             [[fallthrough]];
         case state::END_OPEN_MARKER_FLAG:
-            assert(_primitive._i64 + width_base > 0);
+            SCYLLA_ASSERT(_primitive._i64 + width_base > 0);
             _width = (_primitive._i64 + width_base);
             if (_primitive.read_8(data) != read_status::ready) {
                 _state = state::END_OPEN_MARKER_LOCAL_DELETION_TIME;
@@ -317,7 +325,7 @@ public:
 
     void reset() {
         _end_open_marker.reset();
-        _clustering.set_parsing_start_key(true);
+        _clustering.reset();
         _state = state::START;
     }
 };

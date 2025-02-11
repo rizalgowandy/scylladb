@@ -3,16 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "mutation_writer/shard_based_splitting_writer.hh"
 
-#include <cinttypes>
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/range/algorithm/min_element.hpp>
 #include <seastar/core/shared_mutex.hh>
 #include "dht/i_partitioner.hh"
+#include "mutation_writer/feed_writers.hh"
 
 namespace mutation_writer {
 
@@ -83,7 +81,7 @@ public:
     }
 };
 
-future<> segregate_by_shard(flat_mutation_reader_v2 producer, reader_consumer_v2 consumer) {
+future<> segregate_by_shard(mutation_reader producer, reader_consumer_v2 consumer) {
     auto schema = producer.schema();
     auto permit = producer.permit();
     return feed_writer(

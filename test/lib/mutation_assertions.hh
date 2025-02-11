@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -12,7 +12,7 @@
 
 #include "mutation/mutation.hh"
 #include "mutation/mutation_fragment_stream_validator.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "clustering_interval_set.hh"
 #include "mutation/mutation_partition_v2.hh"
 #include "dht/i_partitioner.hh"
@@ -108,12 +108,12 @@ public:
     }
 };
 
-static inline
+inline
 mutation_partition_assertion assert_that(schema_ptr s, const mutation_partition& mp) {
     return {std::move(s), mp};
 }
 
-static inline
+inline
 mutation_partition_assertion assert_that(schema_ptr s, const mutation_partition_v2& mp) {
     return {s, mp.as_mutation_partition(*s)};
 }
@@ -184,7 +184,7 @@ public:
     }
 };
 
-static inline
+inline
 mutation_assertion assert_that(mutation m) {
     return { std::move(m) };
 }
@@ -208,7 +208,7 @@ public:
     }
 };
 
-static inline
+inline
 mutation_opt_assertions assert_that(mutation_opt mo) {
     return { std::move(mo) };
 }

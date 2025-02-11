@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -20,6 +20,9 @@ class cql_test_env;
 namespace tests {
 
 class random_schema_specification {
+public:
+    using compress_sstable = bool_class<class compress_sstable_tag>;
+private:
     sstring _keyspace_name;
 public:
     explicit random_schema_specification(sstring keyspace_name) : _keyspace_name(std::move(keyspace_name)) { }
@@ -34,6 +37,7 @@ public:
     virtual std::vector<data_type> clustering_key_columns(std::mt19937& engine) = 0;
     virtual std::vector<data_type> regular_columns(std::mt19937& engine) = 0;
     virtual std::vector<data_type> static_columns(std::mt19937& engine) = 0;
+    virtual compress_sstable& compress() = 0;
 };
 
 /// Helper class that can generate a subset of all valid combination of types.
@@ -68,7 +72,8 @@ std::unique_ptr<random_schema_specification> make_random_schema_specification(
         std::uniform_int_distribution<size_t> partition_column_count_dist = std::uniform_int_distribution<size_t>(1, 4),
         std::uniform_int_distribution<size_t> clustering_column_count_dist = std::uniform_int_distribution<size_t>(0, 4),
         std::uniform_int_distribution<size_t> regular_column_count_dist = std::uniform_int_distribution<size_t>(1, 4),
-        std::uniform_int_distribution<size_t> static_column_count_dist = std::uniform_int_distribution<size_t>(0, 4));
+        std::uniform_int_distribution<size_t> static_column_count_dist = std::uniform_int_distribution<size_t>(0, 4),
+        random_schema_specification::compress_sstable compress = random_schema_specification::compress_sstable::yes);
 
 /// Generate values for any type.
 ///
@@ -130,6 +135,11 @@ using timestamp_generator = std::function<api::timestamp_type(std::mt19937& engi
 ///     [api::min_timestamp, api::max_timestamp]
 /// Ignores timestamp destination.
 timestamp_generator default_timestamp_generator();
+
+/// Use this to generate mutations that cannot be compacted
+///
+/// Tombstones will not cover lower level tombstones, or data.
+timestamp_generator uncompactible_timestamp_generator(uint32_t seed);
 
 struct expiry_info {
     gc_clock::duration ttl;
@@ -234,7 +244,7 @@ public:
     void delete_range(
             std::mt19937& engine,
             data_model::mutation_description& md,
-            nonwrapping_range<data_model::mutation_description::key> range,
+            interval<data_model::mutation_description::key> range,
             timestamp_generator ts_gen = default_timestamp_generator(),
             expiry_generator exp_gen = no_expiry_expiry_generator());
 };

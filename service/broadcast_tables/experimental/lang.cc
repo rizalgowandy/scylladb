@@ -3,17 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include "lang.hh"
 
 #include <seastar/core/future.hh>
 
 #include "data_dictionary/data_dictionary.hh"
-#include "db/config.hh"
 #include "db/system_keyspace.hh"
-#include "exceptions/exceptions.hh"
 #include "service/broadcast_tables/experimental/query_result.hh"
 #include "service/raft/raft_group0_client.hh"
 #include "partition_slice_builder.hh"
@@ -30,7 +29,7 @@ bool is_broadcast_table_statement(const sstring& keyspace, const sstring& column
 future<query_result> execute(service::raft_group0_client& group0_client, const query& query) {
     auto group0_cmd = group0_client.prepare_command(broadcast_table_query{query}, "broadcast_tables query");
     auto guard = group0_client.create_result_guard(group0_cmd.new_state_id);
-    co_await group0_client.add_entry_unguarded(std::move(group0_cmd));
+    co_await group0_client.add_entry_unguarded(std::move(group0_cmd), nullptr);
     co_return guard.get();
 }
 
@@ -75,7 +74,7 @@ future<query_result> execute_broadcast_table_query(
                 co_return query_result_select{};
             }
 
-            assert(rs->partitions().size() == 1); // In this version only one value per partition key is allowed.
+            SCYLLA_ASSERT(rs->partitions().size() == 1); // In this version only one value per partition key is allowed.
 
             const auto& p = rs->partitions()[0];
             auto mutation = p.mut().unfreeze(schema);
@@ -94,7 +93,7 @@ future<query_result> execute_broadcast_table_query(
 
             bool found = !rs->partitions().empty();
 
-            assert(!found || rs->partitions().size() == 1); // In this version at most one value per partition key is allowed.
+            SCYLLA_ASSERT(!found || rs->partitions().size() == 1); // In this version at most one value per partition key is allowed.
 
             auto new_mutation = found
                 ? rs->partitions()[0].mut().unfreeze(schema)

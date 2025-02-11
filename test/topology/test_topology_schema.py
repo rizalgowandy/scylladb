@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2022-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 """
 Test consistency of schema changes with server hard stop.
@@ -19,6 +19,7 @@ async def test_topology_schema_changes(manager, random_tables):
 
     # Test add column after server restart
     await manager.server_restart(servers[1].server_id)
+    await manager.servers_see_each_other(servers)
     await table.add_column()
     await random_tables.verify_schema()
 

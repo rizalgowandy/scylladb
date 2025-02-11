@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -54,7 +54,12 @@ public:
         printer(const printer&) = delete;
         printer(printer&&) = delete;
 
-        friend std::ostream& operator<<(std::ostream&, const printer&);
+        friend fmt::formatter<printer>;
     };
-    friend std::ostream& operator<<(std::ostream&, const printer&);
+    friend fmt::formatter<printer>;
+};
+
+template <>
+struct fmt::formatter<atomic_cell_or_collection::printer> : fmt::formatter<string_view> {
+    auto format(const atomic_cell_or_collection::printer&, fmt::format_context& ctx) const -> decltype(ctx.out());
 };

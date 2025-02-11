@@ -3,15 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <cstdint>
-#include <compare>
 #include <iostream>
-#include <type_traits>
+
+#include <fmt/core.h>
 
 namespace utils {
 
@@ -36,7 +35,6 @@ public:
     }
 
     value_type value() const noexcept { return _value; }
-    operator value_type() const noexcept { return _value; }
 
     explicit operator bool() const { return _value != 0; }
 
@@ -83,6 +81,15 @@ template <typename Tag, std::integral ValueType>
 using tagged_integer = tagged_tagged_integer<struct final, Tag, ValueType>;
 
 } // namespace utils
+
+template <typename Final, typename Tag, std::integral ValueType>
+struct fmt::formatter<utils::tagged_tagged_integer<Final, Tag, ValueType>> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const utils::tagged_tagged_integer<Final, Tag, ValueType>& x,
+		fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", x.value());
+    }
+};
 
 namespace std {
 

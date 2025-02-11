@@ -3,10 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #undef SEASTAR_TESTING_MAIN
+#include <fmt/std.h>
+#include "utils/to_string.hh"
 #include "replication.hh"
 
 seastar::logger tlogger("test");
@@ -40,7 +42,7 @@ size_t test_case::get_first_val() {
         first_val += initial_states[initial_leader].le.size();
     }
     if (initial_leader < initial_snapshots.size()) {
-        first_val = initial_snapshots[initial_leader].snap.idx;
+        first_val = initial_snapshots[initial_leader].snap.idx.value();
     }
     return first_val;
 }
@@ -64,7 +66,7 @@ size_t apply_changes(raft::server_id id, const std::vector<raft::command_cref>& 
 
     for (auto&& d : commands) {
         auto is = ser::as_input_stream(d);
-        int n = ser::deserialize(is, boost::type<int>());
+        int n = ser::deserialize(is, std::type_identity<int>());
         if (n != dummy_command) {
             entries++;
             hasher->update(n);      // running hash (values and snapshots)
@@ -74,16 +76,16 @@ size_t apply_changes(raft::server_id id, const std::vector<raft::command_cref>& 
     return entries;
 }
 
-std::vector<raft::log_entry> create_log(std::vector<log_entry> list, unsigned start_idx) {
+std::vector<raft::log_entry> create_log(std::vector<log_entry> list, raft::index_t start_idx) {
     std::vector<raft::log_entry> log;
 
-    unsigned i = start_idx;
+    raft::index_t i = start_idx;
     for (auto e : list) {
         if (std::holds_alternative<int>(e.data)) {
-            log.push_back(raft::log_entry{raft::term_t(e.term), raft::index_t(i++),
+            log.push_back(raft::log_entry{raft::term_t(e.term), i++,
                     create_command(std::get<int>(e.data))});
         } else {
-            log.push_back(raft::log_entry{raft::term_t(e.term), raft::index_t(i++),
+            log.push_back(raft::log_entry{raft::term_t(e.term), i++,
                     std::get<raft::configuration>(e.data)});
         }
     }

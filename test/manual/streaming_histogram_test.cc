@@ -3,14 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #define BOOST_TEST_MODULE core
 
 #include <boost/test/unit_test.hpp>
 #include "utils/streaming_histogram.hh"
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <map>
 #include <cmath>
 

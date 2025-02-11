@@ -1,13 +1,14 @@
 #
 # Copyright 2023-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
 import enum
 import pytest
-from rest_api_mock import expected_request
-import utils
+
+from test.nodetool.utils import check_nodetool_fails_with
+from test.nodetool.rest_api_mock import expected_request
 
 
 class scrub_status(enum.Enum):
@@ -15,6 +16,14 @@ class scrub_status(enum.Enum):
     aborted = 1
     unable_to_cancel = 2  # not used by ScyllaDB
     validation_errors = 3
+
+
+def test_scrub(nodetool):
+    nodetool("scrub", expected_requests=[
+        expected_request("GET", "/storage_service/keyspaces", response=["ks1", "ks2"],
+                         multiple=expected_request.MULTIPLE),
+        expected_request("GET", "/storage_service/keyspace_scrub/ks1", response=scrub_status.successful.value),
+        expected_request("GET", "/storage_service/keyspace_scrub/ks2", response=scrub_status.successful.value)])
 
 
 def test_scrub_keyspace(nodetool):
@@ -37,17 +46,8 @@ def test_scrub_two_tables(nodetool):
                          response=scrub_status.successful.value)])
 
 
-# Cassandra parser completely borks when positional args are missing
-def test_scrub_nokeyspace(nodetool, scylla_only):
-    utils.check_nodetool_fails_with(
-            nodetool,
-            ("scrub",),
-            {},
-            ["error processing arguments: missing mandatory positional argument: keyspace"])
-
-
 def test_scrub_non_existent_keyspace(nodetool):
-    utils.check_nodetool_fails_with(
+    check_nodetool_fails_with(
             nodetool,
             ("scrub", "non_existent_ks"),
             {"expected_requests": [expected_request("GET", "/storage_service/keyspaces", response=["ks"])]},
@@ -106,7 +106,7 @@ def test_scrub_skip_corrupted(nodetool):
 
 
 def test_scrub_skip_corrupted_with_mode(nodetool):
-    utils.check_nodetool_fails_with(
+    check_nodetool_fails_with(
             nodetool,
             ("scrub", "ks", "--skip-corrupted", "--mode", "ABORT"),
             {"expected_requests": [expected_request("GET", "/storage_service/keyspaces", response=["ks"])]},
@@ -143,13 +143,25 @@ def test_scrub_validation_errors_exit_code(nodetool, scylla_only):
         expected_request("GET", "/storage_service/keyspace_scrub/ks", params={"scrub_mode": "VALIDATE"},
                          response=scrub_status.successful.value)])
 
-    utils.check_nodetool_fails_with(
+    check_nodetool_fails_with(
             nodetool,
             ("scrub", "ks", "--mode=VALIDATE"),
             {"expected_requests": [
                     expected_request("GET", "/storage_service/keyspaces", response=["ks"]),
                     expected_request("GET", "/storage_service/keyspace_scrub/ks", params={"scrub_mode": "VALIDATE"},
                                      response=scrub_status.validation_errors.value)]},
+            ["scrub failed: there are invalid sstables"])
+
+    # Check that when the first scrub fails, nodetool goes on to scrub the remainder
+    check_nodetool_fails_with(
+            nodetool,
+            ("scrub", "--mode=VALIDATE"),
+            {"expected_requests": [
+                    expected_request("GET", "/storage_service/keyspaces", response=["ks1", "ks2"]),
+                    expected_request("GET", "/storage_service/keyspace_scrub/ks1", params={"scrub_mode": "VALIDATE"},
+                                     response=scrub_status.validation_errors.value),
+                    expected_request("GET", "/storage_service/keyspace_scrub/ks2", params={"scrub_mode": "VALIDATE"},
+                                     response=scrub_status.successful.value)]},
             ["scrub failed: there are invalid sstables"])
 
 
@@ -159,11 +171,23 @@ def test_scrub_abort_exit_code(nodetool, scylla_only):
         expected_request("GET", "/storage_service/keyspace_scrub/ks", params={"scrub_mode": "ABORT"},
                          response=scrub_status.successful.value)])
 
-    utils.check_nodetool_fails_with(
+    check_nodetool_fails_with(
             nodetool,
             ("scrub", "ks", "--mode=ABORT"),
             {"expected_requests": [
                     expected_request("GET", "/storage_service/keyspaces", response=["ks"]),
                     expected_request("GET", "/storage_service/keyspace_scrub/ks", params={"scrub_mode": "ABORT"},
                                      response=scrub_status.aborted.value)]},
+            ["scrub failed: aborted"])
+
+    # Check that when the first scrub fails, nodetool goes on to scrub the remainder
+    check_nodetool_fails_with(
+            nodetool,
+            ("scrub", "--mode=ABORT"),
+            {"expected_requests": [
+                    expected_request("GET", "/storage_service/keyspaces", response=["ks1", "ks2"]),
+                    expected_request("GET", "/storage_service/keyspace_scrub/ks1", params={"scrub_mode": "ABORT"},
+                                     response=scrub_status.aborted.value),
+                    expected_request("GET", "/storage_service/keyspace_scrub/ks2", params={"scrub_mode": "ABORT"},
+                                     response=scrub_status.successful.value)]},
             ["scrub failed: aborted"])

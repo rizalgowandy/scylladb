@@ -3,13 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <boost/test/unit_test.hpp>
 
 #include "test/lib/result_set_assertions.hh"
-#include "utils/to_string.hh"
 
 static inline
 sstring to_sstring(const bytes& b) {
@@ -49,7 +48,7 @@ row_assertion::matches(const query::result_set_row& row) const {
 
 sstring
 row_assertion::describe(schema_ptr schema) const {
-    return format("{{{}}}", fmt::join(_expected_values | boost::adaptors::transformed([&schema] (auto&& e) {
+    return seastar::format("{{{}}}", fmt::join(_expected_values | std::views::transform([&schema] (auto&& e) {
         auto&& name = e.first;
         auto&& value = e.second;
         const column_definition* def = schema->get_column_definition(name);

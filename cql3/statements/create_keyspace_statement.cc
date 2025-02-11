@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include <seastar/core/coroutine.hh>
@@ -17,7 +17,6 @@
 #include "mutation/mutation.hh"
 #include "service/migration_manager.hh"
 #include "service/storage_proxy.hh"
-#include "transport/messages/result_message.hh"
 #include "cql3/query_processor.hh"
 #include "db/config.hh"
 #include "gms/feature_service.hh"
@@ -89,42 +88,70 @@ void create_keyspace_statement::validate(query_processor& qp, const service::cli
 #endif
 }
 
-future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>> create_keyspace_statement::prepare_schema_mutations(query_processor& qp, api::timestamp_type ts) const {
+future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>> create_keyspace_statement::prepare_schema_mutations(query_processor& qp, const query_options&, api::timestamp_type ts) const {
     using namespace cql_transport;
     const auto& tm = *qp.proxy().get_token_metadata_ptr();
-    ::shared_ptr<event::schema_change> ret;
+    const auto& feat = qp.proxy().features();
+    const auto& cfg = qp.db().get_config();
     std::vector<mutation> m;
+    std::vector<sstring> warnings;
 
     try {
-        m = service::prepare_new_keyspace_announcement(qp.db().real_database(), _attrs->as_ks_metadata(_name, tm), ts);
-
-        ret = ::make_shared<event::schema_change>(
-                event::schema_change::change_type::CREATED,
-                event::schema_change::target_type::KEYSPACE,
-                keyspace());
+        auto ksm = _attrs->as_ks_metadata(_name, tm, feat, cfg);
+        m = service::prepare_new_keyspace_announcement(qp.db().real_database(), ksm, ts);
+        // If the new keyspace uses tablets, as long as there are features
+        // which aren't supported by tablets we want to warn the user that
+        // they will not be usable on the new keyspace - and suggest how a
+        // keyspace can be created without tablets (see rationale in #16807).
+        // Once all feature will become supported with tablets, we should
+        // remove this check.
+        auto rs = locator::abstract_replication_strategy::create_replication_strategy(
+            ksm->strategy_name(),
+            locator::replication_strategy_params(ksm->strategy_options(), ksm->initial_tablets()));
+        if (rs->uses_tablets()) {
+            warnings.push_back(
+                "Tables in this keyspace will be replicated using Tablets "
+                "and will not support CDC, LWT and counters features. "
+                "To use CDC, LWT or counters, drop this keyspace and re-create it "
+                "without tablets by adding AND TABLETS = {'enabled': false} "
+                "to the CREATE KEYSPACE statement.");
+            if (ksm->initial_tablets().value()) {
+                warnings.push_back("Keyspace `initial` tablets option is deprecated.  Use per-table tablet options instead.");
+            }
+        }
     } catch (const exceptions::already_exists_exception& e) {
         if (!_if_not_exists) {
           co_return coroutine::exception(std::current_exception());
         }
     }
 
-    co_return std::make_tuple(std::move(ret), std::move(m), std::vector<sstring>());
+    // If an IF NOT EXISTS clause was used and resource was already created
+    // we shouldn't emit created event. However it interacts badly with
+    // concurrent clients creating resources. The client seeing no create event
+    // assumes resource already previously existed and proceeds with its logic
+    // which may depend on that resource. But it may send requests to nodes which
+    // are not yet aware of new schema or client's metadata may be outdated.
+    // To force synchronization always emit the event (see
+    // github.com/scylladb/scylladb/issues/16909).
+    co_return std::make_tuple(created_event(), std::move(m), std::move(warnings));
 }
 
 std::unique_ptr<cql3::statements::prepared_statement>
 cql3::statements::create_keyspace_statement::prepare(data_dictionary::database db, cql_stats& stats) {
-    return std::make_unique<prepared_statement>(make_shared<create_keyspace_statement>(*this));
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<create_keyspace_statement>(*this));
 }
 
-future<> cql3::statements::create_keyspace_statement::grant_permissions_to_creator(const service::client_state& cs) const {
-    return do_with(auth::make_data_resource(keyspace()), [&cs](const auth::resource& r) {
-        return auth::grant_applicable_permissions(
+future<> cql3::statements::create_keyspace_statement::grant_permissions_to_creator(const service::client_state& cs, service::group0_batch& mc) const {
+    auto resource = auth::make_data_resource(keyspace());
+    try {
+        co_await auth::grant_applicable_permissions(
                 *cs.get_auth_service(),
                 *cs.user(),
-                r).handle_exception_type([](const auth::unsupported_authorization_operation&) {
-            // Nothing.
-        });
-    });
+                resource,
+                mc);
+    } catch (const auth::unsupported_authorization_operation&) {
+        // Nothing.
+    }
 }
 
 // Check for replication strategy choices which are restricted by the
@@ -146,9 +173,11 @@ std::vector<sstring> check_against_restricted_replication_strategies(
     }
 
     std::vector<sstring> warnings;
+    locator::replication_strategy_config_options opts;
+    locator::replication_strategy_params params(opts, std::nullopt);
     auto replication_strategy = locator::abstract_replication_strategy::create_replication_strategy(
             locator::abstract_replication_strategy::to_qualified_class_name(
-                    *attrs.get_replication_strategy_class()), {})->get_type();
+                    *attrs.get_replication_strategy_class()), params)->get_type();
     auto rs_warn_list = qp.db().get_config().replication_strategy_warn_list();
     auto rs_fail_list = qp.db().get_config().replication_strategy_fail_list();
 
@@ -253,9 +282,16 @@ create_keyspace_statement::execute(query_processor& qp, service::query_state& st
     });
 }
 
-lw_shared_ptr<data_dictionary::keyspace_metadata> create_keyspace_statement::get_keyspace_metadata(const locator::token_metadata& tm) {
+lw_shared_ptr<data_dictionary::keyspace_metadata> create_keyspace_statement::get_keyspace_metadata(const locator::token_metadata& tm, const gms::feature_service& feat, const db::config& cfg) {
     _attrs->validate();
-    return _attrs->as_ks_metadata(_name, tm);
+    return _attrs->as_ks_metadata(_name, tm, feat, cfg);
+}
+
+::shared_ptr<schema_altering_statement::event_t> create_keyspace_statement::created_event() const {
+    return make_shared<event_t>(
+            event_t::change_type::CREATED,
+            event_t::target_type::KEYSPACE,
+            keyspace());
 }
 
 }

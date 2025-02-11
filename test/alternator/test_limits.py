@@ -1,15 +1,17 @@
 # Copyright 2021-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 #############################################################################
 # Tests for various limits, which did not fit naturally into other test files
 #############################################################################
 
 import pytest
-from util import random_string, new_test_table, full_query
 from botocore.exceptions import ClientError
-from test_gsi import assert_index_query
+
+from test.alternator.util import random_string, new_test_table, full_query
+from test.alternator.test_gsi import assert_index_query
+
 
 #############################################################################
 # The following tests check the limits on attribute name lengths.

@@ -3,11 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include "types/types.hh"
 #include "keys.hh"
 #include "clustering_bounds_comparator.hh"
@@ -83,18 +84,18 @@ enum class partition_region : uint8_t {
 struct view_and_holder;
 
 template <>
-struct fmt::formatter<partition_region> : fmt::formatter<std::string_view> {
+struct fmt::formatter<partition_region> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const ::partition_region& r, FormatContext& ctx) const {
         switch (r) {
             case partition_region::partition_start:
-                return formatter<std::string_view>::format("partition_start", ctx);
+                return formatter<string_view>::format("partition_start", ctx);
             case partition_region::static_row:
-                return formatter<std::string_view>::format("static_row", ctx);
+                return formatter<string_view>::format("static_row", ctx);
             case partition_region::clustered:
-                return formatter<std::string_view>::format("clustered", ctx);
+                return formatter<string_view>::format("clustered", ctx);
             case partition_region::partition_end:
-                return formatter<std::string_view>::format("partition_end", ctx);
+                return formatter<string_view>::format("partition_end", ctx);
         }
         std::abort(); // compiler will error before we reach here
     }
@@ -238,12 +239,12 @@ public:
 
     // Can be called only when !is_static_row && !is_clustering_row().
     bound_view as_start_bound_view() const {
-        assert(_bound_weight != bound_weight::equal);
+        SCYLLA_ASSERT(_bound_weight != bound_weight::equal);
         return bound_view(*_ck, _bound_weight == bound_weight::before_all_prefixed ? bound_kind::incl_start : bound_kind::excl_start);
     }
 
     bound_view as_end_bound_view() const {
-        assert(_bound_weight != bound_weight::equal);
+        SCYLLA_ASSERT(_bound_weight != bound_weight::equal);
         return bound_view(*_ck, _bound_weight == bound_weight::before_all_prefixed ? bound_kind::excl_end : bound_kind::incl_end);
     }
 
@@ -266,7 +267,7 @@ public:
 };
 
 template <>
-struct fmt::formatter<position_in_partition_view> : fmt::formatter<std::string_view> {
+struct fmt::formatter<position_in_partition_view> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const ::position_in_partition_view& pos, FormatContext& ctx) const {
         fmt::format_to(ctx.out(), "{{position: {}, ", pos._type);
@@ -280,7 +281,7 @@ struct fmt::formatter<position_in_partition_view> : fmt::formatter<std::string_v
 };
 
 template <>
-struct fmt::formatter<position_in_partition_view::printer> : fmt::formatter<std::string_view> {
+struct fmt::formatter<position_in_partition_view::printer> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const ::position_in_partition_view::printer& p, FormatContext& ctx) const {
         auto& pos = p._pipv;
@@ -634,7 +635,6 @@ public:
             return compare(a, b);
         }
     };
-    friend std::ostream& operator<<(std::ostream&, const position_in_partition&);
 
     // Create a position which is the same as this one but governed by a schema with reversed clustering key order.
     position_in_partition reversed() const& {
@@ -648,7 +648,7 @@ public:
 };
 
 template <>
-struct fmt::formatter<position_in_partition> : fmt::formatter<std::string_view> {
+struct fmt::formatter<position_in_partition> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const ::position_in_partition& pos, FormatContext& ctx) const {
         return fmt::format_to(ctx.out(), "{}", position_in_partition_view(pos));
@@ -784,8 +784,6 @@ public:
     // Returns true iff this range contains all keys contained by position_range(start, end).
     bool contains(const schema& s, position_in_partition_view start, position_in_partition_view end) const;
     bool is_all_clustered_rows(const schema&) const;
-
-    friend std::ostream& operator<<(std::ostream&, const position_range&);
 };
 
 class clustering_interval_set;
@@ -818,3 +816,9 @@ bool position_range::is_all_clustered_rows(const schema& s) const {
 //
 // If `r` does not contain any keys, returns nullopt.
 std::optional<query::clustering_range> position_range_to_clustering_range(const position_range& r, const schema&);
+
+template <> struct fmt::formatter<position_range> : fmt::formatter<string_view> {
+    auto format(const position_range& range, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{{{}, {}}}", range.start(), range.end());
+    }
+};

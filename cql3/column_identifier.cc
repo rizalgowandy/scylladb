@@ -3,13 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "cql3/column_identifier.hh"
-#include "exceptions/exceptions.hh"
 #include "cql3/util.hh"
-#include "cql3/query_options.hh"
 
 namespace cql3 {
 
@@ -96,10 +94,6 @@ const sstring& column_identifier_raw::text() const {
 
 sstring column_identifier_raw::to_string() const {
     return _text;
-}
-
-std::ostream& operator<<(std::ostream& out, const column_identifier_raw& id) {
-    return out << id._text;
 }
 
 }

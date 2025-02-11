@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2022-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 """
 Test functionality on the cluster with different values of the --smp parameter on the nodes.
@@ -50,7 +50,7 @@ async def test_nodes_with_different_smp(request: FixtureRequest, manager: Manage
         log_args = [
             '--default-log-level', 'debug',
             '--logger-log-level', 'raft_group0=trace:group0_client=trace:storage_service=trace'
-                                  ':raft=trace:raft_group_registry=trace'
+                                  ':raft=trace:raft_group_registry=trace:raft_topology=trace'
         ]
 
     logger.info(f'Adding --smp=3 server')

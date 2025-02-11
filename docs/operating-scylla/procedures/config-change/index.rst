@@ -1,5 +1,5 @@
-Scylla Configuration Procedures
-===============================
+ScyllaDB Configuration Procedures
+=================================
 
 
 .. toctree::
@@ -8,18 +8,9 @@ Scylla Configuration Procedures
    How to Switch Snitches <switch-snitch>
    How to Change Compaction Strategy <change-compaction>
    How to do a Rolling Restart <rolling-restart>
+   Advanced Internode (RPC) Compression <advanced-internode-compression>
 
-.. raw:: html
-
-
-   <div class="panel callout radius animated">
-            <div class="row">
-              <div class="medium-3 columns">
-                <h5 id="getting-started">Scylla Configuration Procedures</h5>
-              </div>
-              <div class="medium-9 columns">
-
-Procedures to change Scylla Configuration settings.
+Procedures to change ScyllaDB Configuration settings.
 
 * :doc:`How to Switch Snitches </operating-scylla/procedures/config-change/switch-snitch/>`
 
@@ -27,10 +18,5 @@ Procedures to change Scylla Configuration settings.
 
 * :doc:`How to do a Rolling Restart </operating-scylla/procedures/config-change/rolling-restart/>`
 
-.. raw:: html
-
-   </div>
-   </div>
-   </div>
-
+* :doc:`Advanced Internode (RPC) Compression </operating-scylla/procedures/config-change/advanced-internode-compression>`
 

@@ -3,15 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-template <typename Dividend, typename Divisor>
-inline
-// requires Integral<Dividend> && Integral<Divisor>
-auto
-div_ceil(Dividend dividend, Divisor divisor) {
+#include <concepts>
+
+inline auto
+div_ceil(std::integral auto dividend, std::integral auto divisor) {
     return (dividend + divisor - 1) / divisor;
 }

@@ -3,14 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include <map>
 #include <seastar/core/future.hh>
-#include <seastar/core/future-util.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/shared_future.hh>
 
@@ -57,9 +57,9 @@ private:
 
     template<typename Func, typename Arg>
     static auto call_helper(Func&& func, future<Arg> f) {
-        using futurator = futurize<std::result_of_t<Func(Arg&&)>>;
+        using futurator = futurize<std::invoke_result_t<Func, Arg&&>>;
         try {
-            return futurator::invoke(std::forward<Func>(func), f.get0());
+            return futurator::invoke(std::forward<Func>(func), f.get());
         } catch (...) {
             return futurator::make_exception_future(std::current_exception());
         }
@@ -67,7 +67,7 @@ private:
 
     template<typename Func, typename... Args>
     static auto call_helper(Func&& func, future<std::tuple<Args...>> f) {
-        using futurator = futurize<std::result_of_t<Func(std::tuple<Args&&...>)>>;
+        using futurator = futurize<std::invoke_result_t<Func, std::tuple<Args&&...>>>;
         try {
             return futurator::invoke(std::forward<Func>(func), f.get());
         } catch (...) {
@@ -77,7 +77,7 @@ private:
 
     template<typename... Types>
     static future<Types...> handle_failed_future(future<Types...> f, promise_type& pr) {
-        assert(f.failed());
+        SCYLLA_ASSERT(f.failed());
         auto ep = std::move(f).get_exception();
         pr.set_exception(ep);
         return make_exception_future<Types...>(ep);
@@ -116,20 +116,20 @@ public:
         _gate.enter();
         _map[rp].count++;
 
-        using futurator = futurize<std::result_of_t<Func()>>;
+        using futurator = futurize<std::invoke_result_t<Func>>;
 
         return futurator::invoke(std::forward<Func>(func)).then_wrapped([this, rp, post = std::forward<Post>(post)](typename futurator::type f) mutable {
             auto i = _map.find(rp);
-            assert(i != _map.end());
+            SCYLLA_ASSERT(i != _map.end());
 
             using post_result = decltype(call_helper(std::forward<Post>(post), std::move(f)));
 
             auto run_post = [this, post = std::forward<Post>(post), f = std::move(f), i]() mutable {
-                assert(i == _map.begin());
+                SCYLLA_ASSERT(i == _map.begin());
                 return call_helper(std::forward<Post>(post), std::move(f)).then_wrapped([this, i](post_result f) {
                     if (--i->second.count == 0) {
                         auto pr = std::move(i->second.pr);
-                        assert(i == _map.begin());
+                        SCYLLA_ASSERT(i == _map.begin());
                         _map.erase(i);
                         if (f.failed() && _chain_exceptions) {
                             return handle_failed_future(std::move(f), pr);

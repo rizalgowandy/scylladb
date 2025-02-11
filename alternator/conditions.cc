@@ -3,23 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <list>
-#include <map>
 #include <string_view>
 #include "alternator/conditions.hh"
 #include "alternator/error.hh"
-#include "cql3/constants.hh"
 #include <unordered_map>
 #include "utils/rjson.hh"
 #include "serialization.hh"
 #include "utils/base64.hh"
 #include "utils/rjson.hh"
 #include <stdexcept>
-#include <boost/algorithm/cxx11/all_of.hpp>
-#include <boost/algorithm/cxx11/any_of.hpp>
 #include "utils/overloaded_functor.hh"
 
 #include "expressions.hh"
@@ -45,12 +40,12 @@ comparison_operator_type get_comparison_operator(const rjson::value& comparison_
             {"NOT_CONTAINS", comparison_operator_type::NOT_CONTAINS},
     };
     if (!comparison_operator.IsString()) {
-        throw api_error::validation(format("Invalid comparison operator definition {}", rjson::print(comparison_operator)));
+        throw api_error::validation(fmt::format("Invalid comparison operator definition {}", rjson::print(comparison_operator)));
     }
     std::string op = comparison_operator.GetString();
     auto it = ops.find(op);
     if (it == ops.end()) {
-        throw api_error::validation(format("Unsupported comparison operator {}", op));
+        throw api_error::validation(fmt::format("Unsupported comparison operator {}", op));
     }
     return it->second;
 }
@@ -432,7 +427,7 @@ static bool check_BETWEEN(const T& v, const T& lb, const T& ub, bool bounds_from
     if (cmp_lt()(ub, lb)) {
         if (bounds_from_query) {
             throw api_error::validation(
-                format("BETWEEN operator requires lower_bound <= upper_bound, but {} > {}", lb, ub));
+                fmt::format("BETWEEN operator requires lower_bound <= upper_bound, but {} > {}", lb, ub));
         } else {
             return false;
         }
@@ -616,7 +611,7 @@ conditional_operator_type get_conditional_operator(const rjson::value& req) {
         return conditional_operator_type::OR;
     } else {
         throw api_error::validation(
-                format("'ConditionalOperator' parameter must be AND, OR or missing. Found {}.", s));
+                fmt::format("'ConditionalOperator' parameter must be AND, OR or missing. Found {}.", s));
     }
 }
 
@@ -746,9 +741,9 @@ bool verify_condition_expression(
             };
             switch (list.op) {
             case '&':
-                return boost::algorithm::all_of(list.conditions, verify_condition);
+                return std::ranges::all_of(list.conditions, verify_condition);
             case '|':
-                return boost::algorithm::any_of(list.conditions, verify_condition);
+                return std::ranges::any_of(list.conditions, verify_condition);
             default:
                 // Shouldn't happen unless we have a bug in the parser
                 throw std::logic_error("bad operator in condition_list");

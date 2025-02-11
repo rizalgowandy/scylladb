@@ -3,7 +3,7 @@ Nodetool toppartitions
 
 **toppartitions** <keyspace> <table> <duration> - Samples cluster writes and reads and reports the most active partitions in a specified table and time frame.
 
-**toppartitions**  [<--ks-filters ks>] [<--cf-filters tables>] [<-d duration>]
+**toppartitions**  [<--ks-filters ks>] [<--cf-filters tables>] [<-d duration>] [<-s|--capacity capacity>] [<-a|--samplers samplers>]
 
 .. note::
 
@@ -19,7 +19,7 @@ table      The table name
 duration   The duration in milliseconds
 =========  ============================
 
-Additional parameters from Scylla 4.6
+Additional parameters from ScyllaDB 4.6
 
 ==========  ===================================
 Parameter   Description
@@ -29,6 +29,10 @@ ks-filters  List of keyspaces
 cf-filters  List of Tables (Column Families)
 ----------  -----------------------------------
 duration    The duration in milliseconds
+----------  -----------------------------------
+capacity    The capacity of the sampler; higher values increase accuracy at the cost of memory (default 256 keys).
+----------  -----------------------------------
+samplers    The samplers to use; ``WRITES``, ``READS``, or both (default).
 ==========  ===================================
 
 For example:
@@ -37,7 +41,7 @@ For example:
 
    nodetool toppartitions nba team_roster 5000
 
-For Example (Starting from Scylla 4.6):
+For Example (Starting from ScyllaDB 4.6):
 
 * listing the top partitions from *all* tables in *all* keyspaces ``nodetool toppartitions``
 * listing the top partitions for the last 1000 ms ``nodetool toppartitions -d 1000``
@@ -47,7 +51,7 @@ For Example (Starting from Scylla 4.6):
 
 .. note::
 
-   In Scylla 4.6, **duration** parameter requires a *-d* prefix
+   In ScyllaDB 4.6, **duration** parameter requires a *-d* prefix
   
 
 Example output:
@@ -88,7 +92,7 @@ Output
 =============  =============================================================================================
 Parameter      Description
 =============  =============================================================================================
-Partition      The Partition Key, prefixed by the Keyspace and table (ks:cf) for Scylla 4.6 and later
+Partition      The Partition Key, prefixed by the Keyspace and table (ks:cf) for ScyllaDB 4.6 and later
 -------------  ---------------------------------------------------------------------------------------------
 Count          The number of operations of the specified type that occurred during the specified time period
 -------------  ---------------------------------------------------------------------------------------------
@@ -100,6 +104,9 @@ Write Latency  The average read latency
 =============  =============================================================================================
 
 To know which node hold the partition key use the nodetool :doc:`getendpoints </operating-scylla/nodetool-commands/getendpoints/>` command.
+
+If the margin of error column (+/-) approaches the Count column, the measurement is inaccurate. You can increase accuracy by specifying
+the ``--capacity`` option.
 
 For example:
 

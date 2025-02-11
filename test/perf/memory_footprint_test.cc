@@ -3,9 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include <boost/range/irange.hpp>
 
 #include <seastar/util/defer.hh>
@@ -15,7 +16,7 @@
 #include "partition_slice_builder.hh"
 #include "schema/schema_builder.hh"
 #include "replica/memtable.hh"
-#include "row_cache.hh"
+#include "db/row_cache.hh"
 #include "mutation/frozen_mutation.hh"
 #include "test/lib/tmpdir.hh"
 #include "sstables/sstables.hh"
@@ -186,7 +187,7 @@ static sizes calculate_sizes(cache_tracker& tracker, const mutation_settings& se
 
     auto cache_initial_occupancy = tracker.region().occupancy().used_space();
 
-    assert(mt->occupancy().used_space() == 0);
+    SCYLLA_ASSERT(mt->occupancy().used_space() == 0);
 
     std::vector<mutation> muts;
     for (size_t i = 0; i < settings.partition_count; ++i) {

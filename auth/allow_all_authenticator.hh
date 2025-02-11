@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -28,7 +28,7 @@ extern const std::string_view allow_all_authenticator_name;
 
 class allow_all_authenticator final : public authenticator {
 public:
-    allow_all_authenticator(cql3::query_processor&, ::service::migration_manager&) {
+    allow_all_authenticator(cql3::query_processor&, ::service::raft_group0_client&, ::service::migration_manager&) {
     }
 
     virtual future<> start() override {
@@ -59,15 +59,15 @@ public:
         return make_ready_future<authenticated_user>(anonymous_user());
     }
 
-    virtual future<> create(std::string_view, const authentication_options& options) const override {
+    virtual future<> create(std::string_view, const authentication_options& options, ::service::group0_batch&) override {
         return make_ready_future();
     }
 
-    virtual future<> alter(std::string_view, const authentication_options& options) const override {
+    virtual future<> alter(std::string_view, const authentication_options& options, ::service::group0_batch&) override {
         return make_ready_future();
     }
 
-    virtual future<> drop(std::string_view) const override {
+    virtual future<> drop(std::string_view, ::service::group0_batch&) override {
         return make_ready_future();
     }
 
@@ -82,6 +82,10 @@ public:
 
     virtual ::shared_ptr<sasl_challenge> new_sasl_challenge() const override {
         throw std::runtime_error("Should not reach");
+    }
+
+    virtual future<> ensure_superuser_is_created() const override {
+        return make_ready_future<>();
     }
 };
 

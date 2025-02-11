@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -181,6 +181,8 @@ public:
     // The caller must ensure that pos remains valid until the future resolves.
     virtual future<std::optional<skip_info>> advance_to(position_in_partition_view pos) = 0;
 
+    virtual skip_info current_block() = 0;
+
     // Determines the data file offset relative to the start of the partition such that fragments
     // from the range (-inf, pos] are located before that offset.
     //
@@ -297,6 +299,10 @@ public:
     bool empty() const { return _entries.empty(); }
     size_t size() const { return _entries.size(); }
 
+    void clear_one_entry() {
+        _entries.pop_back();
+    }
+
     size_t external_memory_usage() const {
         size_t size = _entries.external_memory_usage();
         for (auto&& e : _entries) {
@@ -319,3 +325,11 @@ inline std::ostream& operator<<(std::ostream& out, const sstables::promoted_inde
     std::visit([&out] (const auto& pos) mutable { fmt::print(out, "{}", pos); }, pos);
     return out;
 }
+
+template<>
+struct fmt::formatter<sstables::clustered_index_cursor::skip_info> : fmt::formatter<std::string_view> {
+    auto format(const sstables::clustered_index_cursor::skip_info& info, fmt::format_context& ctx) const -> decltype(ctx.out()) {
+        return fmt::format_to(ctx.out(), "skip_info{{offset: {}, tombstone: ({}, {})}}",
+                              info.offset, info.active_tombstone_pos, info.active_tombstone);
+    }
+};

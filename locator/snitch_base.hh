@@ -5,25 +5,21 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
-#include <unordered_set>
-#include <vector>
-#include <boost/signals2.hpp>
+#include "utils/assert.hh"
+#include <boost/signals2/signal_type.hpp>
 #include <boost/signals2/dummy_mutex.hpp>
 
+#include "gms/endpoint_state.hh"
 #include "locator/types.hh"
 #include "gms/inet_address.hh"
-#include "inet_address_vectors.hh"
-#include "gms/versioned_value.hh"
-#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/distributed.hh>
-#include "utils/class_registrator.hh"
-#include "log.hh"
+#include "utils/log.hh"
 
 namespace gms {
 
@@ -83,9 +79,9 @@ public:
     /**
      * returns whatever info snitch wants to gossip
      */
-    virtual std::list<std::pair<gms::application_state, gms::versioned_value>> get_app_states() const = 0;
+    virtual gms::application_state_map get_app_states() const = 0;
 
-    virtual ~i_endpoint_snitch() { assert(_state == snitch_state::stopped); };
+    virtual ~i_endpoint_snitch() { SCYLLA_ASSERT(_state == snitch_state::stopped); };
 
     // noop by default
     virtual future<> stop() {
@@ -295,7 +291,7 @@ public:
     // virtual sstring get_datacenter()  = 0;
     //
 
-    virtual std::list<std::pair<gms::application_state, gms::versioned_value>> get_app_states() const override;
+    virtual gms::application_state_map get_app_states() const override;
 
 protected:
     sstring _my_dc;

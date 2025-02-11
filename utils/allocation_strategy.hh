@@ -3,14 +3,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <any>
+#include <memory>
 #include <cstdlib>
-#include <seastar/core/memory.hh>
+#include <string>
 #include <seastar/util/alloc_failure_injector.hh>
 #include <malloc.h>
 
@@ -188,6 +189,24 @@ public:
     void invalidate_references() noexcept {
         ++_invalidate_counter;
     }
+
+    // Asks the allocator to set aside some free memory,
+    // preventing it from being allocated until the matching
+    // unreserve() call. Can be used to preallocate some memory
+    // for a critical section where allocations can't fail.
+    //
+    // This is hack designed with the implementation details of the
+    // log-structured allocator in mind. In other allocators,
+    // it doesn't do anything useful.
+    //
+    // Don't use this unless you understand exactly what you are doing.
+    virtual uintptr_t reserve(size_t memory) {
+        return 0;
+    }
+
+    // As the argument to this function, you must pass the *return value* of the matching reserve().
+    virtual void unreserve(uintptr_t opaque) noexcept {
+    }
 };
 
 class standard_allocation_strategy : public allocation_strategy {
@@ -255,6 +274,16 @@ struct alloc_strategy_deleter {
     void operator()(T* ptr) const noexcept {
         current_allocator().destroy(ptr);
     }
+};
+
+// RAII for allocation_strategy::reserve().
+class hold_reserve {
+    uintptr_t _opaque;
+public:
+    hold_reserve(size_t memory) : _opaque(current_allocator().reserve(memory)) {}
+    ~hold_reserve() { current_allocator().unreserve(_opaque); }
+    // Disallow copying and moving. They *could* be implemented, but I just didn't bother.
+    hold_reserve(hold_reserve&&) = delete;
 };
 
 // std::unique_ptr which can be used for owning an object allocated using allocation_strategy.

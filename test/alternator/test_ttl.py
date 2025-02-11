@@ -1,17 +1,39 @@
 # Copyright 2021 ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for the Time To Live (TTL) feature for item expiration.
 
-import pytest
-import time
-import re
 import math
-from botocore.exceptions import ClientError
-from util import new_test_table, random_string, full_query, unique_table_name, is_aws, client_no_transform
+import re
+import time
 from contextlib import contextmanager
 from decimal import Decimal
+
+import pytest
+from botocore.exceptions import ClientError
+
+from test.alternator.util import new_test_table, random_string, full_query, unique_table_name, is_aws, \
+    client_no_transform
+
+# All tests in this file are expected to fail with tablets due to #16567.
+# To ensure that Alternator TTL is still being tested, instead of
+# xfailing these tests, we temporarily coerce the tests below to avoid
+# using default tablets setting, even if it's available. We do this by
+# using the following tags when creating each table below:
+TAGS = [{'Key': 'experimental:initial_tablets', 'Value': 'none'}]
+
+# Before Alternator TTL is supported with tablets (#16567), let's verify
+# that enabling TTL results in an orderly error. This test should be deleted
+# when #16567 is fixed.
+def test_ttl_enable_error_with_tablets(dynamodb, scylla_only):
+    with new_test_table(dynamodb,
+        Tags=[{'Key': 'experimental:initial_tablets', 'Value': '4'}],
+        KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, ],
+        AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' } ]) as table:
+        with pytest.raises(ClientError, match='ValidationException.*tablets'):
+            table.meta.client.update_time_to_live(TableName=table.name,
+                TimeToLiveSpecification={'AttributeName': 'expiration', 'Enabled': True})
 
 # passes_or_raises() is similar to pytest.raises(), except that while raises()
 # expects a certain exception must happen, the new passes_or_raises()
@@ -85,6 +107,7 @@ def test_describe_ttl_without_ttl(test_table):
 # and this information becomes available via DescribeTimeToLive
 def test_ttl_enable(dynamodb):
     with new_test_table(dynamodb,
+        Tags=TAGS,
         KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, ],
         AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' } ]) as table:
         client = table.meta.client
@@ -120,6 +143,7 @@ def test_ttl_enable(dynamodb):
 # disable case.
 def test_ttl_disable_errors(dynamodb):
     with new_test_table(dynamodb,
+        Tags=TAGS,
         KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, ],
         AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' } ]) as table:
         client = table.meta.client
@@ -152,6 +176,7 @@ def test_ttl_disable_errors(dynamodb):
 # minutes). But on Scylla it is currently almost instantaneous.
 def test_ttl_disable(dynamodb, veryslow_on_aws):
     with new_test_table(dynamodb,
+        Tags=TAGS,
         KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, ],
         AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' } ]) as table:
         client = table.meta.client
@@ -185,6 +210,7 @@ def test_update_ttl_errors(dynamodb):
         client.update_time_to_live(TableName=nonexistent_table,
             TimeToLiveSpecification={'AttributeName': 'expiration', 'Enabled': True})
     with new_test_table(dynamodb,
+            Tags=TAGS,
             KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, ],
             AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' } ]) as table:
         # AttributeName must be between 1 and 255 characters long.
@@ -232,6 +258,7 @@ def test_ttl_expiration(dynamodb):
     delta = math.ceil(duration / 4)
     assert delta >= 1
     with new_test_table(dynamodb,
+        Tags=TAGS,
         KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, ],
         AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' } ]) as table:
         # Insert one expiring item *before* enabling the TTL, to verify that
@@ -354,6 +381,7 @@ def test_ttl_expiration_with_rangekey(dynamodb, waits_for_expiration):
     max_duration = 1200 if is_aws(dynamodb) else 240
     sleep = 30 if is_aws(dynamodb) else 0.1
     with new_test_table(dynamodb,
+        Tags=TAGS,
         KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' },
                     { 'AttributeName': 'c', 'KeyType': 'RANGE' } ],
         AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' },
@@ -392,6 +420,7 @@ def test_ttl_expiration_hash(dynamodb, waits_for_expiration):
     max_duration = 1200 if is_aws(dynamodb) else 240
     sleep = 30 if is_aws(dynamodb) else 0.1
     with new_test_table(dynamodb,
+        Tags=TAGS,
         KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, ],
         AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'N' } ]) as table:
         ttl_spec = {'AttributeName': 'p', 'Enabled': True}
@@ -424,6 +453,7 @@ def test_ttl_expiration_range(dynamodb, waits_for_expiration):
     max_duration = 1200 if is_aws(dynamodb) else 240
     sleep = 30 if is_aws(dynamodb) else 0.1
     with new_test_table(dynamodb,
+        Tags=TAGS,
         KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, { 'AttributeName': 'c', 'KeyType': 'RANGE' } ],
         AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' }, { 'AttributeName': 'c', 'AttributeType': 'N' } ]) as table:
         ttl_spec = {'AttributeName': 'c', 'Enabled': True}
@@ -463,6 +493,7 @@ def test_ttl_expiration_range(dynamodb, waits_for_expiration):
 def test_ttl_expiration_hash_wrong_type(dynamodb):
     duration = 900 if is_aws(dynamodb) else 3
     with new_test_table(dynamodb,
+        Tags=TAGS,
         KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, ],
         AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' } ]) as table:
         ttl_spec = {'AttributeName': 'p', 'Enabled': True}
@@ -496,6 +527,7 @@ def test_ttl_expiration_gsi_lsi(dynamodb, waits_for_expiration):
     max_duration = 3600 if is_aws(dynamodb) else 240
     sleep = 30 if is_aws(dynamodb) else 0.1
     with new_test_table(dynamodb,
+        Tags=TAGS,
         KeySchema=[
             { 'AttributeName': 'p', 'KeyType': 'HASH' },
             { 'AttributeName': 'c', 'KeyType': 'RANGE' },
@@ -589,6 +621,7 @@ def test_ttl_expiration_lsi_key(dynamodb, waits_for_expiration):
     max_duration = 3600 if is_aws(dynamodb) else 240
     sleep = 30 if is_aws(dynamodb) else 0.1
     with new_test_table(dynamodb,
+        Tags=TAGS,
         KeySchema=[
             { 'AttributeName': 'p', 'KeyType': 'HASH' },
             { 'AttributeName': 'c', 'KeyType': 'RANGE' },
@@ -644,6 +677,7 @@ def test_ttl_expiration_streams(dynamodb, dynamodbstreams):
     # max_duration, we report a failure.
     max_duration = 3600 if is_aws(dynamodb) else 10
     with new_test_table(dynamodb,
+        Tags=TAGS,
         KeySchema=[
             { 'AttributeName': 'p', 'KeyType': 'HASH' },
             { 'AttributeName': 'c', 'KeyType': 'RANGE' },
@@ -756,6 +790,7 @@ def test_ttl_expiration_long(dynamodb, waits_for_expiration):
     N=400
     max_duration = 1200 if is_aws(dynamodb) else 15
     with new_test_table(dynamodb,
+        Tags=TAGS,
         KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' },
                     { 'AttributeName': 'c', 'KeyType': 'RANGE' } ],
         AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'N' },

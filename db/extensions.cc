@@ -4,15 +4,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "extensions.hh"
 #include "sstables/sstables.hh"
 #include "commitlog/commitlog_extensions.hh"
 #include "schema/schema.hh"
-#include <boost/range/adaptor/map.hpp>
-#include <boost/range/adaptor/transformed.hpp>
 
 db::extensions::extensions()
 {}
@@ -22,25 +20,24 @@ db::extensions::~extensions()
 std::vector<sstables::file_io_extension*>
 db::extensions::sstable_file_io_extensions() const {
     using etype = sstables::file_io_extension;
-    return boost::copy_range<std::vector<etype*>>(
-            _sstable_file_io_extensions
-            | boost::adaptors::map_values
-            | boost::adaptors::transformed(std::mem_fn(&std::unique_ptr<etype>::get)));
+    return _sstable_file_io_extensions
+            | std::views::values
+            | std::views::transform(std::mem_fn(&std::unique_ptr<etype>::get))
+            | std::ranges::to<std::vector>();
 }
 
 std::vector<db::commitlog_file_extension*>
 db::extensions::commitlog_file_extensions() const {
     using etype = db::commitlog_file_extension;
-    return boost::copy_range<std::vector<etype*>>(
-            _commitlog_file_extensions
-            | boost::adaptors::map_values
-            | boost::adaptors::transformed(std::mem_fn(&std::unique_ptr<etype>::get)));
+    return _commitlog_file_extensions
+            | std::views::values
+            | std::views::transform(std::mem_fn(&std::unique_ptr<etype>::get))
+            | std::ranges::to<std::vector>();
 }
 
 std::set<sstring>
 db::extensions::schema_extension_keywords() const {
-    return boost::copy_range<std::set<sstring>>(
-            _schema_extensions | boost::adaptors::map_keys);
+    return _schema_extensions | std::views::keys | std::ranges::to<std::set>();
 }
 
 void db::extensions::add_sstable_file_io_extension(sstring n, sstable_file_io_extension f) {
@@ -59,14 +56,8 @@ void db::extensions::add_extension_internal_keyspace(std::string ks) {
     _extension_internal_keyspaces.emplace(std::move(ks));
 }
 
-// TODO: remove once this is backmerged to ent once, and relevant code is updated.
-extern bool is_load_prio_keyspace(std::string_view name);
-
 bool db::extensions::is_extension_internal_keyspace(const std::string& ks) const {
     if (_extension_internal_keyspaces.count(ks)) {
-        return true;
-    }
-    if (::is_load_prio_keyspace(ks)) {
         return true;
     }
     return false;

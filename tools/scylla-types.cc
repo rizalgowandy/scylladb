@@ -3,26 +3,35 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <boost/algorithm/string/join.hpp>
-#include <boost/range/adaptor/map.hpp>
 #include <seastar/core/coroutine.hh>
 
+#include <fmt/ranges.h>
 #include "compound.hh"
 #include "db/marshal/type_parser.hh"
-#include "log.hh"
 #include "schema/schema_builder.hh"
 #include "tools/utils.hh"
 #include "dht/i_partitioner.hh"
+#include "utils/managed_bytes.hh"
 
 using namespace seastar;
 using namespace tools::utils;
 
 namespace bpo = boost::program_options;
 
+namespace std {
+// required by boost::lexical_cast<std::string>(vector<string>), which is in turn used
+// by boost::program_option for printing out the default value of an option
+static std::ostream& operator<<(std::ostream& os, const std::vector<sstring>& v) {
+    return os << fmt::format("{}", v);
+}
+}
+
 namespace {
+
+const auto app_name = "types";
 
 using type_variant = std::variant<
         data_type,
@@ -67,7 +76,7 @@ struct serializing_visitor {
 };
 
 void serialize_handler(type_variant type, std::vector<sstring> values, const bpo::variables_map& vm) {
-    fmt::print("{}\n", to_hex(serializing_visitor{values}(type)));
+    fmt::print("{}\n", managed_bytes_view(serializing_visitor{values}(type)));
 }
 
 sstring to_printable_string(const data_type& type, bytes_view value) {
@@ -85,7 +94,7 @@ sstring to_printable_string(const compound_type<AllowPrefixes>& type, bytes_view
     for (size_t i = 0; i != values.size(); ++i) {
         printable_values.emplace_back(types.at(i)->to_string(values.at(i)));
     }
-    return format("({})", boost::algorithm::join(printable_values, ", "));
+    return seastar::format("({})", fmt::join(printable_values, ", "));
 }
 
 struct printing_visitor {
@@ -130,7 +139,7 @@ void compare_handler(type_variant type, std::vector<bytes> values, const bpo::va
     } compare_visitor{values[0], values[1]};
 
     const auto res = std::visit(compare_visitor, type);
-    sstring_view res_str;
+    std::string_view res_str;
 
     if (res == 0) {
         res_str = "==";
@@ -347,17 +356,17 @@ $ scylla types shardof --full-compound -t UTF8Type -t SimpleDateType -t UUIDType
 namespace tools {
 
 int scylla_types_main(int argc, char** argv) {
-    auto description_template =
-R"(scylla-types - a command-line tool to examine values belonging to scylla types.
+    constexpr auto description_template =
+R"(scylla-{} - a command-line tool to examine values belonging to scylla types.
 
-Usage: scylla types {{action}} [--option1] [--option2] ... {{hex_value1}} [{{hex_value2}}] ...
+Usage: scylla {} {{action}} [--option1] [--option2] ... {{hex_value1}} [{{hex_value2}}] ...
 
 Allows examining raw values obtained from e.g. sstables, logs or coredumps and
 executing various actions on them. Values should be provided in hex form,
 without a leading 0x prefix, e.g. 00783562. For scylla-types to be able to
 examine the values, their type has to be provided. Types should be provided by
 their cassandra class names, e.g. org.apache.cassandra.db.marshal.Int32Type for
-the int32_type. The org.apache.cassandra.db.marshal. prefix can be ommited.
+the int32_type. The org.apache.cassandra.db.marshal. prefix can be omitted.
 See https://github.com/scylladb/scylla/blob/master/docs/dev/cql3-type-mapping.md
 for a mapping of cql3 types to Cassandra type class names.
 Compound types specify their subtypes inside () separated by comma, e.g.:
@@ -371,11 +380,11 @@ For more information about individual actions, see their specific help:
 $ scylla types {{action}} --help
 )";
 
-    const auto operations = boost::copy_range<std::vector<operation>>(operations_with_func | boost::adaptors::map_keys);
+    const auto operations = operations_with_func | std::views::keys | std::ranges::to<std::vector>();
     tool_app_template::config app_cfg{
-        .name = "scylla-types",
-        .description = format(description_template, boost::algorithm::join(operations | boost::adaptors::transformed(
-                [] (const operation& op) { return format("* {} - {}", op.name(), op.summary()); } ), "\n")),
+        .name = app_name,
+        .description = seastar::format(description_template, app_name, app_name, fmt::join(operations | std::views::transform(
+                [] (const operation& op) { return fmt::format("* {} - {}", op.name(), op.summary()); } ), "\n")),
         .operations = std::move(operations),
         .global_options = &global_options,
         .global_positional_options = &global_positional_options,
@@ -387,8 +396,9 @@ $ scylla types {{action}} --help
             throw std::invalid_argument("error: missing required option '--type'");
         }
         type_variant type = [&app_config] () -> type_variant {
-            auto types = boost::copy_range<std::vector<data_type>>(app_config["type"].as<std::vector<sstring>>()
-                    | boost::adaptors::transformed([] (const sstring_view type_name) { return db::marshal::type_parser::parse(type_name); }));
+            auto types = app_config["type"].as<std::vector<sstring>>()
+                    | std::views::transform([] (const std::string_view type_name) { return db::marshal::type_parser::parse(type_name); })
+                    | std::ranges::to<std::vector<data_type>>();
             if (app_config.contains("prefix-compound")) {
                 return compound_type<allow_prefixes::yes>(std::move(types));
             } else if (app_config.contains("full-compound")) {
@@ -409,9 +419,7 @@ $ scylla types {{action}} --help
         switch (handler.index()) {
             case 0:
                 {
-                    auto values = boost::copy_range<std::vector<bytes>>(
-                            app_config["value"].as<std::vector<sstring>>() | boost::adaptors::transformed(from_hex));
-
+                    auto values = app_config["value"].as<std::vector<sstring>>() | std::views::transform(from_hex) | std::ranges::to<std::vector>();
                     std::get<bytes_func>(handler)(std::move(type), std::move(values), app_config);
                 }
                 break;

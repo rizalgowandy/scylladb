@@ -5,19 +5,20 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
-#include "utils/serialization.hh"
 #include "gms/heart_beat_state.hh"
 #include "gms/application_state.hh"
 #include "gms/versioned_value.hh"
-#include <optional>
-#include <chrono>
+#include "locator/host_id.hh"
+#include "locator/types.hh"
 
 namespace gms {
+
+using application_state_map = std::unordered_map<application_state, versioned_value>;
 
 /**
  * This abstraction represents both the HeartBeatState and the ApplicationState in an EndpointState
@@ -28,10 +29,9 @@ public:
     using clk = seastar::lowres_system_clock;
 private:
     heart_beat_state _heart_beat_state;
-    std::map<application_state, versioned_value> _application_state;
+    application_state_map _application_state;
     /* fields below do not get serialized */
     clk::time_point _update_timestamp;
-    bool _is_normal = false;
 
 public:
     bool operator==(const endpoint_state& other) const {
@@ -44,23 +44,20 @@ public:
         : _heart_beat_state()
         , _update_timestamp(clk::now())
     {
-        update_is_normal();
     }
 
     endpoint_state(heart_beat_state initial_hb_state) noexcept
         : _heart_beat_state(initial_hb_state)
         , _update_timestamp(clk::now())
     {
-        update_is_normal();
     }
 
     endpoint_state(heart_beat_state&& initial_hb_state,
-            const std::map<application_state, versioned_value>& application_state)
+            const application_state_map& application_state)
         : _heart_beat_state(std::move(initial_hb_state))
         , _application_state(application_state)
         , _update_timestamp(clk::now())
     {
-        update_is_normal();
     }
 
     // Valid only on shard 0
@@ -84,22 +81,20 @@ public:
      * TODO replace this with operations that don't expose private state
      */
     // @Deprecated
-    std::map<application_state, versioned_value>& get_application_state_map() noexcept {
+    application_state_map& get_application_state_map() noexcept {
         return _application_state;
     }
 
-    const std::map<application_state, versioned_value>& get_application_state_map() const noexcept {
+    const application_state_map& get_application_state_map() const noexcept {
         return _application_state;
     }
 
     void add_application_state(application_state key, versioned_value value) {
         _application_state[key] = std::move(value);
-        update_is_normal();
     }
 
     void add_application_state(const endpoint_state& es) {
         _application_state = es._application_state;
-        update_is_normal();
     }
 
     /* getters and setters */
@@ -118,37 +113,33 @@ public:
 
 public:
     std::string_view get_status() const noexcept {
-        constexpr std::string_view empty = "";
-        auto* app_state = get_application_state_ptr(application_state::STATUS);
+        constexpr std::string_view empty;
+        const auto* app_state = get_application_state_ptr(application_state::STATUS);
         if (!app_state) {
             return empty;
         }
-        const auto& value = app_state->value();
+        const std::string_view value = app_state->value();
         if (value.empty()) {
             return empty;
         }
-        auto pos = value.find(',');
-        if (pos == sstring::npos) {
-            return std::string_view(value);
-        }
-        return std::string_view(value.c_str(), pos);
-    }
-
-    bool is_shutdown() const noexcept {
-        return get_status() == versioned_value::SHUTDOWN;
-    }
-
-    bool is_normal() const noexcept {
-        return _is_normal;
-    }
-
-    void update_is_normal() noexcept {
-        _is_normal = get_status() == versioned_value::STATUS_NORMAL;
+        const auto pos = value.find(',');
+        // npos allowed (full value)
+        return value.substr(0, pos);
     }
 
     bool is_cql_ready() const noexcept;
 
-    friend std::ostream& operator<<(std::ostream& os, const endpoint_state& x);
+    // Return the value of the HOST_ID application state
+    // or a null host_id if the application state is not found.
+    locator::host_id get_host_id() const noexcept;
+
+    std::optional<locator::endpoint_dc_rack> get_dc_rack() const;
+
+    // Return the value of the TOKENS application state
+    // or an empty set if the application state is not found.
+    std::unordered_set<dht::token> get_tokens() const;
+
+    friend fmt::formatter<endpoint_state>;
 };
 
 using endpoint_state_ptr = lw_shared_ptr<const endpoint_state>;
@@ -173,3 +164,9 @@ using permit_id = utils::tagged_uuid<struct permit_id_tag>;
 constexpr permit_id null_permit_id = permit_id::create_null_id();
 
 } // gms
+
+template <>
+struct fmt::formatter<gms::endpoint_state> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const gms::endpoint_state&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

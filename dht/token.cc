@@ -3,56 +3,25 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <algorithm>
 #include <limits>
 #include <ostream>
-#include <utility>
+#include <random>
+#include <ranges>
+#include <boost/lexical_cast.hpp>
 
 #include "dht/token.hh"
 #include "dht/token-sharding.hh"
-#include "dht/i_partitioner.hh"
 
 namespace dht {
 
 using uint128_t = unsigned __int128;
 
 inline int64_t long_token(const token& t) {
-    if (t.is_minimum() || t.is_maximum()) {
-        return std::numeric_limits<int64_t>::min();
-    }
-
     return t._data;
-}
-
-static const token min_token{ token::kind::before_all_keys, 0 };
-static const token max_token{ token::kind::after_all_keys, 0 };
-
-const token&
-minimum_token() noexcept {
-    return min_token;
-}
-
-const token&
-maximum_token() noexcept {
-    return max_token;
-}
-
-std::strong_ordering operator<=>(const token& t1, const token& t2) {
-    if (t1._kind < t2._kind) {
-            return std::strong_ordering::less;
-    } else if (t1._kind > t2._kind) {
-            return std::strong_ordering::greater;
-    } else if (t1._kind == token_kind::key) {
-        return tri_compare_raw(long_token(t1), long_token(t2));
-    }
-    return std::strong_ordering::equal;
-}
-
-std::strong_ordering token_comparator::operator()(const token& t1, const token& t2) const {
-    return t1 <=> t2;
 }
 
 std::ostream& operator<<(std::ostream& out, const token& t) {
@@ -145,14 +114,6 @@ token::get_token_validator() {
     return long_type;
 }
 
-uint64_t unbias(const token& t) {
-    return uint64_t(long_token(t)) + uint64_t(std::numeric_limits<int64_t>::min());
-}
-
-token bias(uint64_t n) {
-    return token(token::kind::key, n - uint64_t(std::numeric_limits<int64_t>::min()));
-}
-
 inline
 unsigned
 zero_based_shard_of(uint64_t token, unsigned shards, unsigned sharding_ignore_msb_bits) {
@@ -171,7 +132,7 @@ init_zero_based_shard_start(unsigned shards, unsigned sharding_ignore_msb_bits) 
         return std::vector<uint64_t>(1, uint64_t(0));
     }
     auto ret = std::vector<uint64_t>(shards);
-    for (auto s : boost::irange<unsigned>(0, shards)) {
+    for (auto s : std::views::iota(0u, shards)) {
         uint64_t token = (uint128_t(s) << 64) / shards;
         token >>= sharding_ignore_msb_bits;   // leftmost bits are ignored by zero_based_shard_of
         // token is the start of the next shard, and can be slightly before due to rounding errors; adjust
@@ -239,7 +200,7 @@ dht::token token::from_int64(int64_t i) {
 }
 
 static
-dht::token find_first_token_for_shard_in_not_wrap_around_range(const dht::sharder& sharder, dht::token start, dht::token end, size_t shard_idx) {
+dht::token find_first_token_for_shard_in_not_wrap_around_range(const dht::static_sharder& sharder, dht::token start, dht::token end, size_t shard_idx) {
     // Invariant start < end
     // It is guaranteed that start is not MAX_INT64 because end is greater
     auto t = dht::token::from_int64(dht::token::to_int64(start) + 1);
@@ -250,7 +211,7 @@ dht::token find_first_token_for_shard_in_not_wrap_around_range(const dht::sharde
 }
 
 dht::token find_first_token_for_shard(
-        const dht::sharder& sharder, dht::token start, dht::token end, size_t shard_idx) {
+        const dht::static_sharder& sharder, dht::token start, dht::token end, size_t shard_idx) {
     if (start < end) { // Not a wrap around token range
         return find_first_token_for_shard_in_not_wrap_around_range(sharder, start, end, shard_idx);
     } else { // A wrap around token range

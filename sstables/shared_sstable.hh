@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -43,7 +43,7 @@ std::string to_string(const shared_sstable& sst, bool include_origin = true);
 } // namespace sstables
 
 template <>
-struct fmt::formatter<sstables::shared_sstable> : fmt::formatter<std::string_view> {
+struct fmt::formatter<sstables::shared_sstable> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const sstables::shared_sstable& sst, FormatContext& ctx) const {
         return fmt::format_to(ctx.out(), "{}", sstables::to_string(sst));

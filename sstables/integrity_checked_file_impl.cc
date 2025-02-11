@@ -3,13 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "integrity_checked_file_impl.hh"
 #include <seastar/core/do_with.hh>
-#include <seastar/core/print.hh>
-#include <boost/algorithm/cxx11/all_of.hpp>
+#include <seastar/core/format.hh>
+#include "bytes.hh"
 
 namespace sstables {
 
@@ -33,7 +33,7 @@ static sstring report_zeroed_4k_aligned_blocks(const temporary_buffer<int8_t>& b
 
         auto begin = buf.get() + off;
         auto end = begin + len;
-        if (boost::algorithm::all_of_equal(begin, end, 0)) {
+        if (std::ranges::all_of(begin, end, [](auto byte) { return byte == 0; })) {
             report += format("{:d}, ", off);
         }
     }
@@ -79,7 +79,7 @@ integrity_checked_file_impl::write_dma(uint64_t pos, const void* buffer, size_t 
             }
 
             auto rbuf_end = rbuf.get() + rbuf.size();
-            auto r = std::mismatch(rbuf.get(), rbuf.get() + rbuf.size(), wbuf.get(), wbuf.get() + wbuf.size());
+            auto r = std::mismatch(rbuf.get(), rbuf_end, wbuf.get(), wbuf.get() + wbuf.size());
             if (r.first != rbuf_end) {
                 auto mismatch_off = r.first - rbuf.get();
 

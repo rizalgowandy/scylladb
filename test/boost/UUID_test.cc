@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #define BOOST_TEST_MODULE core
@@ -11,11 +11,11 @@
 #include <boost/test/unit_test.hpp>
 #include <utility>
 #include "utils/UUID_gen.hh"
-#include "utils/lexicographical_compare.hh"
+#include "marshal_exception.hh"
 
 BOOST_AUTO_TEST_CASE(test_generation_of_name_based_UUID) {
     auto uuid = utils::UUID_gen::get_name_UUID("systembatchlog");
-    BOOST_REQUIRE_EQUAL(uuid.to_sstring(), "0290003c-977e-397c-ac3e-fdfdc01d626b");
+    BOOST_REQUIRE_EQUAL(fmt::to_string(uuid), "0290003c-977e-397c-ac3e-fdfdc01d626b");
 }
 
 using utils::UUID;
@@ -39,10 +39,10 @@ BOOST_AUTO_TEST_CASE(test_UUID_comparison) {
 }
 
 BOOST_AUTO_TEST_CASE(test_from_string) {
-    auto check = [] (sstring_view sv) {
+    auto check = [] (std::string_view sv) {
         auto uuid = UUID(sv);
         BOOST_CHECK_EQUAL(uuid.version(), 4);
-        BOOST_CHECK_EQUAL(uuid.to_sstring(), sv);
+        BOOST_CHECK_EQUAL(fmt::to_string(uuid), sv);
         BOOST_CHECK_EQUAL((uuid.get_least_significant_bits() >> 62) & 0x3, 2);
     };
 
@@ -99,6 +99,17 @@ BOOST_AUTO_TEST_CASE(test_get_time_uuid) {
     BOOST_CHECK(unix_timestamp == millis);
 }
 
+BOOST_AUTO_TEST_CASE(test_uuid_to_uint32) {
+    // (gdb) p/x 0x3123223d ^ 0x17300 ^ 0x31e31215 ^ 0x98312
+    // $2 = 0xc8c03a
+    uint64_t x = 0x173003123223d;
+    uint64_t y = 0x9831231e31215;
+    uint32_t expected_id = 0xc8c03a;
+    auto uuid = utils::UUID(x, y);
+    uint32_t id = uuid_xor_to_uint32(uuid);
+    BOOST_CHECK(id == expected_id);
+}
+
 std::strong_ordering timeuuid_legacy_tri_compare(bytes_view o1, bytes_view o2) {
     auto compare_pos = [&] (unsigned pos, int mask, std::strong_ordering ifequal) {
         auto d = (o1[pos] & mask) <=> (o2[pos] & mask);
@@ -137,7 +148,7 @@ BOOST_AUTO_TEST_CASE(test_timeuuid_msb_is_monotonic) {
             bool t1 = utils::timeuuid_tri_compare(next, prev) > 0;
             bool t2 = utils::timeuuid_tri_compare(next, first) > 0;
             if (!t1 || !t2) {
-                BOOST_CHECK_MESSAGE(t1 && t2, format("a UUID {}{} later is not great than at test start: {} {}", i, str(scale), t1, t2));
+                BOOST_CHECK_MESSAGE(t1 && t2, seastar::format("a UUID {}{} later is not great than at test start: {} {}", i, str(scale), t1, t2));
             }
             prev = next;
         }
@@ -163,7 +174,7 @@ BOOST_AUTO_TEST_CASE(test_timeuuid_tri_compare_legacy) {
             bool t1 = utils::timeuuid_tri_compare(next, prev) == timeuuid_legacy_tri_compare(next, prev);
             bool t2 = utils::timeuuid_tri_compare(next, first) == timeuuid_legacy_tri_compare(next, first);
             if (!t1 || !t2) {
-                BOOST_CHECK_MESSAGE(t1 && t2, format("a UUID {}{} later violates compare order", i, str(scale)));
+                BOOST_CHECK_MESSAGE(t1 && t2, seastar::format("a UUID {}{} later violates compare order", i, str(scale)));
             }
             prev = next;
         }

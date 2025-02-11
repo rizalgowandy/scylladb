@@ -5,23 +5,21 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include <string_view>
-#include <functional>
-#include <optional>
 #include <stdexcept>
 #include <tuple>
 #include <vector>
 
 #include <seastar/core/future.hh>
-#include <seastar/core/shared_ptr.hh>
 
 #include "auth/permission.hh"
 #include "auth/resource.hh"
+#include "service/raft/raft_group0_client.hh"
 #include "seastarx.hh"
 
 namespace auth {
@@ -83,14 +81,14 @@ public:
     ///
     /// \throws \ref unsupported_authorization_operation if granting permissions is not supported.
     ///
-    virtual future<> grant(std::string_view role_name, permission_set, const resource&) const = 0;
+    virtual future<> grant(std::string_view role_name, permission_set, const resource&, ::service::group0_batch&) = 0;
 
     ///
     /// Revoke a set of permissions from a role for a particular \ref resource.
     ///
     /// \throws \ref unsupported_authorization_operation if revoking permissions is not supported.
     ///
-    virtual future<> revoke(std::string_view role_name, permission_set, const resource&) const = 0;
+    virtual future<> revoke(std::string_view role_name, permission_set, const resource&, ::service::group0_batch&) = 0;
 
     ///
     /// Query for all directly granted permissions.
@@ -104,14 +102,14 @@ public:
     ///
     /// \throws \ref unsupported_authorization_operation if revoking permissions is not supported.
     ///
-    virtual future<> revoke_all(std::string_view role_name) const = 0;
+    virtual future<> revoke_all(std::string_view role_name, ::service::group0_batch&) = 0;
 
     ///
     /// Revoke all permissions granted to any role for a particular resource.
     ///
     /// \throws \ref unsupported_authorization_operation if revoking permissions is not supported.
     ///
-    virtual future<> revoke_all(const resource&) const = 0;
+    virtual future<> revoke_all(const resource&, ::service::group0_batch&) = 0;
 
     ///
     /// System resources used internally as part of the implementation. These are made inaccessible to users.

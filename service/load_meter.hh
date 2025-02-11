@@ -3,10 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#pragma  once
+#pragma once
 
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/distributed.hh>

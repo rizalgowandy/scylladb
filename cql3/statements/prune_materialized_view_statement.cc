@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 /* Copyright 2022-present ScyllaDB */
@@ -7,14 +7,11 @@
 #include "cql3/statements/prune_materialized_view_statement.hh"
 #include "transport/messages/result_message.hh"
 #include "cql3/selection/selection.hh"
-#include "query-result-reader.hh"
-#include "view_info.hh"
-#include "timeout_config.hh"
 #include "service/pager/query_pagers.hh"
 #include "cql3/restrictions/statement_restrictions.hh"
 #include "cql3/query_processor.hh"
 #include "service/storage_proxy.hh"
-#include <boost/range/adaptors.hpp>
+#include <fmt/ranges.h>
 #include <seastar/core/coroutine.hh>
 
 using namespace std::chrono_literals;
@@ -25,10 +22,10 @@ namespace statements {
 
 static future<> delete_ghost_rows(dht::partition_range_vector partition_ranges, std::vector<query::clustering_range> clustering_bounds, view_ptr view,
         service::storage_proxy& proxy, service::query_state& state, const query_options& options, cql_stats& stats, db::timeout_clock::duration timeout_duration) {
-    auto key_columns = boost::copy_range<std::vector<const column_definition*>>(
+    auto key_columns = std::ranges::to<std::vector<const column_definition*>>(
         view->all_columns()
-        | boost::adaptors::filtered([] (const column_definition& cdef) { return cdef.is_primary_key(); })
-        | boost::adaptors::transformed([] (const column_definition& cdef) { return &cdef; } ));
+        | std::views::filter([] (const column_definition& cdef) { return cdef.is_primary_key(); })
+        | std::views::transform([] (const column_definition& cdef) { return &cdef; } ));
     auto selection = cql3::selection::selection::for_columns(view, key_columns);
 
     query::partition_slice partition_slice(std::move(clustering_bounds), {},  {}, selection->get_query_options());

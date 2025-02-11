@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -37,7 +37,7 @@ std::ostream& operator<<(std::ostream& os, const table_info& ti);
 } // namespace std
 
 template <>
-struct fmt::formatter<table_info> : fmt::formatter<std::string_view> {
+struct fmt::formatter<table_info> : fmt::formatter<string_view> {
     auto format(const table_info&, fmt::format_context& ctx) const -> decltype(ctx.out());
 };
 

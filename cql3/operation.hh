@@ -5,14 +5,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include <seastar/core/shared_ptr.hh>
 #include "cql3/cql3_type.hh"
-#include "exceptions/exceptions.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "update_parameters.hh"
 #include "cql3/column_identifier.hh"

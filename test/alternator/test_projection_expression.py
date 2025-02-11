@@ -1,6 +1,6 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for the various operations (GetItem, Query, Scan) with a
 # ProjectionExpression parameter.
@@ -13,7 +13,9 @@
 
 import pytest
 from botocore.exceptions import ClientError
-from util import random_string, full_scan, full_query, multiset
+
+from test.alternator.util import random_string, full_scan, full_query, multiset
+
 
 # Basic test for ProjectionExpression, requesting only top-level attributes.
 # Result should include the selected attributes only - if one wants the key
@@ -45,9 +47,9 @@ def test_projection_expression_toplevel_syntax(test_table_s):
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression=' a  ,   b  ')['Item'] == {'a': 'hello', 'b': 'hi'}
     # Missing or unused names in ExpressionAttributeNames are errors:
     with pytest.raises(ClientError, match='ValidationException'):
-        test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='#name', ExpressionAttributeNames={'#wrong': 'a'})['Item'] == {'a': 'hello'}
+        test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='#name', ExpressionAttributeNames={'#wrong': 'a'})['Item']
     with pytest.raises(ClientError, match='ValidationException'):
-        test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='#name', ExpressionAttributeNames={'#name': 'a', '#unused': 'b'})['Item'] == {'a': 'hello'}
+        test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='#name', ExpressionAttributeNames={'#name': 'a', '#unused': 'b'})['Item']
     # It is not allowed to fetch the same top-level attribute twice (or in
     # general, list two overlapping attributes). We get an error like
     # "Invalid ProjectionExpression: Two document paths overlap with each

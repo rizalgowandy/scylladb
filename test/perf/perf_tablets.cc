@@ -3,8 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
+
+#include "utils/assert.hh"
+#include <fmt/ranges.h>
 
 #include <seastar/core/distributed.hh>
 #include <seastar/core/app-template.hh>
@@ -13,6 +16,7 @@
 #include <seastar/core/reactor.hh>
 
 #include "locator/tablets.hh"
+#include "replica/tablet_mutation_builder.hh"
 #include "replica/tablets.hh"
 #include "locator/tablet_replication_strategy.hh"
 #include "db/config.hh"
@@ -34,10 +38,7 @@ static const size_t MiB = 1 << 20;
 static
 cql_test_config tablet_cql_test_config() {
     cql_test_config c;
-    c.db_config->experimental_features({
-               db::experimental_features_t::feature::TABLETS,
-               db::experimental_features_t::feature::CONSISTENT_TOPOLOGY_CHANGES
-       }, db::config::config_source::CommandLine);
+    c.db_config->enable_tablets.set(true);
     return c;
 }
 
@@ -58,6 +59,7 @@ static future<> test_basic_operations(app_template& app) {
         tablet_metadata tm;
 
         auto h1 = host_id(utils::UUID_gen::get_time_UUID());
+        auto h2 = host_id(utils::UUID_gen::get_time_UUID());
 
         int nr_tables = app.configuration()["tables"].as<int>();
         int tablets_per_table = app.configuration()["tablets-per-table"].as<int>();
@@ -68,7 +70,7 @@ static future<> test_basic_operations(app_template& app) {
         std::vector<table_id> ids;
         ids.resize(nr_tables);
         for (int i = 0; i < nr_tables; ++i) {
-            ids[i] = add_table(e).get0();
+            ids[i] = add_table(e).get();
         }
 
         testlog.info("Generating tablet metadata");
@@ -83,7 +85,7 @@ static future<> test_basic_operations(app_template& app) {
                 for (int k = 0; k < rf; ++k) {
                     replicas.push_back({h1, 0});
                 }
-                assert(std::cmp_equal(replicas.size(), rf));
+                SCYLLA_ASSERT(std::cmp_equal(replicas.size(), rf));
                 tmap.set_tablet(j, tablet_info{std::move(replicas)});
                 ++total_tablets;
             }
@@ -98,7 +100,7 @@ static future<> test_basic_operations(app_template& app) {
 
         tablet_metadata tm2;
         auto time_to_copy = duration_in_seconds([&] {
-            tm2 = tm;
+            tm2 = tm.copy().get();
         });
 
         testlog.info("Copied in {:.6f} [ms]", time_to_copy.count() * 1000);
@@ -116,18 +118,24 @@ static future<> test_basic_operations(app_template& app) {
         testlog.info("Saved in {:.6f} [ms]", time_to_save.count() * 1000);
 
         auto time_to_read = duration_in_seconds([&] {
-            tm2 = read_tablet_metadata(e.local_qp()).get0();
+            tm2 = read_tablet_metadata(e.local_qp()).get();
         });
-        assert(tm == tm2);
+        SCYLLA_ASSERT(tm == tm2);
 
         testlog.info("Read in {:.6f} [ms]", time_to_read.count() * 1000);
 
         std::vector<canonical_mutation> muts;
         auto time_to_read_muts = duration_in_seconds([&] {
-            muts = replica::read_tablet_mutations(e.local_qp().proxy().get_db()).get0();
+            muts = replica::read_tablet_mutations(e.local_qp().proxy().get_db()).get();
         });
 
         testlog.info("Read mutations in {:.6f} [ms]", time_to_read_muts.count() * 1000);
+
+        auto time_to_read_hosts = duration_in_seconds([&] {
+            replica::read_required_hosts(e.local_qp()).get();
+        });
+
+        testlog.info("Read required hosts in {:.6f} [ms]", time_to_read_hosts.count() * 1000);
 
         auto cm_size = 0;
         for (auto&& cm : muts) {
@@ -138,6 +146,49 @@ static future<> test_basic_operations(app_template& app) {
 
         auto&& tablets_table = e.local_db().find_column_family(db::system_keyspace::tablets());
         testlog.info("Disk space used by system.tablets: {:.6f} [MiB]", double(tablets_table.get_stats().live_disk_space_used) / MiB);
+
+        locator::tablet_metadata_change_hint hint;
+
+        // Migrate one tablet to h2
+        {
+            const auto last_table_id = ids.back();
+            const auto& tmap = tm.get_tablet_map(last_table_id);
+
+            auto ts = utils::UUID_gen::micros_timestamp(e.get_system_keyspace().local().get_last_group0_state_id().get()) + 1;
+
+            const auto tb = tmap.first_tablet();
+            replica::tablet_mutation_builder builder(ts++, last_table_id);
+            const auto token = tmap.get_last_token(tb);
+
+            builder.set_new_replicas(token,
+                tablet_replica_set {
+                    tablet_replica {h2, 0},
+                }
+            );
+            builder.set_stage(token, tablet_transition_stage::streaming);
+            builder.set_transition(token, tablet_transition_kind::migration);
+
+            std::vector<mutation> muts;
+            muts.push_back(builder.build());
+            e.local_db().apply(freeze(muts), db::no_timeout).get();
+            replica::update_tablet_metadata_change_hint(hint, muts.front());
+        }
+
+        using clk = std::chrono::high_resolution_clock;
+
+        const auto start_full_reload = clk::now();
+        const auto tm_full_reload = read_tablet_metadata(e.local_qp()).get();
+        const auto end_full_reload = clk::now();
+        const auto full_reload_duration = std::chrono::duration<double, std::milli>(end_full_reload - start_full_reload);
+
+        const auto start_partial_reload = clk::now();
+        update_tablet_metadata(e.local_db(), e.local_qp(), tm, hint).get();
+        const auto end_partial_reload = clk::now();
+        const auto partial_reload_duration = std::chrono::duration<double, std::milli>(end_partial_reload - start_partial_reload);
+
+        assert(tm == tm_full_reload);
+
+        testlog.info("Tablet metadata reload:\nfull    {:>8.2f}ms\npartial {:>8.2f}ms", full_reload_duration.count(), partial_reload_duration.count());
     }, tablet_cql_test_config());
 }
 
@@ -148,7 +199,7 @@ int scylla_tablets_main(int argc, char** argv) {
     app_template app;
     app.add_options()
             ("tables", bpo::value<int>()->default_value(100), "Number of tables to create.")
-            ("tablets-per-table", bpo::value<int>()->default_value(10000), "Number of tablets per table.")
+            ("tablets-per-table", bpo::value<int>()->default_value(2048), "Number of tablets per table.")
             ("rf", bpo::value<int>()->default_value(3), "Number of replicas per tablet.")
             ("verbose", "Enables standard logging")
             ;

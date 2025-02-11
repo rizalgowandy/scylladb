@@ -22,6 +22,13 @@ To start a single ScyllaDB node instance in a Docker container, run:
 
  docker run --name some-scylla -d scylladb/scylla
 
+If you're on macOS and plan to start a multi-node cluster (3 nodes or more), start ScyllaDB with
+``–reactor-backend=epoll`` to override the default ``linux-aio`` reactor backend:
+
+.. code-block:: console
+
+ docker run --name some-scylla -d scylladb/scylla --reactor-backend=epoll
+
 The ``docker run`` command starts a new Docker instance in the background named some-scylla that runs the ScyllaDB server:
 
 .. code-block:: console
@@ -31,7 +38,7 @@ The ``docker run`` command starts a new Docker instance in the background named 
  CONTAINER ID        IMAGE               COMMAND                  CREATED             STATUS              PORTS                                          NAMES
  616ee646cb9d        scylladb/scylla     "/docker-entrypoint.p"   4 seconds ago       Up 4 seconds        7000-7001/tcp, 9042/tcp, 9160/tcp, 10000/tcp   some-scylla
 
-As seen from the ``docker ps`` output, the image exposes ports **7000-7001** (Inter-node RPC), **9042** (CQL), **9160** (Thrift), and **10000** (REST API).
+As seen from the ``docker ps`` output, the image exposes ports **7000-7001** (Inter-node RPC), **9042** (CQL), and **10000** (REST API).
 
 
 Viewing ScyllaDB Server Logs
@@ -95,6 +102,12 @@ With a single ``some-scylla`` instance running,  joining new nodes to form a clu
 
  docker run --name some-scylla2 -d scylladb/scylla --seeds="$(docker inspect --format='{{ .NetworkSettings.IPAddress }}' some-scylla)"
 
+If you're on macOS, ensure to add the ``–reactor-backend=epoll`` option when adding new nodes:
+
+.. code-block:: console
+
+ docker run --name some-scylla2 -d scylladb/scylla --reactor-backend=epoll --seeds="$(docker inspect --format='{{ .NetworkSettings.IPAddress }}' some-scylla)"
+
 To query when the node is up and running (and view the status of the entire cluster) use the ``nodetool status`` command:
 
 .. code-block:: console
@@ -136,7 +149,7 @@ Overriding scylla.yaml with a Master File
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 Sometimes, it’s not possible to adjust ScyllaDB-specific settings (including non-network properties, like ``cluster_name`` ) directly from the command line when ScyllaDB is running within Docker.
 
-Instead, it may be necessary to incrementally override ``scylla.yaml`` settings by passing an external, master Scylla.yaml file when starting the Docker container for the node.
+Instead, it may be necessary to incrementally override ``scylla.yaml`` settings by passing an external, master ScyllaDB.yaml file when starting the Docker container for the node.
 
 To do this, you can use the ``--volume (-v)`` command as before to specify the overriding ``.yaml`` file:
 
@@ -276,17 +289,17 @@ To disable developer mode:
 
   docker run --name some-scylla -d scylladb/scylla --developer-mode 0
 
---experimental ENABLE
----------------------
-The ``--experimental`` command line option enables Scylla's experimental mode. If no ``--experimental`` command line option is defined, ScyllaDB defaults to running with experimental mode disabled.
+--experimental-features FEATURE
+-------------------------------
+The ``--experimental-features`` command line option enables ScyllaDB's experimental feature individually. If no feature flags are specified, ScyllaDB runs with only stable features enabled.
 
-**It is highly recommended to disable experimental mode for production deployments.**
+**Running experimental features in production environments is not recommended.**
 
-For example, to enable experimental mode:
+For example, to enable the User Defined Functions (UDF) feature:
 
 .. code-block:: console
 
-  docker run --name some-scylla -d scylladb/scylla --experimental 1
+  docker run --name some-scylla -d scylladb/scylla --experimental-features=udf
 
 Other Useful Tips and Tricks
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^

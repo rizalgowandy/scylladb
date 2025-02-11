@@ -3,18 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
+
+#pragma once
 
 #include "replica/database.hh"
 #include "db/system_keyspace.hh"
-#include "db/timeout_clock.hh"
-#include "readers/flat_mutation_reader_v2.hh"
+#include "readers/mutation_reader.hh"
 #include "mutation/mutation_fragment.hh"
 #include "query-request.hh"
 #include "schema/schema_fwd.hh"
-
-#include <boost/range/iterator_range.hpp>
 
 #include <iterator>
 #include <memory>
@@ -38,14 +37,14 @@ namespace db::view {
 class build_progress_virtual_reader {
     replica::database& _db;
 
-    struct build_progress_reader : flat_mutation_reader_v2::impl {
+    struct build_progress_reader : mutation_reader::impl {
         column_id _scylla_next_token_col;
         column_id _scylla_generation_number_col;
         column_id _legacy_last_token_col;
         column_id _legacy_generation_number_col;
         const query::partition_slice& _legacy_slice;
         query::partition_slice _slice;
-        flat_mutation_reader_v2 _underlying;
+        mutation_reader _underlying;
         std::optional<clustering_key> _previous_clustering_key;
 
         build_progress_reader(
@@ -57,7 +56,7 @@ class build_progress_virtual_reader {
                 tracing::trace_state_ptr trace_state,
                 streamed_mutation::forwarding fwd,
                 mutation_reader::forwarding fwd_mr)
-                : flat_mutation_reader_v2::impl(std::move(legacy_schema), permit)
+                : mutation_reader::impl(std::move(legacy_schema), permit)
                 , _scylla_next_token_col(scylla_views_build_progress.schema()->get_column_definition("next_token")->id)
                 , _scylla_generation_number_col(scylla_views_build_progress.schema()->get_column_definition("generation_number")->id)
                 , _legacy_last_token_col(_schema->get_column_definition("last_token")->id)
@@ -100,7 +99,7 @@ class build_progress_virtual_reader {
             // Drop the cpu_id from the clustering key
             auto end = underlying_ck.begin(underlying_schema());
             std::advance(end, underlying_schema().clustering_key_size() - 1);
-            auto r = boost::make_iterator_range(underlying_ck.begin(underlying_schema()), std::move(end));
+            auto r = std::ranges::subrange(underlying_ck.begin(underlying_schema()), std::move(end));
             return clustering_key_prefix::from_exploded(r);
         }
 
@@ -185,7 +184,7 @@ public:
             : _db(db) {
     }
 
-    flat_mutation_reader_v2 operator()(
+    mutation_reader operator()(
             schema_ptr s,
             reader_permit permit,
             const dht::partition_range& range,
@@ -193,7 +192,7 @@ public:
             tracing::trace_state_ptr trace_state,
             streamed_mutation::forwarding fwd,
             mutation_reader::forwarding fwd_mr) {
-        return flat_mutation_reader_v2(std::make_unique<build_progress_reader>(
+        return mutation_reader(std::make_unique<build_progress_reader>(
                 s,
                 std::move(permit),
                 _db.find_column_family(s->ks_name(), system_keyspace::v3::SCYLLA_VIEWS_BUILDS_IN_PROGRESS),

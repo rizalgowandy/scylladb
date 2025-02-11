@@ -3,11 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
-#include <seastar/util/bool_class.hh>
 #include <seastar/util/optimized_optional.hh>
 
 using namespace seastar;

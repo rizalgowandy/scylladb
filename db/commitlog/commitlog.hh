@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -12,9 +12,7 @@
 #include <memory>
 
 #include <seastar/core/future.hh>
-#include <seastar/core/shared_ptr.hh>
-#include <seastar/core/stream.hh>
-#include <seastar/core/file.hh>
+#include <seastar/core/simple-stream.hh>
 #include "replay_position.hh"
 #include "commitlog_entry.hh"
 #include "db/timeout_clock.hh"
@@ -95,6 +93,7 @@ public:
         sstring metrics_category_name;
         uint64_t commitlog_total_space_in_mb = 0;
         std::optional<uint64_t> commitlog_flush_threshold_in_mb = {};
+        std::optional<uint64_t> commitlog_data_max_lifetime_in_seconds = {};
         uint64_t commitlog_segment_size_in_mb = 32;
         uint64_t commitlog_sync_period_in_ms = 10 * 1000; //TODO: verify default!
         // Max number of segments to keep in pre-alloc reserve.
@@ -109,7 +108,8 @@ public:
 
         bool use_o_dsync = false;
         bool warn_about_segments_left_on_disk_after_shutdown = true;
-        bool allow_going_over_size_limit = true;
+        bool allow_going_over_size_limit = false;
+        bool allow_fragmented_entries = false;
 
         // The base segment ID to use.
         // The segment IDs of newly allocated segments will be issued sequentially
@@ -135,7 +135,8 @@ public:
         static inline constexpr uint32_t segment_version_1 = 1u;
         static inline constexpr uint32_t segment_version_2 = 2u;
         static inline constexpr uint32_t segment_version_3 = 3u;
-        static inline constexpr uint32_t current_version = segment_version_3;
+        static inline constexpr uint32_t segment_version_4 = 4u;
+        static inline constexpr uint32_t current_version = segment_version_4;
 
         descriptor(descriptor&&) noexcept = default;
         descriptor(const descriptor&) = default;
@@ -161,6 +162,12 @@ public:
      */
     static future<commitlog> create_commitlog(config);
 
+    /**
+     * Update a running instance with new config options.
+     * Note: only some options (see code part) are actually 
+     * applied once started.
+     */
+    void update_configuration(const config&);
 
     /**
      * Note: To be able to keep impl out of header file,
@@ -239,6 +246,13 @@ public:
     future<> force_new_active_segment() noexcept;
 
     /**
+     * Waits for all segment deletes issued up until now to complete.
+     * Segment delete is done when a segment no longer is active or dirty,
+     * thus most often by calls to `discard_completed_segments` above.
+    */
+    future<> wait_for_pending_deletes() noexcept;
+
+    /**
      * A 'flush_handler' is invoked when the CL determines that size on disk has
      * exceeded allowable threshold. It is called once for every currently active
      * CF id with the highest replay_position which we would prefer to free "until".
@@ -290,6 +304,7 @@ public:
     future<> delete_segments(std::vector<sstring>) const;
 
     uint64_t get_total_size() const;
+    uint64_t get_buffer_size() const;
     uint64_t get_completed_tasks() const;
     uint64_t get_flush_count() const;
     uint64_t get_pending_tasks() const;
@@ -362,7 +377,15 @@ public:
 
     gc_clock::time_point min_gc_time(const cf_id_type&) const;
 
-    typedef std::function<future<>(buffer_and_replay_position)> commit_load_reader_func;
+    // Return the lowest possible replay position across all existing or future commitlog segments.
+    // In other words, only positions greater or equal to min_position() can
+    // be replayed on the next reboot.
+    replay_position min_position() const;
+
+    // (Re-)set data mix lifetime.
+    void update_max_data_lifetime(std::optional<uint64_t> commitlog_data_max_lifetime_in_seconds);
+
+    using commit_load_reader_func = std::function<future<>(buffer_and_replay_position)>;
 
     class segment_error : public std::exception {};
 
@@ -408,7 +431,18 @@ public:
         const char* what() const noexcept override;
     };
 
+    class replay_state {
+    public:
+        replay_state();
+        ~replay_state();
+    private:
+        friend class commitlog;
+        class impl;
+        std::unique_ptr<impl> _impl;
+    };
+
     static future<> read_log_file(sstring filename, sstring prefix, commit_load_reader_func, position_type = 0, const db::extensions* = nullptr);
+    static future<> read_log_file(const replay_state&, sstring filename, sstring prefix, commit_load_reader_func, position_type = 0, const db::extensions* = nullptr);
 private:
     commitlog(config);
 

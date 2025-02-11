@@ -5,25 +5,28 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "auth/resource.hh"
 
 #include <algorithm>
+#include <fmt/core.h>
 #include <iterator>
 #include <unordered_map>
 
-#include <boost/algorithm/string/join.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
 
-#include "service/storage_proxy.hh"
-#include "data_dictionary/user_types_metadata.hh"
+#include "cql3/functions/aggregate_function.hh"
+#include "cql3/functions/user_function.hh"
 #include "cql3/util.hh"
 #include "db/marshal/type_parser.hh"
+#include "utils/log.hh"
 
 namespace auth {
+
+static logging::logger logger("auth_resource");
 
 static const std::unordered_map<resource_kind, std::string_view> roots{
         {resource_kind::data, "data"},
@@ -144,7 +147,7 @@ resource::resource(functions_resource_t, std::string_view keyspace, std::string_
 }
 
 sstring resource::name() const {
-    return boost::algorithm::join(_parts, "/");
+    return fmt::to_string(fmt::join(_parts, "/"));
 }
 
 std::optional<resource> resource::parent() const {
@@ -182,31 +185,15 @@ bool operator<(const resource& r1, const resource& r2) {
             r2._parts.cend());
 }
 
-std::ostream& operator<<(std::ostream& os, const resource& r) {
-    switch (r.kind()) {
-        case resource_kind::data: return os << data_resource_view(r);
-        case resource_kind::role: return os << role_resource_view(r);
-        case resource_kind::service_level: return os << service_level_resource_view(r);
-        case resource_kind::functions: return os << functions_resource_view(r);
-    }
-
-    return os;
-}
-
 service_level_resource_view::service_level_resource_view(const resource &r) {
     if (r._kind != resource_kind::service_level) {
         throw resource_kind_mismatch(resource_kind::service_level, r._kind);
     }
 }
 
-std::ostream &operator<<(std::ostream &os, const service_level_resource_view &v) {
-    os << "<all service levels>";
-    return os;
-}
-
 sstring encode_signature(std::string_view name, std::vector<data_type> args) {
-    return format("{}[{}]", name,
-            fmt::join(args | boost::adaptors::transformed([] (const data_type t) {
+    return seastar::format("{}[{}]", name,
+            fmt::join(args | std::views::transform([] (const data_type t) {
                 return t->name();
             }), "^"));
 }
@@ -221,11 +208,10 @@ std::pair<sstring, std::vector<data_type>> decode_signature(std::string_view enc
     }
     std::vector<std::string_view> raw_types;
     boost::split(raw_types, encoded_signature, boost::is_any_of("^"));
-    std::vector<data_type> decoded_types = boost::copy_range<std::vector<data_type>>(
-        raw_types | boost::adaptors::transformed([] (std::string_view raw_type) {
+    std::vector<data_type> decoded_types =
+        raw_types | std::views::transform([] (std::string_view raw_type) {
             return db::marshal::type_parser::parse(raw_type);
-        })
-    );
+        }) | std::ranges::to<std::vector>();
     return {sstring(function_name), decoded_types};
 }
 
@@ -234,32 +220,19 @@ std::pair<sstring, std::vector<data_type>> decode_signature(std::string_view enc
 // to the short form (int)
 static sstring decoded_signature_string(std::string_view encoded_signature) {
     auto [function_name, arg_types] = decode_signature(encoded_signature);
-    return format("{}({})", cql3::util::maybe_quote(sstring(function_name)),
-            boost::algorithm::join(arg_types | boost::adaptors::transformed([] (data_type t) {
+    return seastar::format("{}({})", cql3::util::maybe_quote(sstring(function_name)),
+            fmt::join(arg_types | std::views::transform([] (data_type t) {
                 return t->cql3_type_name();
             }), ", "));
 }
 
-std::ostream &operator<<(std::ostream &os, const functions_resource_view &v) {
-    const auto keyspace = v.keyspace();
-    const auto function_signature = v.function_signature();
-    const auto name = v.function_name();
-    const auto args = v.function_args();
-
-    if (!keyspace) {
-        os << "<all functions>";
-    } else if (name) {
-        os << "<function " << *keyspace << '.' << cql3::util::maybe_quote(sstring(*name)) << '(';
-        for (auto arg : *args) {
-            os << arg << ',';
-        }
-        os << ")>";
-    } else if (!function_signature) {
-        os << "<all functions in " << *keyspace << '>';
-    } else {
-        os << "<function " << *keyspace << '.' << decoded_signature_string(*function_signature) << '>';
+resource make_functions_resource(const cql3::functions::function& f) {
+    if (!dynamic_cast<const cql3::functions::user_function*>(&f) &&
+            !dynamic_cast<const cql3::functions::aggregate_function*>(&f)) {
+        on_internal_error(logger, "unsuppported function type");
     }
-    return os;
+    auto&& sig = auth::encode_signature(f.name().name, f.arg_types());
+    return make_functions_resource(f.name().keyspace, sig);
 }
 
 functions_resource_view::functions_resource_view(const resource& r) : _resource(r) {
@@ -321,27 +294,16 @@ std::optional<std::string_view> data_resource_view::keyspace() const {
     return _resource._parts[1];
 }
 
+bool data_resource_view::is_keyspace() const {
+    return _resource._parts.size() == 2;
+}
+
 std::optional<std::string_view> data_resource_view::table() const {
     if (_resource._parts.size() <= 2) {
         return {};
     }
 
     return _resource._parts[2];
-}
-
-std::ostream& operator<<(std::ostream& os, const data_resource_view& v) {
-    const auto keyspace = v.keyspace();
-    const auto table = v.table();
-
-    if (!keyspace) {
-        os << "<all keyspaces>";
-    } else if (!table) {
-        os << "<keyspace " << *keyspace << '>';
-    } else {
-        os << "<table " << *keyspace << '.' << *table << '>';
-    }
-
-    return os;
 }
 
 role_resource_view::role_resource_view(const resource& r) : _resource(r) {
@@ -356,18 +318,6 @@ std::optional<std::string_view> role_resource_view::role() const {
     }
 
     return _resource._parts[1];
-}
-
-std::ostream& operator<<(std::ostream& os, const role_resource_view& v) {
-    const auto role = v.role();
-
-    if (!role) {
-        os << "<all roles>";
-    } else {
-        os << "<role " << *role << '>';
-    }
-
-    return os;
 }
 
 resource parse_resource(std::string_view name) {
@@ -440,3 +390,78 @@ resource_set expand_resource_family(const resource& rr) {
 }
 
 }
+
+template <> struct fmt::formatter<auth::role_resource_view> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const auth::role_resource_view& v, fmt::format_context& ctx) const {
+        const auto role = v.role();
+        if (role) {
+            return fmt::format_to(ctx.out(), "<role {}>", *role);
+        } else {
+            return fmt::format_to(ctx.out(), "<all roles>");
+        }
+    }
+};
+
+template <> struct fmt::formatter<auth::service_level_resource_view> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const auth::service_level_resource_view& v, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "<all service levels>");
+    }
+};
+
+template <> struct fmt::formatter<auth::functions_resource_view> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const auth::functions_resource_view& v, fmt::format_context& ctx) const {
+        const auto keyspace = v.keyspace();
+        if (!keyspace) {
+            return fmt::format_to(ctx.out(), "<all functions>");
+        }
+
+        const auto name = v.function_name();
+        if (name) {
+            auto out = ctx.out();
+            out = fmt::format_to(out, "<function {}.{}(", *keyspace, cql3::util::maybe_quote(sstring(*name)));
+            const auto args = v.function_args();
+            for (auto arg : *args) {
+                out = fmt::format_to(out, "{},", arg);
+            }
+            return fmt::format_to(out, ")>");
+        }
+
+        const auto function_signature = v.function_signature();
+        if (!function_signature) {
+            return fmt::format_to(ctx.out(), "<all functions in {}>", *keyspace);
+        }
+
+        return fmt::format_to(ctx.out(), "<function {}.{}>", *keyspace, auth::decoded_signature_string(*function_signature));
+    }
+};
+
+auto fmt::formatter<auth::data_resource_view>::format(const auth::data_resource_view& v,
+                                                      fmt::format_context& ctx) const -> decltype(ctx.out()) {
+    const auto keyspace = v.keyspace();
+    if (!keyspace) {
+        return fmt::format_to(ctx.out(), "<all keyspaces>");
+    }
+
+    const auto table = v.table();
+    if (!table) {
+        return fmt::format_to(ctx.out(), "<keyspace {}>", *keyspace);
+    }
+    return fmt::format_to(ctx.out(), "<table {}.{}>", *keyspace, *table);
+}
+
+auto fmt::formatter<auth::resource>::format(const auth::resource& r,
+                                            fmt::format_context& ctx) const -> decltype(ctx.out()) {
+    auto out = ctx.out();
+    switch (r.kind()) {
+    using enum auth::resource_kind;
+    case data: return fmt::format_to(out, "{}", auth::data_resource_view(r));
+    case role: return fmt::format_to(out, "{}", auth::role_resource_view(r));
+    case service_level: return fmt::format_to(out, "{}", auth::service_level_resource_view(r));
+    case functions: return fmt::format_to(out, "{}", auth::functions_resource_view(r));
+    }
+    return out;
+}
+

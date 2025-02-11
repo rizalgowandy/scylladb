@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -12,12 +12,10 @@
 #include <functional>
 #include <optional>
 #include <variant>
-#include <seastar/core/smp.hh>
-#include <seastar/core/file.hh>
 #include "sstables/types_fwd.hh"
 #include "sstables/sstable_set.hh"
-#include "utils/UUID.hh"
 #include "compaction_fwd.hh"
+#include "mutation_writer/token_group_based_splitting_writer.hh"
 
 namespace sstables {
 
@@ -30,9 +28,8 @@ enum class compaction_type {
     Reshard = 5,
     Upgrade = 6,
     Reshape = 7,
+    Split = 8,
 };
-
-std::ostream& operator<<(std::ostream& os, compaction_type type);
 
 struct compaction_completion_desc {
     // Old, existing SSTables that should be deleted and removed from the SSTable set.
@@ -82,8 +79,11 @@ public:
     };
     struct reshape {
     };
+    struct split {
+        mutation_writer::classify_by_token_group classifier;
+    };
 private:
-    using options_variant = std::variant<regular, cleanup, upgrade, scrub, reshard, reshape>;
+    using options_variant = std::variant<regular, cleanup, upgrade, scrub, reshard, reshape, split>;
 
 private:
     options_variant _options;
@@ -117,6 +117,10 @@ public:
         return compaction_type_options(scrub{.operation_mode = mode, .quarantine_sstables = quarantine_sstables});
     }
 
+    static compaction_type_options make_split(mutation_writer::classify_by_token_group classifier) {
+        return compaction_type_options(split{std::move(classifier)});
+    }
+
     template <typename... Visitor>
     auto visit(Visitor&&... visitor) const {
         return std::visit(std::forward<Visitor>(visitor)..., _options);
@@ -133,10 +137,8 @@ public:
 };
 
 std::string_view to_string(compaction_type_options::scrub::mode);
-std::ostream& operator<<(std::ostream& os, compaction_type_options::scrub::mode scrub_mode);
 
 std::string_view to_string(compaction_type_options::scrub::quarantine_mode);
-std::ostream& operator<<(std::ostream& os, compaction_type_options::scrub::quarantine_mode quarantine_mode);
 
 class dummy_tag {};
 using has_only_fully_expired = seastar::bool_class<dummy_tag>;
@@ -168,6 +170,16 @@ struct compaction_descriptor {
 
     // Denotes if this compaction task is comprised solely of completely expired SSTables
     sstables::has_only_fully_expired has_only_fully_expired = has_only_fully_expired::no;
+
+    // If set to true, gc will check only the compacting sstables to collect tombstones.
+    // If set to false, gc will check the memtables, commit log and other uncompacting
+    // sstables to decide if a tombstone can be collected. Note that these checks are
+    // not perfect. W.r.to memtables and uncompacted SSTables, if their minimum timestamp
+    // is less than that of the tombstone and they contain the key, the tombstone will
+    // not be collected. No row-level, cell-level check takes place. W.r.to the commit
+    // log, there is currently no way to check if the key exists; only the minimum
+    // timestamp comparison, similar to memtables, is performed.
+    bool gc_check_only_compacting_sstables = false;
 
     compaction_descriptor() = default;
 
@@ -207,3 +219,16 @@ struct compaction_descriptor {
 };
 
 }
+
+template <>
+struct fmt::formatter<sstables::compaction_type> : fmt::formatter<string_view> {
+    auto format(sstables::compaction_type, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+template <>
+struct fmt::formatter<sstables::compaction_type_options::scrub::mode> : fmt::formatter<string_view> {
+    auto format(sstables::compaction_type_options::scrub::mode, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+template <>
+struct fmt::formatter<sstables::compaction_type_options::scrub::quarantine_mode> : fmt::formatter<string_view> {
+    auto format(sstables::compaction_type_options::scrub::quarantine_mode, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

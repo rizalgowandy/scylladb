@@ -3,14 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "dht/ring_position.hh"
 #include "dht/token-sharding.hh"
-#include "range.hh"
+#include "interval.hh"
 
 #include <vector>
 
@@ -42,13 +42,14 @@ struct ring_position_range_and_shard {
 };
 
 // Incrementally divides a `partition_range` into sub-ranges wholly owned by a single shard.
+// During tablet migration uses a view on shard routing for reads.
 class ring_position_range_sharder {
     const sharder& _sharder;
     dht::partition_range _range;
     bool _done = false;
 public:
     // Initializes the ring_position_range_sharder with a given range to subdivide.
-    ring_position_range_sharder(const sharder& sharder, nonwrapping_range<ring_position> rrp)
+    ring_position_range_sharder(const sharder& sharder, interval<ring_position> rrp)
             : _sharder(sharder), _range(std::move(rrp)) {}
     // Fetches the next range-shard mapping. When the input range is exhausted, std::nullopt is
     // returned. The returned ranges are contiguous and non-overlapping, and together span the
@@ -74,7 +75,7 @@ struct ring_position_range_and_shard_and_element : ring_position_range_and_shard
 // Incrementally divides several non-overlapping `partition_range`:s into sub-ranges wholly owned by
 // a single shard.
 //
-// Similar to ring_position_range_sharder, but instead of stopping when the input range is exhauseted,
+// Similar to ring_position_range_sharder, but instead of stopping when the input range is exhausted,
 // moves on to the next input range (input ranges are supplied in a vector).
 //
 // This has two use cases:
@@ -85,7 +86,8 @@ struct ring_position_range_and_shard_and_element : ring_position_range_and_shard
 // 2. sstable shard mappings. An sstable has metadata describing which ranges it owns, and this is
 //    used to see what shards these ranges map to (and therefore to see if the sstable is shared or
 //    not, and which shards share it).
-
+//
+// During migration uses a view on shard routing for reads.
 class ring_position_range_vector_sharder {
     using vec_type = dht::partition_range_vector;
     vec_type _ranges;
@@ -117,6 +119,7 @@ public:
 
 // Incrementally divides a `partition_range` into sub-ranges wholly owned by a single shard.
 // Unlike ring_position_range_sharder, it only returns result for a shard number provided by the caller.
+// During topology changes, reflects shard assignment for reads.
 class selective_token_range_sharder {
     const sharder& _sharder;
     dht::token_range _range;
@@ -124,7 +127,7 @@ class selective_token_range_sharder {
     bool _done = false;
     shard_id _next_shard;
     dht::token _start_token;
-    std::optional<range_bound<dht::token>> _start_boundary;
+    std::optional<interval_bound<dht::token>> _start_boundary;
 public:
     // Initializes the selective_token_range_sharder with a token range and shard_id of interest.
     selective_token_range_sharder(const sharder& sharder, dht::token_range range, shard_id shard)
@@ -133,8 +136,8 @@ public:
             , _shard(shard)
             , _next_shard(_shard + 1 == _sharder.shard_count() ? 0 : _shard + 1)
             , _start_token(_range.start() ? _range.start()->value() : minimum_token())
-            , _start_boundary(_sharder.shard_of(_start_token) == shard ?
-                _range.start() : range_bound<dht::token>(_sharder.token_for_next_shard(_start_token, shard))) {
+            , _start_boundary(_sharder.shard_for_reads(_start_token) == shard ?
+                _range.start() : interval_bound<dht::token>(_sharder.token_for_next_shard_for_reads(_start_token, shard))) {
     }
     // Returns the next token_range that is both wholly contained within the input range and also
     // wholly owned by the input shard_id. When the input range is exhausted, std::nullopt is returned.

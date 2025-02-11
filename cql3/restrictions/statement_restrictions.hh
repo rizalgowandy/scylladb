@@ -5,17 +5,15 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include <vector>
-#include <list>
 #include "bounds_slice.hh"
 #include "cql3/expr/expression.hh"
 #include "cql3/expr/restrictions.hh"
-#include "utils/to_string.hh"
 #include "schema/schema_fwd.hh"
 #include "cql3/prepare_context.hh"
 #include "cql3/statements/statement_type.hh"
@@ -43,6 +41,7 @@ private:
     expr::expression _partition_key_restrictions = expr::conjunction({});
 
     expr::single_column_restrictions_map _single_column_partition_key_restrictions;
+    expr::expression _partition_level_filter = expr::conjunction({});
 
     /**
      * Restrictions on clustering columns
@@ -50,6 +49,7 @@ private:
     expr::expression _clustering_columns_restrictions = expr::conjunction({});
 
     expr::single_column_restrictions_map _single_column_clustering_key_restrictions;
+    expr::expression _clustering_row_level_filter = expr::conjunction({});
 
     /**
      * Restriction on non-primary key columns (i.e. secondary index restrictions)
@@ -57,6 +57,9 @@ private:
     expr::expression _nonprimary_key_restrictions = expr::conjunction({});
 
     expr::single_column_restrictions_map _single_column_nonprimary_key_restrictions;
+
+    expr::expression _regular_columns_filter = expr::conjunction({});
+
 
     std::unordered_set<const column_definition*> _not_null_columns;
 
@@ -116,6 +119,10 @@ private:
 
 
     check_indexes _check_indexes = check_indexes::yes;
+    std::vector<const column_definition*> _column_defs_for_filtering;
+    schema_ptr _view_schema;
+    std::optional<secondary_index::index> _idx_opt;
+    expr::expression _idx_restrictions = expr::conjunction({});
 public:
     /**
      * Creates a new empty <code>StatementRestrictions</code>.
@@ -125,15 +132,28 @@ public:
      */
     statement_restrictions(schema_ptr schema, bool allow_filtering);
 
+    friend statement_restrictions analyze_statement_restrictions(
+        data_dictionary::database db,
+        schema_ptr schema,
+        statements::statement_type type,
+        const expr::expression& where_clause,
+        prepare_context& ctx,
+        bool selects_only_static_columns,
+        bool for_view,
+        bool allow_filtering,
+        check_indexes do_check_indexes);
+
+private:
     statement_restrictions(data_dictionary::database db,
         schema_ptr schema,
         statements::statement_type type,
         const expr::expression& where_clause,
         prepare_context& ctx,
         bool selects_only_static_columns,
-        bool for_view = false,
-        bool allow_filtering = false,
-        check_indexes do_check_indexes = check_indexes::yes);
+        bool for_view,
+        bool allow_filtering,
+        check_indexes do_check_indexes);
+public:
 
     const std::vector<expr::expression>& index_restrictions() const;
 
@@ -252,7 +272,10 @@ public:
      * @return the <code>column_definition</code> for the unrestricted column.
      */
     const column_definition& unrestricted_column(column_kind kind) const;
+
+    schema_ptr get_view_schema() const { return _view_schema; }
 private:
+    std::pair<std::optional<secondary_index::index>, expr::expression> do_find_idx(const secondary_index::secondary_index_manager& sim) const;
     void add_restriction(const expr::binary_operator& restr, schema_ptr schema, bool allow_filtering, bool for_view);
     void add_is_not_restriction(const expr::binary_operator& restr, schema_ptr schema, bool for_view);
     void add_single_column_parition_key_restriction(const expr::binary_operator& restr, schema_ptr schema, bool allow_filtering, bool for_view);
@@ -288,7 +311,7 @@ private:
     void add_clustering_restrictions_to_idx_ck_prefix(const schema& idx_tbl_schema);
 
     unsigned int num_clustering_prefix_columns_that_need_not_be_filtered() const;
-
+    void calculate_column_defs_for_filtering_and_erase_restrictions_used_for_index(data_dictionary::database db);
 public:
     /**
      * Returns the specified range of the partition key.
@@ -310,7 +333,7 @@ public:
      */
     bool need_filtering() const;
 
-    void validate_secondary_index_selections(bool selects_only_static_columns);
+    void validate_secondary_index_selections(bool selects_only_static_columns) const;
 
     /**
      * Checks if the query has some restrictions on the clustering columns.
@@ -345,16 +368,21 @@ public:
         return _single_column_nonprimary_key_restrictions;
     }
 
-    /**
-     * @return partition key restrictions split into single column restrictions (e.g. for filtering support).
-     */
-    const expr::single_column_restrictions_map& get_single_column_partition_key_restrictions() const;
+    // Returns any filter that needs to be applied to a row, but if it fails, it will fail for all rows in the partition.
+    // If a column is used for a secondary index, it will not be in the filter.
+    //
+    // This filter will only reference partition key columns and static columns.
+    const expr::expression& get_partition_level_filter() const {
+        return _partition_level_filter;
+    }
 
-    /**
-     * @return clustering key restrictions split into single column restrictions (e.g. for filtering support).
-     */
-    const expr::single_column_restrictions_map& get_single_column_clustering_key_restrictions() const;
+    // Returns any filter that needs to be applied to each clustering row. If one of the column restrictions is translated
+    // to read_command, it will not be in the filter.
+    const expr::expression& get_clustering_row_level_filter() const {
+        return _clustering_row_level_filter;
+    }
 
+private:
     /// Prepares internal data for evaluating index-table queries.  Must be called before
     /// get_local_index_clustering_ranges().
     void prepare_indexed_local(const schema& idx_tbl_schema);
@@ -363,6 +391,7 @@ public:
     /// get_global_index_clustering_ranges() or get_global_index_token_clustering_ranges().
     void prepare_indexed_global(const schema& idx_tbl_schema);
 
+public:
     /// Calculates clustering ranges for querying a global-index table.
     std::vector<query::clustering_range> get_global_index_clustering_ranges(
             const query_options& options, const schema& idx_tbl_schema) const;
@@ -380,6 +409,34 @@ public:
     /// Checks that the primary key restrictions don't contain null values, throws invalid_request_exception otherwise.
     void validate_primary_key(const query_options& options) const;
 };
+
+statement_restrictions analyze_statement_restrictions(
+        data_dictionary::database db,
+        schema_ptr schema,
+        statements::statement_type type,
+        const expr::expression& where_clause,
+        prepare_context& ctx,
+        bool selects_only_static_columns,
+        bool for_view,
+        bool allow_filtering,
+        check_indexes do_check_indexes);
+
+
+// Extracts all binary operators which have the given column on their left hand side.
+// Extracts only single-column restrictions.
+// Does not include multi-column restrictions.
+// Does not include token() restrictions.
+// Does not include boolean constant restrictions.
+// For example "WHERE c = 1 AND (a, c) = (2, 1) AND token(p) < 2 AND FALSE" will return {"c = 1"}.
+std::vector<expr::expression> extract_single_column_restrictions_for_column(const expr::expression&, const column_definition&);
+
+
+// Checks whether this expression is empty - doesn't restrict anything
+bool is_empty_restriction(const expr::expression&);
+
+// Finds the value of the given column in the expression
+// In case of multpiple possible values calls on_internal_error
+bytes_opt value_for(const column_definition&, const expr::expression&, const query_options&);
 
 }
 

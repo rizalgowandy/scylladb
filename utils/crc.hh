@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  *
  * A crc32 calculation for __PPC64__ uses the code from https://github.com/antonblanchard/crc32-vpmsum
  * written by Anton Blanchard <anton@au.ibm.com>, IBM
@@ -12,30 +12,27 @@
 #pragma once
 
 #include <cstdint>
-#include <type_traits>
 #include <seastar/net/byteorder.hh>
 #include <seastar/core/byteorder.hh>
-
-#include <boost/range/algorithm/for_each.hpp>
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <smmintrin.h>
 #elif defined(__aarch64__)
 #include <arm_acle.h>
 /* Implement x86-64 intrinsics with according aarch64 ones */
-static inline uint32_t _mm_crc32_u8(uint32_t crc, uint8_t in)
+inline uint32_t _mm_crc32_u8(uint32_t crc, uint8_t in)
 {
     return __crc32cb(crc, in);
 }
-static inline uint32_t _mm_crc32_u16(uint32_t crc, uint16_t in)
+inline uint32_t _mm_crc32_u16(uint32_t crc, uint16_t in)
 {
     return __crc32ch(crc, in);
 }
-static inline uint32_t _mm_crc32_u32(uint32_t crc, uint32_t in)
+inline uint32_t _mm_crc32_u32(uint32_t crc, uint32_t in)
 {
     return __crc32cw(crc, in);
 }
-static inline uint32_t _mm_crc32_u64(uint32_t crc, uint64_t in)
+inline uint32_t _mm_crc32_u64(uint32_t crc, uint64_t in)
 {
     return __crc32cd(crc, in);
 }
@@ -210,10 +207,9 @@ public:
     template<typename FragmentedBuffer>
     requires FragmentRange<FragmentedBuffer>
     void process_fragmented(const FragmentedBuffer& buffer) {
-        using boost::range::for_each;
-        for_each(buffer, [this] (bytes_view bv) {
+        for (bytes_view bv : buffer) {
             process(reinterpret_cast<const uint8_t*>(bv.data()), bv.size());
-        });
+        }
     }
 
     uint32_t get() const {

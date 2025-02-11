@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -16,10 +16,6 @@
 #include "utils/logalloc.hh"
 #include "utils/managed_vector.hh"
 
-#include <boost/range/algorithm/equal.hpp>
-#include <boost/algorithm/clamp.hpp>
-#include <boost/version.hpp>
-#include <memory>
 #include <type_traits>
 #include <iterator>
 #include <utility>
@@ -48,7 +44,7 @@ private:
         }
     }
     void do_reserve_for_push_back();
-    size_t make_room(size_t n, bool stop_after_one);
+    void make_room(size_t n, bool stop_after_one);
     chunk_ptr new_chunk(size_t n);
     const T* addr(size_t i) const {
         return &_chunks[i / max_chunk_capacity()][i % max_chunk_capacity()];
@@ -148,22 +144,23 @@ public:
     ///
     /// Allows reserving the memory chunk-by-chunk, avoiding stalls when a lot of
     /// chunks are needed. To drive the reservation to completion, call this
-    /// repeatedly with the value returned from the previous call until it
-    /// returns 0, yielding between calls when necessary. Example usage:
+    /// repeatedly until the vector's capacity reaches the expected size, yielding
+    /// between calls when necessary. Example usage:
     ///
-    ///     return do_until([&size] { return !size; }, [&my_vector, &size] () mutable {
-    ///         size = my_vector.reserve_partial(size);
+    ///     return do_until([&my_vector, size] { return my_vector.capacity() == size; }, [&my_vector, size] () mutable {
+    ///         my_vector.reserve_partial(size);
     ///     });
     ///
     /// Here, `do_until()` takes care of yielding between iterations when
     /// necessary.
     ///
-    /// \returns the memory that remains to be reserved
-    size_t reserve_partial(size_t n) {
+    /// The recommended way to use this method is by calling utils::reserve_gently() from stall_free.hh
+    /// instead of looping with this method directly. utils::reserve_gently() will repeatedly call this
+    /// method to reserve the required quantity, yielding between calls when necessary.
+    void reserve_partial(size_t n) {
         if (n > _capacity) {
             return make_room(n, true);
         }
-        return 0;
     }
 
     size_t memory_size() const {
@@ -264,7 +261,7 @@ public:
     std::reverse_iterator<const_iterator> crend() const { return std::reverse_iterator(cbegin()); }
 public:
     bool operator==(const chunked_managed_vector& x) const {
-        return boost::equal(*this, x);
+        return std::ranges::equal(*this, x);
     }
 
     // Returns the amount of external memory used to hold inserted items.
@@ -359,7 +356,7 @@ chunked_managed_vector<T>::migrate(T* begin, T* end, managed_vector<T>& result) 
 }
 
 template <typename T>
-size_t
+void
 chunked_managed_vector<T>::make_room(size_t n, bool stop_after_one) {
     // First, if the last chunk is below max_chunk_capacity(), enlarge it
 
@@ -391,7 +388,6 @@ chunked_managed_vector<T>::make_room(size_t n, bool stop_after_one) {
         _capacity += now;
         stop = stop_after_one;
     }
-    return (n - _capacity);
 }
 
 template <typename T>
@@ -399,7 +395,7 @@ void
 chunked_managed_vector<T>::do_reserve_for_push_back() {
     if (_capacity == 0) {
         // allocate a bit of room in case utilization will be low
-        reserve(boost::algorithm::clamp(512 / sizeof(T), 1, max_chunk_capacity()));
+        reserve(std::clamp(512 / sizeof(T), size_t(1), max_chunk_capacity()));
     } else if (_capacity < max_chunk_capacity() / 2) {
         // exponential increase when only one chunk to reduce copying
         reserve(_capacity * 2);

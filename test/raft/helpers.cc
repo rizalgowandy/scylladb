@@ -3,13 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 //
 // Helper functions for raft tests
 //
 
+#include "utils/assert.hh"
 #include <seastar/core/sharded.hh>
 
 #include "helpers.hh"
@@ -35,7 +36,7 @@ void election_timeout(raft::fsm& fsm) {
 }
 
 void make_candidate(raft::fsm& fsm) {
-    assert(fsm.is_follower());
+    SCYLLA_ASSERT(fsm.is_follower());
     // NOTE: single node skips candidate state
     while (fsm.is_follower()) {
         fsm.tick();
@@ -54,11 +55,11 @@ bool compare_log_entry(raft::log_entry_ptr le1, raft::log_entry_ptr le2) {
     return true;
 }
 
-bool compare_log_entries(raft::log& log1, raft::log& log2, size_t from, size_t to) {
-    assert(to <= log1.last_idx());
-    assert(to <= log2.last_idx());
-    for (size_t i = from; i <= to; ++i) {
-        if (!compare_log_entry(log1[i], log2[i])) {
+bool compare_log_entries(raft::log& log1, raft::log& log2, raft::index_t from, raft::index_t to) {
+    SCYLLA_ASSERT(to <= log1.last_idx());
+    SCYLLA_ASSERT(to <= log2.last_idx());
+    for (raft::index_t i = from; i <= to; ++i) {
+        if (!compare_log_entry(log1[i.value()], log2[i.value()])) {
             return false;
         }
     }
@@ -94,7 +95,8 @@ communicate_impl(std::function<bool()> stop_pred, raft_routing_map& map) {
         has_traffic = false;
         for (auto e : map) {
             raft::fsm& from = *e.second;
-            for (auto output = from.get_output(); !output.empty(); output = from.get_output()) {
+            for (bool has_output = from.has_output(); has_output; has_output = from.has_output()) {
+                auto output = from.get_output();
                 if (stop_pred()) {
                     return;
                 }

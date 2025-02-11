@@ -3,15 +3,19 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "test/lib/scylla_test_case.hh"
+
+#include <fmt/ranges.h>
+#include <fmt/std.h>
 
 #include "transport/request.hh"
 #include "transport/response.hh"
 
 #include "test/lib/random_utils.hh"
+#include "test/lib/test_utils.hh"
 
 namespace cql3 {
 
@@ -45,15 +49,15 @@ SEASTAR_THREAD_TEST_CASE(test_response_request_reader) {
     res.write_value(bytes_opt(value));
 
     // Name and value list
-    auto names_and_values = boost::copy_range<std::vector<std::pair<sstring, bytes_opt>>>(
-        boost::irange<int16_t>(0, tests::random::get_int<int16_t>(16) + 16)
-        | boost::adaptors::transformed([] (int) {
+    auto names_and_values =
+        std::views::iota(0, tests::random::get_int<int>(16) + 16)
+        | std::views::transform([] (int) {
             return std::pair(
                 tests::random::get_sstring(),
                 !tests::random::get_int(4) ? bytes_opt() : bytes_opt(tests::random::get_bytes(tests::random::get_int<int16_t>(1024)))
             );
         })
-    );
+        | std::ranges::to<std::vector<std::pair<sstring, bytes_opt>>>();
     res.write_short(names_and_values.size());
     for (auto& [ name, value ] : names_and_values) {
         res.write_string(name);
@@ -61,21 +65,21 @@ SEASTAR_THREAD_TEST_CASE(test_response_request_reader) {
     }
 
     // String list
-    auto string_list = boost::copy_range<std::vector<sstring>>(
-        boost::irange<int16_t>(0, tests::random::get_int<int16_t>(16) + 16)
-        | boost::adaptors::transformed([] (int) {
+    auto string_list =
+        std::views::iota(0, tests::random::get_int<int>(16) + 16)
+        | std::views::transform([] (int) {
             return tests::random::get_sstring();
         })
-    );
+        | std::ranges::to<std::vector<sstring>>();
     res.write_string_list(string_list);
 
     // String map
-    auto string_map = boost::copy_range<std::map<sstring, sstring>>(
-        boost::irange<int16_t>(0, tests::random::get_int<int16_t>(16) + 16)
-        | boost::adaptors::transformed([] (int) {
+    auto string_map =
+        std::views::iota(0, tests::random::get_int<int>(16) + 16)
+        | std::views::transform([] (int) {
             return std::pair(tests::random::get_sstring(), tests::random::get_sstring());
         })
-    );
+        | std::ranges::to<std::map>();
     res.write_string_map(string_map);
     auto string_unordered_map = std::unordered_map<sstring, sstring>(string_map.begin(), string_map.end());
 
@@ -106,20 +110,20 @@ SEASTAR_THREAD_TEST_CASE(test_response_request_reader) {
     BOOST_CHECK(v2.unset);
     BOOST_CHECK_EQUAL(to_bytes(req.read_value_view(version).value), value);
 
-    std::vector<sstring_view> names;
+    std::vector<std::string_view> names;
     std::vector<cql3::raw_value_view> values;
     cql3::unset_bind_variable_vector unset;
     req.read_name_and_value_list(version, names, values, unset);
     BOOST_CHECK(std::none_of(unset.begin(), unset.end(), std::identity()));
-    BOOST_CHECK_EQUAL(names, names_and_values | boost::adaptors::transformed([] (auto& name_and_value) {
-        return sstring_view(name_and_value.first);
-    }));
-    BOOST_CHECK_EQUAL(values, names_and_values | boost::adaptors::transformed([] (auto& name_and_value) {
+    BOOST_CHECK(std::ranges::equal(names, names_and_values | std::views::transform([] (auto& name_and_value) {
+        return std::string_view(name_and_value.first);
+    })));
+    BOOST_CHECK(std::ranges::equal(values, names_and_values | std::views::transform([] (auto& name_and_value) {
         if (!name_and_value.second) {
             return cql3::raw_value_view::make_null();
         }
         return cql3::raw_value_view::make_value(fragmented_temporary_buffer::view(*name_and_value.second));
-    }));
+    })));
 
     auto received_string_list = std::vector<sstring>();
     req.read_string_list(received_string_list);

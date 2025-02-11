@@ -1,8 +1,8 @@
 ScyllaDB Large Rows and Large Cells Tables
 ===========================================
 
-This document describes how to detect large rows and large cells in Scylla.
-Scylla is not optimized for very large rows or large cells. They require allocation of large, contiguous memory areas and therefore may increase latency.
+This document describes how to detect large rows and large cells in ScyllaDB.
+ScyllaDB is not optimized for very large rows or large cells. They require allocation of large, contiguous memory areas and therefore may increase latency.
 Rows may also grow over time. For example, many insert operations may add elements to the same collection, or a large blob can be inserted in a single operation.
 
 Similar to the :doc:`large partitions table <large-partition-table>`, the large rows and large cells tables are updated when sstables are written or deleted, for example, on memtable flush or during compaction.
@@ -106,7 +106,7 @@ Configure the detection threshold of large rows and large cells with the corresp
 * ``compaction_collection_elements_count_warning_threshold`` parameter (default: 10000).
 
 Once the threshold is reached, the relevant information is captured in the ``system.large_rows`` / ``system.large_cells`` tables.
-In addition,  a warning message is logged in the Scylla log (refer to :doc:`logging </getting-started/logging>`).
+In addition,  a warning message is logged in the ScyllaDB log (refer to :doc:`logging </getting-started/logging>`).
 
 
 Storing
@@ -131,13 +131,11 @@ Large rows and large cells are stored in system tables with the following schema
       AND compaction = {'class': 'SizeTieredCompactionStrategy'}
       AND compression = {'sstable_compression': 'org.apache.cassandra.io.compress.LZ4Compressor'}
       AND crc_check_chance = 1.0
-      AND dclocal_read_repair_chance = 0.1
       AND default_time_to_live = 0
       AND gc_grace_seconds = 0
       AND max_index_interval = 2048
       AND memtable_flush_period_in_ms = 0
       AND min_index_interval = 128
-      AND read_repair_chance = 0.0
       AND speculative_retry = '99.0PERCENTILE';
 
   CREATE TABLE system.large_cells (
@@ -158,13 +156,11 @@ Large rows and large cells are stored in system tables with the following schema
       AND compaction = {'class': 'SizeTieredCompactionStrategy'}
       AND compression = {'sstable_compression': 'org.apache.cassandra.io.compress.LZ4Compressor'}
       AND crc_check_chance = 1.0
-      AND dclocal_read_repair_chance = 0.1
       AND default_time_to_live = 0
       AND gc_grace_seconds = 0
       AND max_index_interval = 2048
       AND memtable_flush_period_in_ms = 0
       AND min_index_interval = 128
-      AND read_repair_chance = 0.0
       AND speculative_retry = '99.0PERCENTILE';
 
 

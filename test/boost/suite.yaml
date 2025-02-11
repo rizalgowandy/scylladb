@@ -1,4 +1,6 @@
 type: boost
+extra_scylla_cmdline_options:
+    - '--reactor-backend linux-aio'
 # A list of long tests, which should be started early
 run_first:
     - index_with_paging_test
@@ -31,7 +33,7 @@ custom_args:
     sstable_datafile_test:
         - '-c1 -m2G'
     sstable_compaction_test:
-        - '-c1 -m2G'
+        - '-c1 -m2G --logger-log-level compaction=debug --logger-log-level compaction_manager=debug'
     sstable_3_x_test:
         - '-c1 -m2G'
     cql_query_test:
@@ -42,5 +44,9 @@ custom_args:
         - '-c2 -m3G'
     cache_algorithm_test:
         - '-c1 -m256M'
+    commitlog_cleanup_test:
+        - '-c1 -m2G'
+    bloom_filter_test:
+        - '-c1'
 run_in_debug:
     - logalloc_standard_allocator_segment_pool_backend_test

@@ -3,13 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include <unordered_map>
-#include <ostream>
 
 #include "bytes.hh"
 #include "types/user.hh"
@@ -27,8 +27,8 @@ public:
     }
     void add_type(user_type type) {
         auto i = _user_types.find(type->_name);
-        assert(i == _user_types.end() || type->is_compatible_with(*i->second));
-        _user_types[type->_name] = std::move(type);
+        SCYLLA_ASSERT(i == _user_types.end() || type->is_compatible_with(*i->second));
+        _user_types.insert_or_assign(i, type->_name, type);
     }
     void remove_type(user_type type) {
         _user_types.erase(type->_name);
@@ -36,7 +36,6 @@ public:
     bool has_type(const bytes& name) const {
         return _user_types.contains(name);
     }
-    friend std::ostream& operator<<(std::ostream& os, const user_types_metadata& m);
 };
 
 class user_types_storage {

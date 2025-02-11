@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2023-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 # This file configures pytest for all tests in this directory, and also
 
@@ -15,8 +15,7 @@ from test.pylib.manager_client import ManagerClient
 
 @pytest.mark.asyncio
 async def test_sticky_coordinator_enforced(manager: ManagerClient) -> None:
-    await manager.server_add(cmdline=['--logger-log-level', 'paging=trace'])
-    await manager.server_add(cmdline=['--logger-log-level', 'paging=trace'])
+    await manager.servers_add(2, cmdline=['--logger-log-level', 'paging=trace'])
 
     cql = manager.get_cql()
 

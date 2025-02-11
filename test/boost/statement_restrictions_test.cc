@@ -3,19 +3,25 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 
 #include <vector>
+
+#include <fmt/ranges.h>
 
 #include "cql3/restrictions/statement_restrictions.hh"
 #include "cql3/expr/expr-utils.hh"
 #include "cql3/util.hh"
 #include "test/lib/cql_assertions.hh"
 #include "test/lib/cql_test_env.hh"
+#include "test/lib/test_utils.hh"
+
+BOOST_AUTO_TEST_SUITE(statement_restrictions_test)
 
 using namespace cql3;
 
@@ -27,7 +33,7 @@ query::clustering_row_ranges slice(
         const std::vector<expr::expression>& where_clause, cql_test_env& env,
         const sstring& table_name = "t", const sstring& keyspace_name = "ks") {
     prepare_context ctx;
-    return restrictions::statement_restrictions(
+    return restrictions::analyze_statement_restrictions(
             env.data_dictionary(),
             env.local_db().find_schema(keyspace_name, table_name),
             statements::statement_type::SELECT,
@@ -35,16 +41,17 @@ query::clustering_row_ranges slice(
             ctx,
             /*contains_only_static_columns=*/false,
             /*for_view=*/false,
-            /*allow_filtering=*/true)
+            /*allow_filtering=*/true,
+            restrictions::check_indexes::yes)
             .get_clustering_bounds(query_options({}));
 }
 
 /// Overload that parses the WHERE clause from string.  Named differently to disambiguate when where_clause is
 /// brace-initialized.
 query::clustering_row_ranges slice_parse(
-        sstring_view where_clause, cql_test_env& env,
+        std::string_view where_clause, cql_test_env& env,
         const sstring& table_name = "t", const sstring& keyspace_name = "ks") {
-    return slice(boolean_factors(cql3::util::where_clause_to_relations(where_clause)), env, table_name, keyspace_name);
+    return slice(boolean_factors(cql3::util::where_clause_to_relations(where_clause, cql3::dialect{})), env, table_name, keyspace_name);
 }
 
 auto I(int32_t x) { return int32_type->decompose(x); }
@@ -406,7 +413,7 @@ BOOST_AUTO_TEST_CASE(expression_extract_column_restrictions) {
     column_definition col_r3 = make_column("r3", column_kind::regular_column, 2);
 
     // Empty input test
-    assert_expr_vec_eq(extract_single_column_restrictions_for_column(conjunction{}, col_pk1), {});
+    assert_expr_vec_eq(cql3::restrictions::extract_single_column_restrictions_for_column(conjunction{}, col_pk1), {});
 
     // BIG_WHERE test
     // big_where contains:
@@ -490,24 +497,26 @@ BOOST_AUTO_TEST_CASE(expression_extract_column_restrictions) {
 
     expression big_where_expr = conjunction{std::move(big_where)};
 
-    assert_expr_vec_eq(extract_single_column_restrictions_for_column(big_where_expr, col_pk1),
+    assert_expr_vec_eq(restrictions::extract_single_column_restrictions_for_column(big_where_expr, col_pk1),
         {pk1_restriction});
 
-    assert_expr_vec_eq(extract_single_column_restrictions_for_column(big_where_expr, col_pk2),
+    assert_expr_vec_eq(restrictions::extract_single_column_restrictions_for_column(big_where_expr, col_pk2),
         {pk2_restriction, pk2_restriction2});
 
-    assert_expr_vec_eq(extract_single_column_restrictions_for_column(big_where_expr, col_ck1),
+    assert_expr_vec_eq(restrictions::extract_single_column_restrictions_for_column(big_where_expr, col_ck1),
         {ck1_restriction});
 
-    assert_expr_vec_eq(extract_single_column_restrictions_for_column(big_where_expr, col_ck2),
+    assert_expr_vec_eq(restrictions::extract_single_column_restrictions_for_column(big_where_expr, col_ck2),
         {ck2_restriction});
 
-    assert_expr_vec_eq(extract_single_column_restrictions_for_column(big_where_expr, col_r1),
+    assert_expr_vec_eq(restrictions::extract_single_column_restrictions_for_column(big_where_expr, col_r1),
         {r1_restriction, r1_restriction2, r1_restriction3});
 
-    assert_expr_vec_eq(extract_single_column_restrictions_for_column(big_where_expr, col_r2),
+    assert_expr_vec_eq(restrictions::extract_single_column_restrictions_for_column(big_where_expr, col_r2),
         {r2_restriction});
 
-    assert_expr_vec_eq(extract_single_column_restrictions_for_column(big_where_expr, col_r3),
+    assert_expr_vec_eq(restrictions::extract_single_column_restrictions_for_column(big_where_expr, col_r3),
         {});
 }
+
+BOOST_AUTO_TEST_SUITE_END()

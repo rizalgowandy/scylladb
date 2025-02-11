@@ -3,10 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "cache_service.hh"
+#include "api/api.hh"
 #include "api/api-doc/cache_service.json.hh"
 #include "column_family.hh"
 
@@ -195,9 +196,9 @@ void set_cache_service(http_context& ctx, routes& r) {
         return make_ready_future<json::json_return_type>(0);
     });
 
-    cs::get_row_capacity.set(r, [&ctx] (std::unique_ptr<http::request> req) {
-        return ctx.db.map_reduce0([](replica::database& db) -> uint64_t {
-            return db.row_cache_tracker().region().occupancy().used_space();
+    cs::get_row_capacity.set(r, [] (std::unique_ptr<http::request> req) {
+        return seastar::map_reduce(smp::all_cpus(), [] (int cpu) {
+            return make_ready_future<uint64_t>(memory::stats().total_memory());
         }, uint64_t(0), std::plus<uint64_t>()).then([](const int64_t& res) {
             return make_ready_future<json::json_return_type>(res);
         });
@@ -240,9 +241,9 @@ void set_cache_service(http_context& ctx, routes& r) {
 
     cs::get_row_size.set(r, [&ctx] (std::unique_ptr<http::request> req) {
         // In origin row size is the weighted size.
-        // We currently do not support weights, so we use num entries instead
+        // We currently do not support weights, so we use raw size in bytes instead
         return ctx.db.map_reduce0([](replica::database& db) -> uint64_t {
-            return db.row_cache_tracker().partitions();
+            return db.row_cache_tracker().region().occupancy().used_space();
         }, uint64_t(0), std::plus<uint64_t>()).then([](const int64_t& res) {
             return make_ready_future<json::json_return_type>(res);
         });
@@ -317,6 +318,51 @@ void set_cache_service(http_context& ctx, routes& r) {
         // so currently returning a 0 for entries is ok
         return make_ready_future<json::json_return_type>(0);
     });
+}
+
+void unset_cache_service(http_context& ctx, routes& r) {
+    cs::get_row_cache_save_period_in_seconds.unset(r);
+    cs::set_row_cache_save_period_in_seconds.unset(r);
+    cs::get_key_cache_save_period_in_seconds.unset(r);
+    cs::set_key_cache_save_period_in_seconds.unset(r);
+    cs::get_counter_cache_save_period_in_seconds.unset(r);
+    cs::set_counter_cache_save_period_in_seconds.unset(r);
+    cs::get_row_cache_keys_to_save.unset(r);
+    cs::set_row_cache_keys_to_save.unset(r);
+    cs::get_key_cache_keys_to_save.unset(r);
+    cs::set_key_cache_keys_to_save.unset(r);
+    cs::get_counter_cache_keys_to_save.unset(r);
+    cs::set_counter_cache_keys_to_save.unset(r);
+    cs::invalidate_key_cache.unset(r);
+    cs::invalidate_counter_cache.unset(r);
+    cs::set_row_cache_capacity_in_mb.unset(r);
+    cs::set_key_cache_capacity_in_mb.unset(r);
+    cs::set_counter_cache_capacity_in_mb.unset(r);
+    cs::save_caches.unset(r);
+    cs::get_key_capacity.unset(r);
+    cs::get_key_hits.unset(r);
+    cs::get_key_requests.unset(r);
+    cs::get_key_hit_rate.unset(r);
+    cs::get_key_hits_moving_avrage.unset(r);
+    cs::get_key_requests_moving_avrage.unset(r);
+    cs::get_key_size.unset(r);
+    cs::get_key_entries.unset(r);
+    cs::get_row_capacity.unset(r);
+    cs::get_row_hits.unset(r);
+    cs::get_row_requests.unset(r);
+    cs::get_row_hit_rate.unset(r);
+    cs::get_row_hits_moving_avrage.unset(r);
+    cs::get_row_requests_moving_avrage.unset(r);
+    cs::get_row_size.unset(r);
+    cs::get_row_entries.unset(r);
+    cs::get_counter_capacity.unset(r);
+    cs::get_counter_hits.unset(r);
+    cs::get_counter_requests.unset(r);
+    cs::get_counter_hit_rate.unset(r);
+    cs::get_counter_hits_moving_avrage.unset(r);
+    cs::get_counter_requests_moving_avrage.unset(r);
+    cs::get_counter_size.unset(r);
+    cs::get_counter_entries.unset(r);
 }
 
 }

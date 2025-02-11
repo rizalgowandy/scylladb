@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -14,17 +14,15 @@
 #include <cstdint>
 #include <compare>
 #include <limits>
-#include <iostream>
+#include <ranges>
 #include <stdexcept>
-#include <type_traits>
-#include <boost/range/adaptors.hpp>
 #include <seastar/core/on_internal_error.hh>
-#include <boost/regex.hpp>
 #include <seastar/core/smp.hh>
 #include <seastar/core/sstring.hh>
 #include "types/types.hh"
+#include "utils/assert.hh"
 #include "utils/UUID_gen.hh"
-#include "log.hh"
+#include "utils/log.hh"
 
 namespace sstables {
 
@@ -59,33 +57,8 @@ public:
         }
         return _value.get_least_significant_bits();
     }
-    static generation_type from_string(const std::string& s) {
-        int64_t int_value;
-        if (auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), int_value);
-            ec == std::errc() && ptr == s.data() + s.size()) {
-            return generation_type(int_value);
-        } else {
-            static const boost::regex pattern("([0-9a-z]{4})_([0-9a-z]{4})_([0-9a-z]{5})([0-9a-z]{13})");
-            boost::smatch match;
-            if (!boost::regex_match(s, match, pattern)) {
-                throw std::invalid_argument(fmt::format("invalid UUID: {}", s));
-            }
-            utils::UUID_gen::decimicroseconds timestamp = {};
-            auto decode_base36 = [](const std::string& s) {
-                std::size_t pos{};
-                auto n = std::stoull(s, &pos, 36);
-                if (pos != s.size()) {
-                    throw std::invalid_argument(fmt::format("invalid part in UUID: {}", s));
-                }
-                return n;
-            };
-            timestamp += std::chrono::days{decode_base36(match[1])};
-            timestamp += std::chrono::seconds{decode_base36(match[2])};
-            timestamp += ::utils::UUID_gen::decimicroseconds{decode_base36(match[3])};
-            int64_t lsb = decode_base36(match[4]);
-            return generation_type{utils::UUID_gen::get_time_UUID_raw(timestamp, lsb)};
-        }
-    }
+    static generation_type from_string(const std::string& s);
+
     // return true if the generation holds a valid id
     explicit operator bool() const noexcept {
         return bool(_value);
@@ -135,16 +108,16 @@ constexpr generation_type generation_from_value(generation_type::int_t value) {
 
 template <std::ranges::range Range, typename Target = std::vector<sstables::generation_type>>
 Target generations_from_values(const Range& values) {
-    return boost::copy_range<Target>(values | boost::adaptors::transformed([] (auto value) {
+    return values | std::views::transform([] (auto value) {
         return generation_type(value);
-    }));
+    }) | std::ranges::to<Target>();
 }
 
 template <typename Target = std::vector<sstables::generation_type>>
 Target generations_from_values(std::initializer_list<generation_type::int_t> values) {
-    return boost::copy_range<Target>(values | boost::adaptors::transformed([] (auto value) {
+    return values | std::views::transform([] (auto value) {
         return generation_type(value);
-    }));
+    }) | std::ranges::to<Target>();
 }
 
 using uuid_identifiers = bool_class<struct uuid_identifiers_tag>;
@@ -182,7 +155,7 @@ public:
     /// way to determine that is overlapping its partition-ranges with the shard's
     /// owned ranges.
     static bool maybe_owned_by_this_shard(const sstables::generation_type& gen) {
-        assert(bool(gen));
+        SCYLLA_ASSERT(bool(gen));
         int64_t hint = 0;
         if (gen.is_uuid_based()) {
             hint = std::hash<utils::UUID>{}(gen.as_uuid());
@@ -220,7 +193,7 @@ struct numeric_limits<sstables::generation_type> : public numeric_limits<sstable
 } //namespace std
 
 template <>
-struct fmt::formatter<sstables::generation_type> : fmt::formatter<std::string_view> {
+struct fmt::formatter<sstables::generation_type> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const sstables::generation_type& generation, FormatContext& ctx) const {
         if (!generation) {

@@ -28,7 +28,7 @@ The files created are:
 
 By default, these files are created in the 'build'
 subdirectory under the directory containing the script.
-The destination directory can be overriden by
+The destination directory can be overridden by
 using '-o PATH' option.
 END
 )
@@ -78,7 +78,7 @@ fi
 
 # Default scylla product/version tags
 PRODUCT=scylla
-VERSION=5.5.0-dev
+VERSION=2025.2.0-dev
 
 if test -f version
 then
@@ -88,10 +88,13 @@ else
 	SCYLLA_VERSION=$VERSION
 	if [ -z "$SCYLLA_RELEASE" ]; then
 		GIT_COMMIT=$(git -C "$SCRIPT_DIR" log --pretty=format:'%h' -n 1 --abbrev=12)
-		# For custom package builds, replace "0" with "counter.your_name",
+		# For custom package builds, replace "0" with "counter.yourname",
 		# where counter starts at 1 and increments for successive versions.
 		# This ensures that the package manager will select your custom
 		# package over the standard release.
+		# Do not use any special characters like - or _ in the name above!
+		# These characters either have special meaning or are illegal in
+		# version strings.
 		SCYLLA_BUILD=0
 		SCYLLA_RELEASE=$SCYLLA_BUILD.$DATE.$GIT_COMMIT
 	elif [ -f "$OUTPUT_DIR/SCYLLA-RELEASE-FILE" ]; then
@@ -101,7 +104,7 @@ else
 fi
 
 if [ -f "$OUTPUT_DIR/SCYLLA-RELEASE-FILE" ]; then
-	GIT_COMMIT_FILE=$(cat "$OUTPUT_DIR/SCYLLA-RELEASE-FILE" |cut -d . -f 3)
+	GIT_COMMIT_FILE=$(cat "$OUTPUT_DIR/SCYLLA-RELEASE-FILE" | rev | cut -d . -f 1 | rev)
 	if [ "$GIT_COMMIT" = "$GIT_COMMIT_FILE" ]; then
 		exit 0
 	fi

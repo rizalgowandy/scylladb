@@ -3,26 +3,29 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "expression.hh"
 #include "expr-utils.hh"
 #include "evaluate.hh"
 #include "cql3/functions/functions.hh"
+#include "cql3/functions/castas_fcts.hh"
+#include "cql3/functions/scalar_function.hh"
 #include "cql3/column_identifier.hh"
-#include "cql3/constants.hh"
 #include "cql3/lists.hh"
+#include "cql3/maps.hh"
 #include "cql3/sets.hh"
 #include "cql3/user_types.hh"
 #include "types/list.hh"
 #include "types/set.hh"
 #include "types/map.hh"
+#include "types/vector.hh"
 #include "types/user.hh"
 #include "exceptions/unrecognized_entity_exception.hh"
 #include "utils/like_matcher.hh"
 
-#include <boost/range/algorithm/count.hpp>
+#include <ranges>
 
 namespace cql3::expr {
 
@@ -144,7 +147,7 @@ usertype_constructor_prepare_expression(const usertype_constructor& u, data_dict
         // We had some field that are not part of the type
         for (auto&& id_val : u.elements) {
             auto&& id = id_val.first;
-            if (!boost::range::count(ut->field_names(), id.bytes_)) {
+            if (!std::ranges::contains(ut->field_names(), id.bytes_)) {
                 throw exceptions::invalid_request_exception(format("Unknown field '{}' in value of user defined type {}", id, ut->get_name_as_string()));
             }
         }
@@ -435,10 +438,6 @@ list_validate_assignable_to(const collection_constructor& c, data_dictionary::da
 static
 assignment_testable::test_result
 list_test_assignment(const collection_constructor& c, data_dictionary::database db, const sstring& keyspace, const schema* schema_opt, const column_specification& receiver) {
-    if (!dynamic_pointer_cast<const list_type_impl>(receiver.type)) {
-        return assignment_testable::test_result::NOT_ASSIGNABLE;
-    }
-
     // If there is no elements, we can't say it's an exact match (an empty list if fundamentally polymorphic).
     if (c.elements.empty()) {
         return assignment_testable::test_result::WEAKLY_ASSIGNABLE;
@@ -452,10 +451,6 @@ list_test_assignment(const collection_constructor& c, data_dictionary::database 
 static
 std::optional<expression>
 list_prepare_expression(const collection_constructor& c, data_dictionary::database db, const sstring& keyspace, const schema* schema_opt, lw_shared_ptr<column_specification> receiver) {
-    if (!receiver) {
-        // TODO: It is possible to infer the type of a list from the types of the key/value pairs
-        return std::nullopt;
-    }
     list_validate_assignable_to(c, db, keyspace, schema_opt, *receiver);
 
     // In Cassandra, an empty (unfrozen) map/set/list is equivalent to the column being null. In
@@ -479,7 +474,7 @@ list_prepare_expression(const collection_constructor& c, data_dictionary::databa
         values.push_back(std::move(elem));
     }
     collection_constructor value {
-        .style = collection_constructor::style_type::list,
+        .style = collection_constructor::style_type::list_or_vector,
         .elements = std::move(values),
         .type = receiver->type
     };
@@ -487,6 +482,113 @@ list_prepare_expression(const collection_constructor& c, data_dictionary::databa
         return constant(evaluate(value, query_options::DEFAULT), value.type);
     } else {
         return value;
+    }
+}
+
+static
+lw_shared_ptr<column_specification>
+vector_value_spec_of(const column_specification& column) {
+    return make_lw_shared<column_specification>(column.ks_name, column.cf_name,
+            ::make_shared<column_identifier>(format("value({})", *column.name), true),
+            dynamic_cast<const vector_type_impl&>(column.type->without_reversed()).get_elements_type());
+}
+
+static
+void
+vector_validate_assignable_to(const collection_constructor& c, data_dictionary::database db, const sstring keyspace, const schema* schema_opt, const column_specification& receiver) {
+    auto vt = dynamic_pointer_cast<const vector_type_impl>(receiver.type->underlying_type());
+    if (!vt) {
+        throw exceptions::invalid_request_exception(format("Invalid vector type literal for {} of type {}", *receiver.name, receiver.type->as_cql3_type()));
+    }
+
+    size_t expected_size = vt->get_dimension();
+    if (!expected_size) {
+        throw exceptions::invalid_request_exception(format("Invalid vector type literal for {}: type {} expects at least one element",
+                                                            *receiver.name, receiver.type->as_cql3_type()));
+    }
+    size_t received_size = c.elements.size();
+    if (expected_size != received_size) {
+        throw exceptions::invalid_request_exception(format("Invalid vector literal for {}: type {} expects {:d} elements but got {:d}",
+                                                            *receiver.name, receiver.type->as_cql3_type(), expected_size, received_size));
+    }
+
+    auto&& value_spec = vector_value_spec_of(receiver);
+    for (auto& e : c.elements) {
+        if (!is_assignable(test_assignment(e, db, keyspace, schema_opt, *value_spec))) {
+            throw exceptions::invalid_request_exception(format("Invalid vector literal for {}: value {} is not of type {}",
+                    *receiver.name, e, value_spec->type->as_cql3_type()));
+        }
+    }
+}
+
+static
+assignment_testable::test_result
+vector_test_assignment(const collection_constructor& c, data_dictionary::database db, const sstring& keyspace, const schema* schema_opt, const column_specification& receiver) {
+    // If there is no elements, we can't say it's an exact match (an empty vector if fundamentally polymorphic).
+    if (c.elements.empty()) {
+        return assignment_testable::test_result::WEAKLY_ASSIGNABLE;
+    }
+
+    auto&& value_spec = vector_value_spec_of(receiver);
+    return test_assignment_all(c.elements, db, keyspace, schema_opt, *value_spec);
+}
+
+static
+std::optional<expression>
+vector_prepare_expression(const collection_constructor& c, data_dictionary::database db, const sstring& keyspace, const schema* schema_opt, lw_shared_ptr<column_specification> receiver) {
+    vector_validate_assignable_to(c, db, keyspace, schema_opt, *receiver);
+
+    auto&& value_spec = vector_value_spec_of(*receiver);
+    std::vector<expression> values;
+    values.reserve(c.elements.size());
+    bool all_terminal = true;
+    for (auto& e : c.elements) {
+        expression elem = prepare_expression(e, db, keyspace, schema_opt, value_spec);
+
+        if (!is<constant>(elem)) {
+            all_terminal = false;
+        }
+        values.push_back(std::move(elem));
+    }
+
+    // Here we convert from list_or_vector to vector style, as we know that we received a vector type.
+    collection_constructor value {
+        .style = collection_constructor::style_type::vector,
+        .elements = std::move(values),
+        .type = receiver->type
+    };
+    if (all_terminal) {
+        return constant(evaluate(value, query_options::DEFAULT), value.type);
+    } else {
+        return value;
+    }
+}
+
+static
+assignment_testable::test_result
+list_or_vector_test_assignment(const collection_constructor& c, data_dictionary::database db, const sstring& keyspace, const schema* schema_opt, const column_specification& receiver) {
+    if (dynamic_pointer_cast<const vector_type_impl>(receiver.type)) {
+        return vector_test_assignment(c, db, keyspace, schema_opt, receiver);
+    } else if (dynamic_pointer_cast<const list_type_impl>(receiver.type)) {
+        return list_test_assignment(c, db, keyspace, schema_opt, receiver);
+    } else {
+        return assignment_testable::test_result::NOT_ASSIGNABLE;
+    }
+}
+
+static
+std::optional<expression>
+list_or_vector_prepare_expression(const collection_constructor& c, data_dictionary::database db, const sstring& keyspace, const schema* schema_opt, lw_shared_ptr<column_specification> receiver) {
+    if (!receiver) {
+        // TODO: It is possible to infer the type of a list or vector from the types of the key/value pairs
+        return std::nullopt;
+    }
+
+    // We do not check if the receiver is a list because it is checked later in the list_prepare_expression.
+    if (receiver->type->is_vector()) {
+        return vector_prepare_expression(c, db, keyspace, schema_opt, receiver);
+    } else {
+        return list_prepare_expression(c, db, keyspace, schema_opt, receiver);
     }
 }
 
@@ -559,9 +661,10 @@ tuple_constructor_prepare_nontuple(const tuple_constructor& tc, data_dictionary:
     if (receiver) {
         type = receiver->type;
     } else {
-        type = tuple_type_impl::get_instance(boost::copy_range<std::vector<data_type>>(
+        type = tuple_type_impl::get_instance(
                 values
-                | boost::adaptors::transformed(type_of)));
+                | std::views::transform(type_of)
+                | std::ranges::to<std::vector>());
     }
     tuple_constructor value {
         .elements  = std::move(values),
@@ -574,22 +677,27 @@ tuple_constructor_prepare_nontuple(const tuple_constructor& tc, data_dictionary:
     }
 }
 
-static
-std::ostream&
-operator<<(std::ostream&out, untyped_constant::type_class t)
-{
-    switch (t) {
-        case untyped_constant::type_class::string:   return out << "STRING";
-        case untyped_constant::type_class::integer:  return out << "INTEGER";
-        case untyped_constant::type_class::uuid:     return out << "UUID";
-        case untyped_constant::type_class::floating_point:    return out << "FLOAT";
-        case untyped_constant::type_class::boolean:  return out << "BOOLEAN";
-        case untyped_constant::type_class::hex:      return out << "HEX";
-        case untyped_constant::type_class::duration: return out << "DURATION";
-        case untyped_constant::type_class::null:     return out << "NULL";
-    }
-    abort();
 }
+
+template <> struct fmt::formatter<cql3::expr::untyped_constant::type_class> : fmt::formatter<string_view> {
+    auto format(cql3::expr::untyped_constant::type_class t, fmt::format_context& ctx) const {
+        using enum cql3::expr::untyped_constant::type_class;
+        std::string_view name;
+        switch (t) {
+            case string:   name = "STRING"; break;
+            case integer:  name = "INTEGER"; break;
+            case uuid:     name = "UUID"; break;
+            case floating_point:    name = "FLOAT"; break;
+            case boolean:  name = "BOOLEAN"; break;
+            case hex:      name = "HEX"; break;
+            case duration: name = "DURATION"; break;
+            case null:     name = "NULL"; break;
+        }
+        return fmt::format_to(ctx.out(), "{}", name);
+    }
+};
+
+namespace cql3::expr {
 
 static
 bytes
@@ -597,7 +705,7 @@ untyped_constant_parsed_value(const untyped_constant uc, data_type validator)
 {
     try {
         if (uc.partial_type == untyped_constant::type_class::hex && validator == bytes_type) {
-            auto v = static_cast<sstring_view>(uc.raw_text);
+            auto v = static_cast<std::string_view>(uc.raw_text);
             v.remove_prefix(2);
             return validator->from_string(v);
         }
@@ -616,7 +724,7 @@ untyped_constant_test_assignment(const untyped_constant& uc, data_dictionary::da
 {
     bool uc_is_null = uc.partial_type == untyped_constant::type_class::null;
     auto receiver_type = receiver.type->as_cql3_type();
-    if ((receiver_type.is_collection() || receiver_type.is_user_type()) && !uc_is_null) {
+    if ((receiver_type.is_collection() || receiver_type.is_user_type() || receiver_type.is_vector()) && !uc_is_null) {
         return assignment_testable::test_result::NOT_ASSIGNABLE;
     }
     if (!receiver_type.is_native()) {
@@ -962,7 +1070,7 @@ prepare_function_call(const expr::function_call& fc, data_dictionary::database d
             return func;
         },
         [&] (const functions::function_name& name) {
-            auto fun = functions::functions::get(db, keyspace, name, partially_prepared_args, keyspace, cf_name, receiver.get());
+            auto fun = functions::instance().get(db, keyspace, name, partially_prepared_args, keyspace, cf_name, receiver.get());
             if (!fun) {
                 throw exceptions::invalid_request_exception(format("Unknown function {} called", name));
             }
@@ -988,7 +1096,7 @@ prepare_function_call(const expr::function_call& fc, data_dictionary::database d
     bool all_terminal = true;
     for (size_t i = 0; i < partially_prepared_args.size(); ++i) {
         expr::expression e = prepare_expression(fc.args[i], db, keyspace, schema_opt,
-                                                functions::functions::make_arg_spec(keyspace, cf_name, *fun, i));
+                                                functions::instance().make_arg_spec(keyspace, cf_name, *fun, i));
         if (!expr::is<expr::constant>(e)) {
             all_terminal = false;
         }
@@ -1019,7 +1127,7 @@ test_assignment_function_call(const cql3::expr::function_call& fc, data_dictiona
         auto&& fun = std::visit(overloaded_functor{
             [&] (const functions::function_name& name) {
                 auto args = prepare_function_args_for_type_inference(fc.args, db, keyspace, schema_opt);
-                return functions::functions::get(db, keyspace, name, args, receiver.ks_name, receiver.cf_name, &receiver);
+                return functions::instance().get(db, keyspace, name, args, receiver.ks_name, receiver.cf_name, &receiver);
             },
             [] (const shared_ptr<functions::function>& func) {
                 return func;
@@ -1183,18 +1291,24 @@ try_prepare_expression(const expression& expr, data_dictionary::database db, con
 
             auto col_spec = column_specification_of(sub_col);
             lw_shared_ptr<column_specification> subscript_column_spec;
+            data_type value_cmp;
             if (sub_col_type.is_map()) {
                 subscript_column_spec = map_key_spec_of(*col_spec);
+                value_cmp = static_cast<const collection_type_impl&>(sub_col_type).value_comparator();
+            } else if (sub_col_type.is_set()) {
+                subscript_column_spec = set_value_spec_of(*col_spec);
+                value_cmp = static_cast<const collection_type_impl&>(sub_col_type).name_comparator();
             } else if (sub_col_type.is_list()) {
                 subscript_column_spec = list_key_spec_of(*col_spec);
+                value_cmp = static_cast<const collection_type_impl&>(sub_col_type).value_comparator();
             } else {
-                throw exceptions::invalid_request_exception(format("Column {} is not a map/list, cannot be subscripted", col_spec->name->text()));
+                throw exceptions::invalid_request_exception(format("Column {} is not a map/set/list, cannot be subscripted", col_spec->name->text()));
             }
 
             return subscript {
                 .val = sub_col,
                 .sub = prepare_expression(sub.sub, db, schema.ks_name(), &schema, std::move(subscript_column_spec)),
-                .type = static_cast<const collection_type_impl&>(sub_col_type).value_comparator(),
+                .type = value_cmp,
             };
         },
         [&] (const unresolved_identifier& unin) -> std::optional<expression> {
@@ -1226,9 +1340,11 @@ try_prepare_expression(const expression& expr, data_dictionary::database db, con
         },
         [&] (const collection_constructor& c) -> std::optional<expression> {
             switch (c.style) {
-            case collection_constructor::style_type::list: return list_prepare_expression(c, db, keyspace, schema_opt, receiver);
+            case collection_constructor::style_type::list_or_vector: return list_or_vector_prepare_expression(c, db, keyspace, schema_opt, receiver);
             case collection_constructor::style_type::set: return set_prepare_expression(c, db, keyspace, schema_opt, receiver);
             case collection_constructor::style_type::map: return map_prepare_expression(c, db, keyspace, schema_opt, receiver);
+            case collection_constructor::style_type::vector:
+                on_internal_error(expr_logger, "vector style type found during prepare, should have been introduced post-prepare");
             }
             on_internal_error(expr_logger, fmt::format("unexpected collection_constructor style {}", static_cast<unsigned>(c.style)));
         },
@@ -1272,7 +1388,8 @@ test_assignment(const expression& expr, data_dictionary::database db, const sstr
             return expression_test_assignment(col_val.col->type, receiver);
         },
         [&] (const subscript&) -> test_result {
-            on_internal_error(expr_logger, "subscripts are not yet reachable via test_assignment()");
+            // not implemented. issue #22075
+            return assignment_testable::test_result::NOT_ASSIGNABLE;
         },
         [&] (const unresolved_identifier& ui) -> test_result {
             return unresolved_identifier_test_assignment(ui, db, keyspace, schema_opt, receiver);
@@ -1300,9 +1417,11 @@ test_assignment(const expression& expr, data_dictionary::database db, const sstr
         },
         [&] (const collection_constructor& c) -> test_result {
             switch (c.style) {
-            case collection_constructor::style_type::list: return list_test_assignment(c, db, keyspace, schema_opt, receiver);
+            case collection_constructor::style_type::list_or_vector: return list_or_vector_test_assignment(c, db, keyspace, schema_opt, receiver);
             case collection_constructor::style_type::set: return set_test_assignment(c, db, keyspace, schema_opt, receiver);
             case collection_constructor::style_type::map: return map_test_assignment(c, db, keyspace, schema_opt, receiver);
+            case collection_constructor::style_type::vector:
+                on_internal_error(expr_logger, "vector style type found in test_assignment, should have been introduced post-prepare");
             }
             on_internal_error(expr_logger, fmt::format("unexpected collection_constructor style {}", static_cast<unsigned>(c.style)));
         },
@@ -1380,6 +1499,8 @@ static lw_shared_ptr<column_specification> get_lhs_receiver(const expression& pr
             const column_value& sub_col = get_subscripted_column(col_val);
             if (sub_col.col->type->is_map()) {
                 return map_value_spec_of(*sub_col.col->column_specification);
+            } else if (sub_col.col->type->is_set()) {
+                return set_value_spec_of(*sub_col.col->column_specification);
             } else {
                 return list_value_spec_of(*sub_col.col->column_specification);
             }
@@ -1442,9 +1563,9 @@ static lw_shared_ptr<column_specification> get_lhs_receiver(const expression& pr
 static lw_shared_ptr<column_specification> get_rhs_receiver(lw_shared_ptr<column_specification>& lhs_receiver, oper_t oper) {
     const data_type lhs_type = lhs_receiver->type->underlying_type();
 
-    if (oper == oper_t::IN) {
+    if (oper == oper_t::IN || oper == oper_t::NOT_IN) {
         data_type rhs_receiver_type = list_type_impl::get_instance(std::move(lhs_type), false);
-        auto in_name = ::make_shared<column_identifier>(format("in({})", lhs_receiver->name->text()), true);
+        auto in_name = ::make_shared<column_identifier>(format("{}({})", oper, lhs_receiver->name->text()), true);
         return make_lw_shared<column_specification>(lhs_receiver->ks_name,
                                                     lhs_receiver->cf_name,
                                                     in_name,

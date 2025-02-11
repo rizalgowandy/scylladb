@@ -3,13 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "duration.hh"
 
 #include <boost/lexical_cast.hpp>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 
 #include <cctype>
 #include <optional>

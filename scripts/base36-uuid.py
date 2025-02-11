@@ -5,7 +5,7 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
 import argparse
@@ -139,7 +139,7 @@ class TimeUuid:
     @property
     def timestamp(self) -> (datetime.datetime, int):
         # UUID v1 uses a timestamp epoch derived from Gregorian calendar, so we
-        # need to translate the timetamp to the UNIX time
+        # need to translate the timestamp to the UNIX time
         unix_time = self.uuid.time - self.UNIX_EPOCH_SINCE_GREGORIAN_DAY0
         seconds, decimicro_seconds = divmod(unix_time, DECIMICRO_RATIO)
         return datetime.datetime.fromtimestamp(seconds), decimicro_seconds

@@ -1,4 +1,6 @@
 include(add_whole_archive)
+find_package(OpenLDAP REQUIRED
+  ldap)
 
 add_library(scylla_auth STATIC)
 target_sources(scylla_auth
@@ -10,6 +12,7 @@ target_sources(scylla_auth
     certificate_authenticator.cc
     common.cc
     default_authorizer.cc
+    ldap_role_manager.cc
     password_authenticator.cc
     passwords.cc
     permission.cc
@@ -18,9 +21,11 @@ target_sources(scylla_auth
     role_or_anonymous.cc
     roles-metadata.cc
     sasl_challenge.cc
+    saslauthd_authenticator.cc
     service.cc
     standard_role_manager.cc
-    transitional.cc)
+    transitional.cc
+    maintenance_socket_role_manager.cc)
 target_include_directories(scylla_auth
   PUBLIC
     ${CMAKE_SOURCE_DIR})
@@ -29,8 +34,11 @@ target_link_libraries(scylla_auth
     Seastar::seastar
     xxHash::xxhash
   PRIVATE
+    absl::headers
+    OpenLDAP::ldap
     cql3
     idl
+    ldap
     wasmtime_bindings
     libxcrypt::libxcrypt)
 

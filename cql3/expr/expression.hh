@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -18,8 +18,6 @@
 #include "cql3/cql3_type.hh"
 #include "cql3/functions/function_name.hh"
 #include "seastarx.hh"
-#include "utils/overloaded_functor.hh"
-#include "utils/variant_element.hh"
 #include "cql3/values.hh"
 
 class row;
@@ -223,7 +221,7 @@ const column_value& get_subscripted_column(const subscript&);
 /// Only columns can be subscripted in CQL, so we can expect that the subscripted expression is a column_value.
 const column_value& get_subscripted_column(const expression&);
 
-enum class oper_t { EQ, NEQ, LT, LTE, GTE, GT, IN, CONTAINS, CONTAINS_KEY, IS_NOT, LIKE };
+enum class oper_t { EQ, NEQ, LT, LTE, GTE, GT, IN, NOT_IN, CONTAINS, CONTAINS_KEY, IS_NOT, LIKE };
 
 /// Describes the nature of clustering-key comparisons.  Useful for implementing SCYLLA_CLUSTERING_BOUND.
 enum class comparison_order : char {
@@ -419,7 +417,7 @@ struct tuple_constructor {
 // For example: "[1, 2, ?]", "{5, 6, 7}", {1: 2, 3: 4}"
 // During preparation collection constructors with constant values are converted to expr::constant.
 struct collection_constructor {
-    enum class style_type { list, set, map };
+    enum class style_type { list_or_vector, set, map, vector };
     style_type style;
 
     // For map constructors, elements is a list of key-pair tuples.
@@ -462,8 +460,8 @@ struct expression::impl final {
     using variant_type = std::variant<
             conjunction, binary_operator, column_value, unresolved_identifier,
             column_mutation_attribute, function_call, cast, field_selection,
-            bind_variable, untyped_constant, constant, tuple_constructor, collection_constructor,
-            usertype_constructor, subscript, temporary>;
+            bind_variable, untyped_constant, constant, tuple_constructor,
+            collection_constructor, usertype_constructor, subscript, temporary>;
     variant_type v;
     impl(variant_type v) : v(std::move(v)) {}
 };
@@ -506,15 +504,9 @@ E* as_if(expression* e) {
 /// directly into the resulting conjunction's children, flattening the expression tree.
 extern expression make_conjunction(expression a, expression b);
 
-extern std::ostream& operator<<(std::ostream&, oper_t);
-
 extern sstring to_string(const expression&);
 
 extern std::ostream& operator<<(std::ostream&, const column_value&);
-
-extern std::ostream& operator<<(std::ostream&, const expression&);
-
-extern std::ostream& operator<<(std::ostream&, const expression::printer&);
 
 data_type type_of(const expression& e);
 
@@ -557,9 +549,7 @@ public:
 
     template <typename FormatContext>
     auto format(const cql3::expr::expression& expr, FormatContext& ctx) const {
-        std::ostringstream os;
-        os << cql3::expr::expression::printer{.expr_to_print = expr, .debug_mode = _debug, .for_metadata = _for_metadata};
-        return fmt::format_to(ctx.out(), "{}", os.str());
+        return fmt::format_to(ctx.out(), "{}", cql3::expr::expression::printer{.expr_to_print = expr, .debug_mode = _debug, .for_metadata = _for_metadata});
     }
 };
 
@@ -571,11 +561,7 @@ struct fmt::formatter<cql3::expr::expression::printer> {
     }
 
     template <typename FormatContext>
-    auto format(const cql3::expr::expression::printer& pr, FormatContext& ctx) const {
-        std::ostringstream os;
-        os << pr;
-        return fmt::format_to(ctx.out(), "{}", os.str());
-    }
+    auto format(const cql3::expr::expression::printer& pr, FormatContext& ctx) const -> decltype(ctx.out());
 };
 
 /// Required for fmt::join() to work on ExpressionElement, and for {:user}/{:debug} to work on ExpressionElement.
@@ -584,7 +570,7 @@ struct fmt::formatter<E> : public fmt::formatter<cql3::expr::expression> {
 };
 
 template <>
-struct fmt::formatter<cql3::expr::column_mutation_attribute::attribute_kind> : fmt::formatter<std::string_view> {
+struct fmt::formatter<cql3::expr::column_mutation_attribute::attribute_kind> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(cql3::expr::column_mutation_attribute::attribute_kind k, FormatContext& ctx) const {
         switch (k) {
@@ -595,4 +581,17 @@ struct fmt::formatter<cql3::expr::column_mutation_attribute::attribute_kind> : f
         }
         return fmt::format_to(ctx.out(), "unrecognized_attribute_kind({})", static_cast<int>(k));
     }
+};
+
+template <>
+struct fmt::formatter<cql3::expr::oper_t> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+
+    template <typename FormatContext>
+    auto format(const cql3::expr::oper_t& op, FormatContext& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", to_string(op));
+    }
+
+private:
+    static std::string_view to_string(const cql3::expr::oper_t& op);
 };

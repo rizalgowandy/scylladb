@@ -3,15 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "compaction_strategy_impl.hh"
-#include "compaction.hh"
 #include "sstables/shared_sstable.hh"
-#include <boost/algorithm/cxx11/any_of.hpp>
 
 class size_tiered_backlog_tracker;
 
@@ -66,7 +64,7 @@ class size_tiered_compaction_strategy : public compaction_strategy_impl {
     }
 
     bool is_any_bucket_interesting(const std::vector<std::vector<sstables::shared_sstable>>& buckets, int min_threshold) const {
-        return boost::algorithm::any_of(buckets, [&] (const auto& bucket) {
+        return std::ranges::any_of(buckets, [&] (const auto& bucket) {
             return this->is_bucket_interesting(bucket, min_threshold);
         });
     }
@@ -96,7 +94,7 @@ public:
 
     virtual std::unique_ptr<compaction_backlog_tracker::impl> make_backlog_tracker() const override;
 
-    virtual compaction_descriptor get_reshaping_job(std::vector<shared_sstable> input, schema_ptr schema, reshape_mode mode) const override;
+    virtual compaction_descriptor get_reshaping_job(std::vector<shared_sstable> input, schema_ptr schema, reshape_config cfg) const override;
 
     friend class ::size_tiered_backlog_tracker;
 };

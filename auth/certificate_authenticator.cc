@@ -4,14 +4,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "auth/certificate_authenticator.hh"
 
-#include <regex>
+#include <boost/regex.hpp>
+#include <fmt/ranges.h>
 
 #include "utils/class_registrator.hh"
+#include "utils/to_string.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "cql3/query_processor.hh"
 #include "db/config.hh"
@@ -30,13 +32,14 @@ static const std::string cfg_source_altname = "ALTNAME";
 static const class_registrator<auth::authenticator
     , auth::certificate_authenticator
     , cql3::query_processor&
+    , ::service::raft_group0_client&
     , ::service::migration_manager&> cert_auth_reg(CERT_AUTH_NAME);
 
 enum class auth::certificate_authenticator::query_source {
     subject, altname
 };
 
-auth::certificate_authenticator::certificate_authenticator(cql3::query_processor& qp, ::service::migration_manager&)
+auth::certificate_authenticator::certificate_authenticator(cql3::query_processor& qp, ::service::raft_group0_client&, ::service::migration_manager&)
     : _queries([&] {
         auto& conf = qp.db().get_config();
         auto queries = conf.auth_certificate_role_queries();
@@ -73,7 +76,7 @@ auth::certificate_authenticator::certificate_authenticator(cql3::query_processor
                     continue;
                 } catch (std::out_of_range&) {
                     // just fallthrough
-                } catch (std::regex_error&) {
+                } catch (boost::regex_error&) {
                     std::throw_with_nested(std::invalid_argument(fmt::format("Invalid query expression: {}", map.at(cfg_query_attr))));
                 }
             }
@@ -146,7 +149,7 @@ future<std::optional<auth::authenticated_user>> auth::certificate_authenticator:
             co_return username;
         }
     }
-    throw exceptions::authentication_exception(format("Subject '{}'/'{}' does not match any query expression", subject, altname));
+    throw exceptions::authentication_exception(seastar::format("Subject '{}'/'{}' does not match any query expression", subject, altname));
 }
 
 
@@ -154,16 +157,16 @@ future<auth::authenticated_user> auth::certificate_authenticator::authenticate(c
     throw exceptions::authentication_exception("Cannot authenticate using attribute map");
 }
 
-future<> auth::certificate_authenticator::create(std::string_view role_name, const authentication_options& options) const {
+future<> auth::certificate_authenticator::create(std::string_view role_name, const authentication_options& options, ::service::group0_batch& mc) {
     // TODO: should we keep track of roles/enforce existence? Role manager should deal with this...
     co_return;
 }
 
-future<> auth::certificate_authenticator::alter(std::string_view role_name, const authentication_options& options) const {
+future<> auth::certificate_authenticator::alter(std::string_view role_name, const authentication_options& options, ::service::group0_batch& mc) {
     co_return;
 }
 
-future<> auth::certificate_authenticator::drop(std::string_view role_name) const {
+future<> auth::certificate_authenticator::drop(std::string_view role_name, ::service::group0_batch&) {
     co_return;
 }
 

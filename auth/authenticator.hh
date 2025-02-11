@@ -5,30 +5,25 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include <string_view>
 #include <memory>
-#include <set>
-#include <stdexcept>
 #include <unordered_map>
 #include <optional>
 #include <functional>
 
-#include <seastar/core/enum.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/sstring.hh>
-#include <seastar/core/shared_ptr.hh>
 
 #include "auth/authentication_options.hh"
 #include "auth/resource.hh"
 #include "auth/sasl_challenge.hh"
-#include "bytes.hh"
-#include "enum_set.hh"
-#include "exceptions/exceptions.hh"
+
+#include "service/raft/raft_group0_client.hh"
 
 namespace db {
     class config;
@@ -48,6 +43,11 @@ struct certificate_info {
 
 using session_dn_func = std::function<future<std::optional<certificate_info>>()>;
 
+class unsupported_authentication_operation : public std::invalid_argument {
+public:
+    using std::invalid_argument::invalid_argument;
+};
+
 ///
 /// Abstract client for authenticating role identity.
 ///
@@ -66,6 +66,12 @@ public:
     /// The name of the key to be used for the password part of password authentication with \ref authenticate.
     ///
     static const sstring PASSWORD_KEY;
+
+    /// Service for SASL authentication.
+    static const sstring SERVICE_KEY;
+
+    /// Realm for SASL authentication.
+    static const sstring REALM_KEY;
 
     using credentials_map = std::unordered_map<sstring, sstring>;
 
@@ -111,7 +117,7 @@ public:
     ///
     /// The options provided must be a subset of `supported_options()`.
     ///
-    virtual future<> create(std::string_view role_name, const authentication_options& options) const = 0;
+    virtual future<> create(std::string_view role_name, const authentication_options& options, ::service::group0_batch& mc) = 0;
 
     ///
     /// Alter the authentication record of an existing user.
@@ -120,12 +126,12 @@ public:
     ///
     /// Callers must ensure that the specification of `alterable_options()` is adhered to.
     ///
-    virtual future<> alter(std::string_view role_name, const authentication_options& options) const = 0;
+    virtual future<> alter(std::string_view role_name, const authentication_options& options, ::service::group0_batch& mc) = 0;
 
     ///
     /// Delete the authentication record for a user. This will disallow the user from logging in.
     ///
-    virtual future<> drop(std::string_view role_name) const = 0;
+    virtual future<> drop(std::string_view role_name, ::service::group0_batch&) = 0;
 
     ///
     /// Query for custom options (those corresponding to \ref authentication_options::options).
@@ -134,12 +140,27 @@ public:
     ///
     virtual future<custom_options> query_custom_options(std::string_view role_name) const = 0;
 
+    virtual bool uses_password_hashes() const {
+        return false;
+    }
+
+    ///
+    /// Query the password hash corresponding to a given role.
+    ///
+    /// If the authenticator doesn't use password hashes, throws an `unsupported_authentication_operation` exception.
+    ///
+    virtual future<std::optional<sstring>> get_password_hash(std::string_view role_name) const {
+        return make_exception_future<std::optional<sstring>>(unsupported_authentication_operation("get_password_hash is not implemented"));
+    }
+
     ///
     /// System resources used internally as part of the implementation. These are made inaccessible to users.
     ///
     virtual const resource_set& protected_resources() const = 0;
 
     virtual ::shared_ptr<sasl_challenge> new_sasl_challenge() const = 0;
+
+    virtual future<> ensure_superuser_is_created() const = 0;
 };
 
 }

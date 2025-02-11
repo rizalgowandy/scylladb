@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <unordered_set>
@@ -12,6 +12,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/file.hh>
+#include <seastar/core/pipe.hh>
 
 #include "test/lib/scylla_test_case.hh"
 #include <seastar/testing/thread_test_case.hh>
@@ -19,8 +20,8 @@
 #include "test/lib/tmpdir.hh"
 #include "test/lib/random_utils.hh"
 #include "test/lib/test_utils.hh"
-#include "test/lib/make_random_string.hh"
 
+#include "utils/assert.hh"
 #include "utils/lister.hh"
 
 class expected_exception : public std::exception {
@@ -83,7 +84,7 @@ SEASTAR_TEST_CASE(test_lister_abort) {
     std::unordered_set<std::string> dir_names;
 
     auto count = co_await generate_random_content(tmp, file_names, dir_names, 1, tests::random::get_int(100, 1000));
-    assert(count > 0);
+    SCYLLA_ASSERT(count > 0);
     BOOST_TEST_MESSAGE(fmt::format("Generated {} dir entries", count));
 
     size_t initial = tests::random::get_int<size_t>(1, count);

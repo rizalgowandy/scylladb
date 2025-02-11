@@ -3,16 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <concepts>
 #include <compare>
-#include <boost/range/algorithm/copy.hpp>
+#include <algorithm>
 #include <seastar/net/byteorder.hh>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <seastar/util/backtrace.hh>
 
 #include "marshal_exception.hh"
@@ -123,7 +123,7 @@ bytes linearized(const FragmentedBuffer& buffer)
     bytes b(bytes::initialized_later(), buffer.size_bytes());
     auto dst = b.begin();
     for (bytes_view fragment : buffer) {
-        dst = boost::copy(fragment, dst);
+        dst = std::ranges::copy(fragment, dst).out;
     }
     return b;
 }
@@ -388,7 +388,7 @@ T read_simple_exactly(View v) {
 }
 
 template<typename T, FragmentedMutableView Out>
-static inline
+inline
 void write(Out& out, std::type_identity_t<T> val) {
     auto v = net::ntoh(val);
     auto p = reinterpret_cast<const bytes_view::value_type*>(&v);
@@ -401,7 +401,7 @@ void write(Out& out, std::type_identity_t<T> val) {
 }
 
 template<typename T, FragmentedMutableView Out>
-static inline
+inline
 void write_native(Out& out, std::type_identity_t<T> v) {
     auto p = reinterpret_cast<const bytes_view::value_type*>(&v);
     if (out.current_fragment().size() >= sizeof(v)) [[likely]] {
@@ -413,7 +413,7 @@ void write_native(Out& out, std::type_identity_t<T> v) {
 }
 
 template <FragmentedView View>
-struct fmt::formatter<View> : fmt::formatter<std::string_view> {
+struct fmt::formatter<View> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const View& b, FormatContext& ctx) const {
         auto out = ctx.out();

@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -22,7 +22,7 @@ class query_processor;
 
 namespace statements {
 
-class create_role_statement final : public authentication_statement {
+class create_role_statement final : public authentication_altering_statement {
     sstring _role;
 
     role_options _options;
@@ -39,12 +39,15 @@ public:
 
     std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats) override;
 
-    future<> grant_permissions_to_creator(const service::client_state&) const;
-
     virtual future<> check_access(query_processor& qp, const service::client_state&) const override;
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>>
     execute(query_processor&, service::query_state&, const query_options&, std::optional<service::group0_guard> guard) const override;
+
+    virtual void sanitize_audit_info() override;
+
+private:
+    future<> grant_permissions_to_creator(const service::client_state&, ::service::group0_batch&) const;
 };
 
 }

@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 #pragma once
 #include "gms/inet_address.hh"
@@ -35,15 +35,15 @@ class boot_strapper {
     sharded<streaming::stream_manager>& _stream_manager;
     abort_source& _abort_source;
     /* endpoint that needs to be bootstrapped */
-    inet_address _address;
+    locator::host_id _address;
     /* its DC/RACK info */
     locator::endpoint_dc_rack _dr;
     /* token of the node being bootstrapped. */
     std::unordered_set<token> _tokens;
-    const token_metadata_ptr _token_metadata_ptr;
+    const locator::token_metadata_ptr _token_metadata_ptr;
 public:
     boot_strapper(distributed<replica::database>& db, sharded<streaming::stream_manager>& sm, abort_source& abort_source,
-            inet_address addr, locator::endpoint_dc_rack dr, std::unordered_set<token> tokens, const token_metadata_ptr tmptr)
+            locator::host_id addr, locator::endpoint_dc_rack dr, std::unordered_set<token> tokens, const token_metadata_ptr tmptr)
         : _db(db)
         , _stream_manager(sm)
         , _abort_source(abort_source)
@@ -53,19 +53,21 @@ public:
         , _token_metadata_ptr(std::move(tmptr)) {
     }
 
-    future<> bootstrap(streaming::stream_reason reason, gms::gossiper& gossiper, service::frozen_topology_guard, inet_address replace_address = {});
+    future<> bootstrap(streaming::stream_reason reason, gms::gossiper& gossiper, service::frozen_topology_guard, locator::host_id replace_address = {});
 
     /**
      * if initialtoken was specified, use that (split on comma).
      * otherwise, if num_tokens == 1, pick a token to assume half the load of the most-loaded node.
      * else choose num_tokens tokens at random
      */
-    static std::unordered_set<token> get_bootstrap_tokens(const token_metadata_ptr tmptr, const db::config& cfg, check_token_endpoint check);
+    static std::unordered_set<token> get_bootstrap_tokens(const token_metadata_ptr tmptr, sstring initialtoken, uint32_t num_tokens, check_token_endpoint check);
+    static std::unordered_set<token> get_bootstrap_tokens(token_metadata_ptr tmptr, const db::config& cfg, check_token_endpoint check);
+
 
     /**
      * Same as above but does not consult initialtoken config
      */
-    static std::unordered_set<token> get_random_bootstrap_tokens(const token_metadata_ptr tmptr, size_t num_tokens, check_token_endpoint check);
+    static std::unordered_set<token> get_random_bootstrap_tokens(const token_metadata_ptr tmptr, size_t num_tokens);
 
     static std::unordered_set<token> get_random_tokens(const token_metadata_ptr tmptr, size_t num_tokens);
 #if 0

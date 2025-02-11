@@ -5,15 +5,14 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include "gms/generation-number.hh"
 #include "gms/version_generator.hh"
-#include "utils/serialization.hh"
-#include <ostream>
+#include <fmt/core.h>
 #include <limits>
 
 namespace gms {
@@ -62,9 +61,16 @@ public:
         _version = std::numeric_limits<version_type>::max();
     }
 
-    friend inline std::ostream& operator<<(std::ostream& os, const heart_beat_state& h) {
-        return os << "{ generation = " << h._generation << ", version = " << h._version << " }";
-    }
+    friend fmt::formatter<heart_beat_state>;
 };
 
 } // gms
+
+template<>
+struct fmt::formatter<gms::heart_beat_state> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const gms::heart_beat_state& h, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{{ generation = {}, version = {} }}",
+                              h._generation, h._version);
+    }
+};

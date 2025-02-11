@@ -5,15 +5,16 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "locator/snitch_base.hh"
 #include "gms/application_state.hh"
+#include "utils/class_registrator.hh"
 
 namespace locator {
 
-std::list<std::pair<gms::application_state, gms::versioned_value>> snitch_base::get_app_states() const {
+gms::application_state_map snitch_base::get_app_states() const {
     return {
         {gms::application_state::DC, gms::versioned_value::datacenter(_my_dc)},
         {gms::application_state::RACK, gms::versioned_value::rack(_my_rack)},

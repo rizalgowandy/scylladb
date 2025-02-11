@@ -179,6 +179,36 @@
                ]
             }
          ]
+      },
+      {
+         "path":"/system/dump_llvm_profile",
+         "operations":[
+            {
+               "method":"POST",
+               "summary":"Dump llvm profile data (raw profile data) that can later be used for coverage reporting or PGO (no-op if the current binary is not instrumented)",
+               "type":"void",
+               "nickname":"dump_profile",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[]
+            }
+         ]
+      },
+      {
+         "path":"/system/highest_supported_sstable_version",
+         "operations":[
+            {
+               "method":"GET",
+               "summary":"Get highest supported sstable version",
+               "type":"string",
+               "nickname":"get_highest_supported_sstable_version",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[]
+            }
+         ]
       }
    ]
 }

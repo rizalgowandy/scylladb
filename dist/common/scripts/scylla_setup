@@ -5,7 +5,7 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 import os
 import sys
@@ -15,7 +15,6 @@ import shutil
 import io
 import stat
 import distro
-import platform
 from scylla_util import *
 from subprocess import run, DEVNULL
 
@@ -104,7 +103,6 @@ def interactive_choose_swap_size():
             print(f'"{s}" is not valid number, input again')
 
 pkg_files = {
-        f'{PRODUCT}-jmx': scylladir_p() / 'jmx/scylla-jmx',
         f'{PRODUCT}-tools': scylladir_p() / 'share/cassandra/bin/cqlsh',
         f'{PRODUCT}-node-exporter': scylladir_p() / 'node_exporter/node_exporter'
         }
@@ -170,9 +168,6 @@ def warn_offline(setup):
 
 def warn_offline_missing_pkg(setup, pkg):
     colorprint('{red}{setup} disabled by default, since {pkg} not available.{nocolor}', setup=setup, pkg=pkg)
-
-def is_rhel7_old_kernel():
-    return is_redhat_variant() and distro.major_version() == '7' and platform.release().startswith('3.10')
 
 if __name__ == '__main__':
     if not is_nonroot() and os.getuid() > 0:
@@ -275,6 +270,8 @@ if __name__ == '__main__':
                         help='skip swap setup')
     parser.add_argument('--no-rsyslog-setup', action='store_true', default=False,
                         help='skip rsyslog setup')
+    parser.add_argument('--no-nofiles-setup', action='store_true', default=False,
+                        help='skip LimitNOFILES setup')
     parser.add_argument('--rsyslog-server',
                         help='specify a remote rsyslog server to send Scylla logs to. Use ip:port format, if no port is given, Scylla-Monitoring rsyslog will be used')
     if len(sys.argv) == 1:
@@ -321,6 +318,7 @@ if __name__ == '__main__':
     memory_setup = not args.no_memory_setup
     swap_setup = not args.no_swap_setup
     rsyslog_setup = not args.no_rsyslog_setup
+    nofiles_setup = not args.no_nofiles_setup
     rsyslog_server = args.rsyslog_server
     selinux_reboot_required = False
     set_clocksource = False
@@ -332,14 +330,6 @@ if __name__ == '__main__':
         return when_interactive_ask_service(interactive, msg1, msg2, default)
 
     if not is_nonroot():
-        if is_rhel7_old_kernel():
-            colorprint('{red}RHEL/CentOS7 default kernel detected.{nocolor}')
-            colorprint('{red}To get optimal performance, please install kernel-ml kernel.{nocolor}')
-            continue_setup = interactive_ask_service('Do you want to continue the setup with current kernel?', 'Yes - continue the setup, No - abort the setup.', True)
-            if not continue_setup:
-                colorprint('{red}Setup aborted.{nocolor}')
-                sys.exit(1)
-
         kernel_check = interactive_ask_service('Do you want to run check your kernel version?', 'Yes - runs a  script to verify that the kernel for this instance qualifies to run Scylla. No - skips the kernel check.', kernel_check)
         args.no_kernel_check = not kernel_check
         if kernel_check:
@@ -348,8 +338,6 @@ if __name__ == '__main__':
         verify_package = interactive_ask_service('Do you want to verify the ScyllaDB packages are installed?', 'Yes - runs a script to confirm that ScyllaDB is installed. No - skips the installation check.', verify_package)
         args.no_verify_package = not verify_package
         if verify_package:
-            do_verify_package_and_exit(f'{PRODUCT}-jmx')
-            do_verify_package_and_exit(f'{PRODUCT}-tools')
             do_verify_package_and_exit(f'{PRODUCT}-node-exporter')
 
     enable_service = interactive_ask_service('Do you want the Scylla server service to automatically start when the Scylla node boots?', 'Yes - Scylla server service automatically starts on Scylla node boot. No - skips this step. Note you will have to start the Scylla Server service manually.', enable_service)
@@ -564,6 +552,10 @@ if __name__ == '__main__':
                     rsyslog_server = interactive_ask_rsyslog_server()
                 if rsyslog_server:
                     run_setup_script('rsyslog', 'scylla_rsyslog_setup --remote-server ' + rsyslog_server)
+
+    nofiles_setup = interactive_ask_service('Do you want to tune LimitNOFILES run Scylla on large node?', 'Yes - tune LimitNOFILES. No - skip this setup.', nofiles_setup)
+    if nofiles_setup:
+        run_setup_script('LimitNOFILE tuneup', 'scylla_nofile_setup')
 
     print('ScyllaDB setup finished.')
 

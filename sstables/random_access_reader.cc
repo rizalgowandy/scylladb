@@ -3,14 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <exception>
 
 #include "sstables/random_access_reader.hh"
 #include "utils/disk-error-handler.hh"
-#include "log.hh"
+#include "utils/log.hh"
 
 namespace sstables {
 

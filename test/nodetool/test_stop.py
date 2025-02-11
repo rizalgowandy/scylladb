@@ -1,11 +1,10 @@
 #
 # Copyright 2023-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
-
-from rest_api_mock import expected_request
-import utils
+from test.nodetool.utils import check_nodetool_fails_with
+from test.nodetool.rest_api_mock import expected_request
 
 
 def check_compaction_type(nodetool, compaction_type):
@@ -36,10 +35,11 @@ def test_stop_unsupported(nodetool):
                 "POST",
                 "/compaction_manager/stop_compaction",
                 params={"type": compaction_type},
+                multiple=expected_request.ANY,
                 response={"code": 500,
                           "message": f"std::runtime_error (Compaction type {compaction_type} is unsupported)"},
                 response_status=500)
-        utils.check_nodetool_fails_with(
+        check_nodetool_fails_with(
                 nodetool,
                 ("stop", compaction_type),
                 {"expected_requests": [req]},
@@ -49,7 +49,7 @@ def test_stop_unsupported(nodetool):
 
 
 def test_stop_unknown(nodetool):
-    utils.check_nodetool_fails_with(
+    check_nodetool_fails_with(
             nodetool,
             ("stop", "FOO"),
             {},
@@ -58,7 +58,7 @@ def test_stop_unknown(nodetool):
 
 
 def test_stop_no_type(nodetool, scylla_only):
-    utils.check_nodetool_fails_with(
+    check_nodetool_fails_with(
             nodetool,
             ("stop",),
             {},
@@ -69,7 +69,7 @@ def test_stop_no_type(nodetool, scylla_only):
 def test_stop_by_id(nodetool, scylla_only):
     expected_error = "error processing arguments: stopping compactions by id is not implemented"
 
-    utils.check_nodetool_fails_with(nodetool, ("stop", "-id", "123"), {}, [expected_error])
-    utils.check_nodetool_fails_with(nodetool, ("stop", "-id=123"), {}, [expected_error])
-    utils.check_nodetool_fails_with(nodetool, ("stop", "--id", "123"), {}, [expected_error])
-    utils.check_nodetool_fails_with(nodetool, ("stop", "--id=123"), {}, [expected_error])
+    check_nodetool_fails_with(nodetool, ("stop", "-id", "123"), {}, [expected_error])
+    check_nodetool_fails_with(nodetool, ("stop", "-id=123"), {}, [expected_error])
+    check_nodetool_fails_with(nodetool, ("stop", "--id", "123"), {}, [expected_error])
+    check_nodetool_fails_with(nodetool, ("stop", "--id=123"), {}, [expected_error])

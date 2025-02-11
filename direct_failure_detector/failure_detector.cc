@@ -3,9 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include <unordered_set>
 
 #include <seastar/core/abort_source.hh>
@@ -17,7 +18,7 @@
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/util/defer.hh>
 
-#include "log.hh"
+#include "utils/log.hh"
 
 #include "direct_failure_detector/failure_detector.hh"
 
@@ -96,6 +97,7 @@ struct failure_detector::impl {
     clock& _clock;
 
     clock::interval_t _ping_period;
+    clock::interval_t _ping_timeout;
 
     // Number of workers on each shard.
     // We use this to decide where to create new workers (we pick a shard with the smallest number of workers).
@@ -138,7 +140,7 @@ struct failure_detector::impl {
     // The unregistering process requires cross-shard operations which we perform on this fiber.
     future<> _destroy_subscriptions = make_ready_future<>();
 
-    impl(failure_detector& parent, pinger&, clock&, clock::interval_t ping_period);
+    impl(failure_detector& parent, pinger&, clock&, clock::interval_t ping_period, clock::interval_t ping_timeout);
     ~impl();
 
     // Inform update_endpoint_fiber() about an added/removed endpoint.
@@ -174,12 +176,14 @@ struct failure_detector::impl {
     future<> mark(listener* l, pinger::endpoint_id ep, bool alive);
 };
 
-failure_detector::failure_detector(pinger& pinger, clock& clock, clock::interval_t ping_period)
-        : _impl(std::make_unique<impl>(*this, pinger, clock, ping_period))
+failure_detector::failure_detector(
+    pinger& pinger, clock& clock, clock::interval_t ping_period, clock::interval_t ping_timeout)
+        : _impl(std::make_unique<impl>(*this, pinger, clock, ping_period, ping_timeout))
 {}
 
-failure_detector::impl::impl(failure_detector& parent, pinger& pinger, clock& clock, clock::interval_t ping_period)
-        : _parent(parent), _pinger(pinger), _clock(clock), _ping_period(ping_period) {
+failure_detector::impl::impl(
+    failure_detector& parent, pinger& pinger, clock& clock, clock::interval_t ping_period, clock::interval_t ping_timeout)
+        : _parent(parent), _pinger(pinger), _clock(clock), _ping_period(ping_period), _ping_timeout(ping_timeout) {
     if (this_shard_id() != 0) {
         return;
     }
@@ -189,7 +193,7 @@ failure_detector::impl::impl(failure_detector& parent, pinger& pinger, clock& cl
 }
 
 void failure_detector::impl::send_update_endpoint(pinger::endpoint_id ep, endpoint_update update) {
-    assert(this_shard_id() == 0);
+    SCYLLA_ASSERT(this_shard_id() == 0);
 
     auto it = _endpoint_updates.find(ep);
     if (it == _endpoint_updates.end()) {
@@ -202,7 +206,7 @@ void failure_detector::impl::send_update_endpoint(pinger::endpoint_id ep, endpoi
 }
 
 future<> failure_detector::impl::update_endpoint_fiber() {
-    assert(this_shard_id() == 0);
+    SCYLLA_ASSERT(this_shard_id() == 0);
 
     while (true) {
         co_await _endpoint_changed.wait([this] { return !_endpoint_updates.empty(); });
@@ -243,7 +247,7 @@ future<> failure_detector::impl::update_endpoint_fiber() {
 }
 
 future<> failure_detector::impl::add_endpoint(pinger::endpoint_id ep) {
-    assert(this_shard_id() == 0);
+    SCYLLA_ASSERT(this_shard_id() == 0);
 
     if (_workers.contains(ep)) {
         co_return;
@@ -251,7 +255,7 @@ future<> failure_detector::impl::add_endpoint(pinger::endpoint_id ep) {
 
     // Pick a shard with the smallest number of workers to create a new worker.
     auto shard = std::distance(_num_workers.begin(), std::min_element(_num_workers.begin(), _num_workers.end()));
-    assert(_num_workers.size() == smp::count);
+    SCYLLA_ASSERT(_num_workers.size() == smp::count);
 
     ++_num_workers[shard];
     auto [it, _] = _workers.emplace(ep, shard);
@@ -266,7 +270,7 @@ future<> failure_detector::impl::add_endpoint(pinger::endpoint_id ep) {
 }
 
 future<> failure_detector::impl::remove_endpoint(pinger::endpoint_id ep) {
-    assert(this_shard_id() == 0);
+    SCYLLA_ASSERT(this_shard_id() == 0);
 
     auto it = _workers.find(ep);
     if (it == _workers.end()) {
@@ -276,8 +280,8 @@ future<> failure_detector::impl::remove_endpoint(pinger::endpoint_id ep) {
     auto shard = it->second;
     co_await _parent.container().invoke_on(shard, [ep] (failure_detector& fd) { return fd._impl->destroy_worker(ep); });
 
-    assert(_num_workers.size() == smp::count);
-    assert(shard < _num_workers.size());
+    SCYLLA_ASSERT(_num_workers.size() == smp::count);
+    SCYLLA_ASSERT(shard < _num_workers.size());
     --_num_workers[shard];
     _workers.erase(it);
 
@@ -371,8 +375,8 @@ endpoint_worker::endpoint_worker(failure_detector::impl& fd, pinger::endpoint_id
 }
 
 endpoint_worker::~endpoint_worker() {
-    assert(_ping_fiber.available());
-    assert(_notify_fiber.available());
+    SCYLLA_ASSERT(_ping_fiber.available());
+    SCYLLA_ASSERT(_notify_fiber.available());
 }
 
 future<subscription> failure_detector::register_listener(listener& l, clock::interval_t threshold) {
@@ -536,11 +540,9 @@ future<> endpoint_worker::ping_fiber() noexcept {
         auto start = clock.now();
         auto next_ping_start = start + _fd._ping_period;
 
-        // A ping should take significantly less time than _ping_period, but we give it a multiple of ping_period before it times out
-        // just in case of transient network partitions.
-        // However, if there's a listener that's going to timeout soon (before the ping returns), we abort the ping in order to handle
+        auto timeout = start + _fd._ping_timeout;
+        // If there's a listener that's going to timeout soon (before the ping returns), we abort the ping in order to handle
         // the listener (mark it as dead).
-        auto timeout = start + 3 * _fd._ping_period;
         for (auto& [threshold, l]: _fd._listeners_liveness) {
             if (l.endpoint_liveness[_id].alive && last_response + threshold < timeout) {
                 timeout = last_response + threshold;
@@ -623,11 +625,11 @@ future<> endpoint_worker::notify_fiber() noexcept {
             auto& listeners = it->second.listeners;
             auto& endpoint_liveness = it->second.endpoint_liveness[_id];
             bool alive = endpoint_liveness.alive;
-            assert(alive != endpoint_liveness.marked_alive);
+            SCYLLA_ASSERT(alive != endpoint_liveness.marked_alive);
             endpoint_liveness.marked_alive = alive;
 
             try {
-                co_await coroutine::parallel_for_each(listeners.begin(), listeners.end(), [this, endpoint = _id, alive] (const listener_info& listener) {
+                co_await coroutine::parallel_for_each(listeners, [this, endpoint = _id, alive] (const listener_info& listener) {
                     return _fd._parent.container().invoke_on(listener.shard, [listener = listener.id, endpoint, alive] (failure_detector& fd) {
                         return fd._impl->mark(listener, endpoint, alive);
                     });
@@ -679,7 +681,7 @@ future<> failure_detector::stop() {
 
     co_await container().invoke_on_all([] (failure_detector& fd) -> future<> {
         // All subscriptions must be destroyed before stopping the fd.
-        assert(fd._impl->_registered.empty());
+        SCYLLA_ASSERT(fd._impl->_registered.empty());
 
         // There are no concurrent `{create,destroy}_worker` calls running since we waited for `update_endpoint_fiber` to finish.
         while (!fd._impl->_shard_workers.empty()) {
@@ -696,13 +698,13 @@ future<> failure_detector::stop() {
 }
 
 failure_detector::impl::~impl() {
-    assert(_shard_workers.empty());
-    assert(_destroy_subscriptions.available());
-    assert(_update_endpoint_fiber.available());
+    SCYLLA_ASSERT(_shard_workers.empty());
+    SCYLLA_ASSERT(_destroy_subscriptions.available());
+    SCYLLA_ASSERT(_update_endpoint_fiber.available());
 }
 
 failure_detector::~failure_detector() {
-    assert(!_impl);
+    SCYLLA_ASSERT(!_impl);
 }
 
 } // namespace direct_failure_detector

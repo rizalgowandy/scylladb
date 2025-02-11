@@ -3,18 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "types/types.hh"
-#include "mutation/atomic_cell.hh"
 #include "query-request.hh"
 #include "query-result.hh"
 #include "utils/digest_algorithm.hh"
 #include "utils/digester.hh"
 #include "full_position.hh"
+#include "mutation/tombstone.hh"
 #include "idl/query.dist.hh"
 #include "idl/query.dist.impl.hh"
 
@@ -136,9 +136,9 @@ public:
             return stop_iteration::no;
         }
         if (!_slice.options.contains<partition_slice::option::allow_short_read>()) {
-            throw std::runtime_error(fmt::format(
-                    "Tombstones processed by unpaged query exceeds limit of {} (configured via query_tombstone_page_limit)",
-                    _tombstone_limit));
+            // The read is unpaged, we cannot interrupt it early without failing it.
+            // Better let it continue.
+            return stop_iteration::no;
         }
         return stop_iteration::yes;
     }

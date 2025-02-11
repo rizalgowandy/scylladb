@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -24,6 +24,10 @@ class view_info final {
     mutable std::optional<query::partition_slice> _partition_slice;
     db::view::base_info_ptr _base_info;
     mutable bool _has_computed_column_depending_on_base_non_primary_key;
+
+    // True if the partition key columns of the view are the same as the
+    // partition key columns of the base, maybe in a different order.
+    mutable bool _is_partition_key_permutation_of_base_partition_key;
 public:
     view_info(const schema& schema, const raw_view_info& raw_view_info);
 
@@ -56,6 +60,10 @@ public:
         return _has_computed_column_depending_on_base_non_primary_key;
     }
 
+    bool is_partition_key_permutation_of_base_partition_key() const {
+        return _is_partition_key_permutation_of_base_partition_key;
+    }
+
     /// Returns a pointer to the base_dependent_view_info which matches the current
     /// schema of the base table.
     ///
@@ -74,7 +82,11 @@ public:
     friend bool operator==(const view_info& x, const view_info& y) {
         return x._raw == y._raw;
     }
-    friend std::ostream& operator<<(std::ostream& os, const view_info& view) {
-        return os << view._raw;
+    friend fmt::formatter<view_info>;
+};
+
+template <> struct fmt::formatter<view_info> : fmt::formatter<string_view> {
+    auto format(const view_info& view, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", view._raw);
     }
 };

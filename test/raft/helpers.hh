@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 //
@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include "utils/assert.hh"
 #include <boost/test/unit_test.hpp>
 #include "test/lib/log.hh"
 #include "test/lib/random_utils.hh"
@@ -63,9 +64,20 @@ raft::command create_command(T val) {
 extern raft::fsm_config fsm_cfg;
 extern raft::fsm_config fsm_cfg_pre;
 
-class fsm_debug : public raft::fsm {
+struct sm_events_container {
+    seastar::condition_variable sm_events;
+};
+
+class fsm_debug : public sm_events_container, public raft::fsm {
 public:
     using raft::fsm::fsm;
+
+    explicit fsm_debug(raft::server_id id, raft::term_t current_term, raft::server_id voted_for, raft::log log,
+            raft::failure_detector& failure_detector, raft::fsm_config conf)
+        : sm_events_container()
+        , fsm(id, current_term, voted_for, std::move(log), raft::index_t{0}, failure_detector, conf, sm_events) {
+    }
+
     void become_follower(raft::server_id leader) {
         raft::fsm::become_follower(leader);
     }
@@ -78,14 +90,14 @@ public:
     }
 
     bool leadership_transfer_active() const {
-        assert(is_leader());
+        SCYLLA_ASSERT(is_leader());
         return bool(leader_state().stepdown);
     }
 };
 
 // NOTE: it doesn't compare data contents, just the data type
 bool compare_log_entry(raft::log_entry_ptr le1, raft::log_entry_ptr le2);
-bool compare_log_entries(raft::log& log1, raft::log& log2, size_t from, size_t to);
+bool compare_log_entries(raft::log& log1, raft::log& log2, raft::index_t from, raft::index_t to);
 using raft_routing_map = std::unordered_map<raft::server_id, raft::fsm*>;
 
 bool deliver(raft_routing_map& routes, raft::server_id from,

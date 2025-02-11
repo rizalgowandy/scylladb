@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "murmur3_partitioner.hh"
@@ -34,7 +34,7 @@ murmur3_partitioner::get_token(bytes_view key) const {
 
 token
 murmur3_partitioner::get_token(uint64_t value) const {
-    return token(token::kind::key, value);
+    return token(value);
 }
 
 token

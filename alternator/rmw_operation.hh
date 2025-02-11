@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -11,9 +11,14 @@
 #include "seastarx.hh"
 #include "service/paxos/cas_request.hh"
 #include "utils/rjson.hh"
+#include "consumed_capacity.hh"
 #include "executor.hh"
+#include "tracing/trace_state.hh"
+#include "keys.hh"
 
 namespace alternator {
+
+class consumed_capacity;
 
 // An rmw_operation encapsulates the common logic of all the item update
 // operations which may involve a read of the item before the write
@@ -63,7 +68,7 @@ protected:
     partition_key _pk = partition_key::make_empty();
     clustering_key _ck = clustering_key::make_empty();
     write_isolation _write_isolation;
-
+    mutable wcu_consumed_capacity_counter _consumed_capacity;
     // All RMW operations can have a ReturnValues parameter from the following
     // choices. But note that only UpdateItem actually supports all of them:
     enum class returnvalues {
@@ -113,7 +118,8 @@ public:
             tracing::trace_state_ptr trace_state,
             service_permit permit,
             bool needs_read_before_write,
-            stats& stats);
+            stats& stats,
+            uint64_t& wcu_total);
     std::optional<shard_id> shard_for_execute(bool needs_read_before_write);
 };
 

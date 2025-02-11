@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/distributed.hh>
@@ -12,10 +12,10 @@
 #include <seastar/core/thread.hh>
 #include <seastar/util/closeable.hh>
 
-#include "utils/managed_bytes.hh"
+#include "utils/assert.hh"
 #include "utils/logalloc.hh"
-#include "row_cache.hh"
-#include "log.hh"
+#include "db/row_cache.hh"
+#include "utils/log.hh"
 #include "schema/schema_builder.hh"
 #include "replica/memtable.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
@@ -104,13 +104,13 @@ int main(int argc, char** argv) {
                 return memory::stats().free_memory() + logalloc::shard_tracker().occupancy().free_space();
             };
 
-            std::cout << "memtable occupancy: " << mt->occupancy() << "\n";
-            std::cout << "Cache occupancy: " << tracker.region().occupancy() << "\n";
-            std::cout << "Reclaimable memory: " << reclaimable_memory() << "\n";
+            fmt::print("memtable occupancy: {}\n", mt->occupancy());
+            fmt::print("Cache occupancy: {}\n", tracker.region().occupancy());
+            fmt::print("Reclaimable memory: {}\n", reclaimable_memory());
 
             // We need to have enough Free memory to copy memtable into cache
             // When this assertion fails, increase amount of memory
-            assert(mt->occupancy().used_space() < reclaimable_memory());
+            SCYLLA_ASSERT(mt->occupancy().used_space() < reclaimable_memory());
 
             std::deque<dht::decorated_key> cache_stuffing;
             auto fill_cache_to_the_top = [&] {
@@ -140,16 +140,16 @@ int main(int argc, char** argv) {
                 for (auto&& key : keys) {
                     cache.touch(key);
                 }
-                std::cout << "Reclaimable memory: " << reclaimable_memory() << "\n";
-                std::cout << "Cache occupancy: " << tracker.region().occupancy() << "\n";
+                fmt::print("Reclaimable memory: {}\n", reclaimable_memory());
+                fmt::print("Cache occupancy: {}\n", tracker.region().occupancy());
             };
 
             std::deque<std::unique_ptr<char[]>> stuffing;
             auto fragment_free_space = [&] {
                 stuffing.clear();
-                std::cout << "Reclaimable memory: " << reclaimable_memory() << "\n";
-                std::cout << "Free memory: " << memory::stats().free_memory() << "\n";
-                std::cout << "Cache occupancy: " << tracker.region().occupancy() << "\n";
+                fmt::print("Reclaimable memory: {}\n", reclaimable_memory());
+                fmt::print("Free memory: {}\n", memory::stats().free_memory());
+                fmt::print("Cache occupancy: {}\n", tracker.region().occupancy());
 
                 // Induce memory fragmentation by taking down cache segments,
                 // which should be evicted in random order, and inducing high
@@ -159,10 +159,10 @@ int main(int argc, char** argv) {
                     stuffing.emplace_back(std::make_unique<char[]>(logalloc::segment_size / 2 + 1));
                 }
 
-                std::cout << "After fragmenting:\n";
-                std::cout << "Reclaimable memory: " << reclaimable_memory() << "\n";
-                std::cout << "Free memory: " << memory::stats().free_memory() << "\n";
-                std::cout << "Cache occupancy: " << tracker.region().occupancy() << "\n";
+                fmt::print("After fragmenting:\n");
+                fmt::print("Reclaimable memory: {}\n", reclaimable_memory());
+                fmt::print("Free memory: {}\n", memory::stats().free_memory());
+                fmt::print("Cache occupancy: {}\n", tracker.region().occupancy());
             };
 
             fill_cache_to_the_top();
@@ -179,9 +179,9 @@ int main(int argc, char** argv) {
                 auto range = dht::partition_range::make_singular(key);
                 auto reader = cache.make_reader(s, semaphore.make_permit(), range);
                 auto close_reader = deferred_close(reader);
-                auto mo = read_mutation_from_flat_mutation_reader(reader).get0();
-                assert(mo);
-                assert(mo->partition().live_row_count(*s) ==
+                auto mo = read_mutation_from_mutation_reader(reader).get();
+                SCYLLA_ASSERT(mo);
+                SCYLLA_ASSERT(mo->partition().live_row_count(*s) ==
                        row_count + 1 /* one row was already in cache before update()*/);
             }
 
@@ -197,9 +197,9 @@ int main(int argc, char** argv) {
                 auto range = dht::partition_range::make_singular(key);
                 auto reader = cache.make_reader(s, semaphore.make_permit(), range);
                 auto close_reader = deferred_close(reader);
-                auto mfopt = reader().get0();
-                assert(mfopt);
-                assert(mfopt->is_partition_start());
+                auto mfopt = reader().get();
+                SCYLLA_ASSERT(mfopt);
+                SCYLLA_ASSERT(mfopt->is_partition_start());
             }
 
             std::cout << "Testing reading when memory can't be reclaimed.\n";
@@ -236,12 +236,12 @@ int main(int argc, char** argv) {
                 try {
                     auto reader = cache.make_reader(s, semaphore.make_permit(), range);
                     auto close_reader = deferred_close(reader);
-                    assert(!reader().get0());
+                    SCYLLA_ASSERT(!reader().get());
                     auto evicted_from_cache = logalloc::segment_size + large_cell_size;
                     // GCC's -fallocation-dce can remove dead calls to new and malloc, so
                     // assign the result to a global variable to disable it.
                     leak = new char[evicted_from_cache + logalloc::segment_size];
-                    assert(false); // The test is not invoking the case which it's supposed to test
+                    SCYLLA_ASSERT(false); // The test is not invoking the case which it's supposed to test
                 } catch (const std::bad_alloc&) {
                     // expected
                 }

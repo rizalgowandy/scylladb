@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -23,12 +23,5 @@ public:
 
     virtual sstring to_string() const override;
 };
-
-inline
-std::ostream&
-operator<<(std::ostream& os, const cf_name& n) {
-    os << n.to_string();
-    return os;
-}
 
 }

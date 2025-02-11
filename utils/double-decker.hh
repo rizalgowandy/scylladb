@@ -3,13 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <type_traits>
-#include <seastar/util/concepts.hh>
+#include "utils/assert.hh"
 #include "utils/bptree.hh"
 #include "utils/intrusive-array.hh"
 #include "utils/collection-concepts.hh"
@@ -197,7 +197,7 @@ public:
 
     template <typename... Args>
     iterator emplace_before(iterator i, Key k, const bound_hint& hint, Args&&... args) {
-        assert(!hint.match);
+        SCYLLA_ASSERT(!hint.match);
         outer_iterator& bucket = i._bucket;
 
         if (!hint.key_match) {
@@ -363,7 +363,7 @@ public:
             arr->for_each(disp);
         });
 
-        assert(nb == end._bucket);
+        SCYLLA_ASSERT(nb == end._bucket);
 
         /*
          * Drop the head of the ending bucket. Every erased element is the 0th

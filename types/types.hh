@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -11,7 +11,8 @@
 #include <optional>
 #include <boost/functional/hash.hpp>
 #include <iosfwd>
-#include <sstream>
+#include <initializer_list>
+#include <unordered_set>
 
 #include <seastar/core/sstring.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -19,7 +20,6 @@
 #include <seastar/net/byteorder.hh>
 #include "db_clock.hh"
 #include "bytes.hh"
-#include "utils/to_string.hh"
 #include "duration.hh"
 #include "marshal_exception.hh"
 #include <seastar/net/ipv4_address.hh>
@@ -33,9 +33,11 @@
 #include "utils/bit_cast.hh"
 #include "utils/chunked_vector.hh"
 #include "utils/lexicographical_compare.hh"
+#include "utils/overloaded_functor.hh"
 #include "tasks/types.hh"
 
 class tuple_type_impl;
+class vector_type_impl;
 class big_decimal;
 
 namespace utils {
@@ -50,7 +52,7 @@ class cql3_type;
 
 }
 
-int64_t timestamp_from_string(sstring_view s);
+int64_t timestamp_from_string(std::string_view s);
 
 struct runtime_exception : public std::exception {
     sstring _why;
@@ -216,6 +218,16 @@ public:
     // to explicitly call `make_null()` instead.
     data_value(std::nullptr_t) = delete;
 
+    // Do not allow construction of a data_value from pointers. The reason is
+    // that this is error prone since pointers are implicitly converted to `bool`
+    // deriving the data_value(bool) constructor.
+    // In this case, comparisons between unrelated types, like `sstring` and `something*`
+    // implicitly select operator==(const data_value&, const data_value&), as
+    // `sstring` is implicitly convertible to `data_value`, and so is `something*`
+    // via `data_value(bool)`.
+    template <typename T>
+    data_value(const T*) = delete;
+
     data_value(ascii_native_type);
     data_value(bool);
     data_value(int8_t);
@@ -267,7 +279,7 @@ public:
     friend class empty_type_impl;
     template <typename T> friend const T& value_cast(const data_value&);
     template <typename T> friend T&& value_cast(data_value&&);
-    friend std::ostream& operator<<(std::ostream&, const data_value&);
+    friend data_value make_vector_value(data_type, maybe_empty<std::vector<data_value>>);
     friend data_value make_tuple_value(data_type, maybe_empty<std::vector<data_value>>);
     friend data_value make_set_value(data_type, maybe_empty<std::vector<data_value>>);
     friend data_value make_list_value(data_type, maybe_empty<std::vector<data_value>>);
@@ -323,7 +335,8 @@ public:
         utf8,
         uuid,
         varint,
-        last = varint,
+        vector,
+        last = vector,
     };
 private:
     kind _kind;
@@ -425,7 +438,7 @@ public:
         return to_string(bytes_view(b));
     }
     sstring to_string_impl(const data_value& v) const;
-    bytes from_string(sstring_view text) const;
+    bytes from_string(std::string_view text) const;
     bool is_counter() const;
     bool is_string() const;
     bool is_collection() const;
@@ -439,10 +452,14 @@ public:
     bool is_atomic() const { return !is_multi_cell(); }
     bool is_reversed() const { return _kind == kind::reversed; }
     bool is_tuple() const;
+    bool is_vector() const;
     bool is_user_type() const { return _kind == kind::user; }
     bool is_native() const;
     cql3::cql3_type as_cql3_type() const;
     const sstring& cql3_type_name() const;
+    // The type is guaranteed to be wrapped within double quotation marks
+    // if it couldn't be used as a type identifier in CQL otherwise.
+    sstring cql3_type_name_without_frozen() const;
     virtual shared_ptr<const abstract_type> freeze() const { return shared_from_this(); }
 
     const abstract_type& without_reversed() const {
@@ -466,7 +483,7 @@ protected:
     bool _contains_set_or_map = false;
     bool _contains_collection = false;
 
-    // native_value_* methods are virualized versions of native_type's
+    // native_value_* methods are virtualized versions of native_type's
     // sizeof/alignof/copy-ctor/move-ctor etc.
     void* native_value_clone(const void* from) const;
     const std::type_info& native_typeid() const;
@@ -557,34 +574,7 @@ bool operator==(const data_value& x, const data_value& y);
 using bytes_view_opt = std::optional<bytes_view>;
 using managed_bytes_view_opt = std::optional<managed_bytes_view>;
 
-static inline
-bool optional_less_compare(data_type t, bytes_view_opt e1, bytes_view_opt e2) {
-    if (bool(e1) != bool(e2)) {
-        return bool(e2);
-    }
-    if (!e1) {
-        return false;
-    }
-    return t->less(*e1, *e2);
-}
-
-static inline
-bool optional_equal(data_type t, bytes_view_opt e1, bytes_view_opt e2) {
-    if (bool(e1) != bool(e2)) {
-        return false;
-    }
-    if (!e1) {
-        return true;
-    }
-    return t->equal(*e1, *e2);
-}
-
-static inline
-bool less_compare(data_type t, bytes_view e1, bytes_view e2) {
-    return t->less(e1, e2);
-}
-
-static inline
+inline
 std::strong_ordering tri_compare(data_type t, managed_bytes_view e1, managed_bytes_view e2) {
     return t->compare(e1, e2);
 }
@@ -599,7 +589,7 @@ tri_compare_opt(data_type t, managed_bytes_view_opt v1, managed_bytes_view_opt v
     }
 }
 
-static inline
+inline
 bool equal(data_type t, managed_bytes_view e1, managed_bytes_view e2) {
     return t->equal(e1, e2);
 }
@@ -890,7 +880,7 @@ less_unsigned(bytes_view v1, bytes_view v2) {
 }
 
 template<typename Type>
-static inline
+inline
 typename Type::value_type deserialize_value(Type& t, bytes_view v) {
     return t.deserialize_value(v);
 }
@@ -984,6 +974,7 @@ std::optional<View> read_nth_user_type_field(View serialized_user_type, std::siz
 
 using user_type = shared_ptr<const user_type_impl>;
 using tuple_type = shared_ptr<const tuple_type_impl>;
+using vector_type = shared_ptr<const vector_type_impl>;
 
 inline
 data_value::data_value(std::optional<bytes> v)
@@ -1002,3 +993,39 @@ struct appending_hash<data_type> {
         feed_hash(h, v->name());
     }
 };
+
+struct unset_value {
+    bool operator==(const unset_value&) const noexcept { return true; }
+};
+
+using data_value_or_unset = std::variant<data_value, unset_value>;
+
+template <>
+struct fmt::formatter<unset_value> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const unset_value& u, FormatContext& ctx) const {
+        return fmt::format_to(ctx.out(), "unset");
+    }
+};
+
+template <>
+struct fmt::formatter<data_value_or_unset> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const data_value_or_unset& var, FormatContext& ctx) const {
+        return std::visit(overloaded_functor {
+            [&ctx] (const data_value& v) {
+                return fmt::format_to(ctx.out(), "{}", v);
+            },
+            [&ctx] (const unset_value& u) {
+                return fmt::format_to(ctx.out(), "{}", u);
+            }
+        }, var);
+    }
+};
+
+template <> struct fmt::formatter<data_value> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const data_value&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+using data_value_list = std::initializer_list<data_value_or_unset>;

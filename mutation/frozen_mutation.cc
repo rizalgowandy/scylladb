@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/coroutine.hh>
@@ -14,11 +14,10 @@
 #include "counters.hh"
 #include "partition_builder.hh"
 #include "mutation_partition_serializer.hh"
-#include "utils/data_input.hh"
 #include "query-result-set.hh"
 #include "idl/mutation.dist.hh"
 #include "idl/mutation.dist.impl.hh"
-#include "readers/flat_mutation_reader_v2.hh"
+#include "readers/mutation_reader.hh"
 #include "converting_mutation_partition_applier.hh"
 #include "mutation_partition_view.hh"
 
@@ -32,7 +31,7 @@ using namespace db;
 
 ser::mutation_view frozen_mutation::mutation_view() const {
     auto in = ser::as_input_stream(_bytes);
-    return ser::deserialize(in, boost::type<ser::mutation_view>());
+    return ser::deserialize(in, std::type_identity<ser::mutation_view>());
 }
 
 table_id
@@ -102,20 +101,6 @@ frozen_mutation::unfreeze(schema_ptr schema) const {
     return m;
 }
 
-future<mutation>
-frozen_mutation::unfreeze_gently(schema_ptr schema) const {
-    check_schema_version(schema_version(), *schema);
-    mutation m(schema, key());
-    partition_builder b(*schema, m.partition());
-    try {
-        co_await partition().accept_gently(*schema, b);
-    } catch (...) {
-        std::throw_with_nested(std::runtime_error(format(
-                "frozen_mutation::unfreeze_gently(): failed unfreezing mutation {} of {}.{}", key(), schema->ks_name(), schema->cf_name())));
-    }
-    co_return m;
-}
-
 mutation frozen_mutation::unfreeze_upgrading(schema_ptr schema, const column_mapping& cm) const {
     mutation m(schema, key());
     converting_mutation_partition_applier v(cm, *schema, m.partition());
@@ -133,23 +118,20 @@ frozen_mutation freeze(const mutation& m) {
 }
 
 std::vector<frozen_mutation> freeze(const std::vector<mutation>& muts) {
-    return boost::copy_range<std::vector<frozen_mutation>>(muts | boost::adaptors::transformed([] (const mutation& m) {
+    return muts | std::views::transform([] (const mutation& m) {
         return freeze(m);
-    }));
+    }) | std::ranges::to<std::vector<frozen_mutation>>();
 }
 
 std::vector<mutation> unfreeze(const std::vector<frozen_mutation>& muts) {
-    return boost::copy_range<std::vector<mutation>>(muts | boost::adaptors::transformed([] (const frozen_mutation& fm) {
+    return muts | std::views::transform([] (const frozen_mutation& fm) {
         return fm.unfreeze(local_schema_registry().get(fm.schema_version()));
-    }));
+    }) | std::ranges::to<std::vector<mutation>>();
 }
+
 
 mutation_partition_view frozen_mutation::partition() const {
     return mutation_partition_view::from_view(mutation_view().partition());
-}
-
-std::ostream& operator<<(std::ostream& out, const frozen_mutation::printer& pr) {
-    return out << pr.self.unfreeze(pr.schema);
 }
 
 frozen_mutation::printer frozen_mutation::pretty_printer(schema_ptr s) const {
@@ -167,11 +149,7 @@ stop_iteration streamed_mutation_freezer::consume(static_row&& sr) {
 }
 
 stop_iteration streamed_mutation_freezer::consume(clustering_row&& cr) {
-    if (_reversed) {
-        _crs.emplace_front(std::move(cr));
-    } else {
-        _crs.emplace_back(std::move(cr));
-    }
+    _crs.emplace_back(std::move(cr));
     return stop_iteration::no;
 }
 
@@ -281,7 +259,7 @@ public:
     }
 };
 
-future<> fragment_and_freeze(flat_mutation_reader_v2 mr, frozen_mutation_consumer_fn c, size_t fragment_size)
+future<> fragment_and_freeze(mutation_reader mr, frozen_mutation_consumer_fn c, size_t fragment_size)
 {
     std::exception_ptr ex;
     try {

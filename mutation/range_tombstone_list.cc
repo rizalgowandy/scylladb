@@ -3,13 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <boost/range/adaptor/reversed.hpp>
 #include "range_tombstone_list.hh"
+#include "utils/assert.hh"
 #include "utils/allocation_strategy.hh"
-#include "utils/amortized_reserve.hh"
+#include <boost/range/algorithm/equal.hpp>
 #include <seastar/util/variant_utils.hh>
 
 range_tombstone_list::range_tombstone_list(const range_tombstone_list& x)
@@ -320,28 +320,28 @@ struct pos_order_by_start {
 range_tombstone_list::iterator_range
 range_tombstone_list::slice(const schema& s, const query::clustering_range& r) const {
     auto bv_range = bound_view::from_range(r);
-    return boost::make_iterator_range(
+    return std::ranges::subrange(
         _tombstones.lower_bound(bv_range.first, bv_order_by_end{s}),
         _tombstones.upper_bound(bv_range.second, bv_order_by_start{s}));
 }
 
 range_tombstone_list::iterator_range
 range_tombstone_list::slice(const schema& s, position_in_partition_view start, position_in_partition_view end) const {
-    return boost::make_iterator_range(
+    return std::ranges::subrange(
         _tombstones.upper_bound(start, pos_order_by_end{s}), // end_position() is exclusive, hence upper_bound()
         _tombstones.lower_bound(end, pos_order_by_start{s}));
 }
 
 range_tombstone_list::iterator_range
 range_tombstone_list::lower_slice(const schema& s, bound_view start, position_in_partition_view before) const {
-    return boost::make_iterator_range(
+    return std::ranges::subrange(
         _tombstones.lower_bound(start, bv_order_by_end{s}),
         _tombstones.lower_bound(before, pos_order_by_end{s}));
 }
 
 range_tombstone_list::iterator_range
 range_tombstone_list::upper_slice(const schema& s, position_in_partition_view after, bound_view end) const {
-    return boost::make_iterator_range(
+    return std::ranges::subrange(
         _tombstones.upper_bound(after, pos_order_by_start{s}),
         _tombstones.upper_bound(end, bv_order_by_start{s}));
 }
@@ -386,7 +386,7 @@ void range_tombstone_list::reverter::update(range_tombstones_type::iterator it, 
 }
 
 void range_tombstone_list::reverter::revert() noexcept {
-    for (auto&& rt : _ops | boost::adaptors::reversed) {
+    for (auto&& rt : _ops | std::views::reverse) {
         seastar::visit(rt, [this] (auto& op) {
             op.undo(_s, _dst);
         });
@@ -410,7 +410,7 @@ void range_tombstone_list::nop_reverter::update(range_tombstones_type::iterator 
 
 void range_tombstone_list::insert_undo_op::undo(const schema& s, range_tombstone_list& rt_list) noexcept {
     auto it = rt_list.find(s, _new_rt);
-    assert (it != rt_list.end());
+    SCYLLA_ASSERT (it != rt_list.end());
     rt_list._tombstones.erase_and_dispose(it, current_deleter<range_tombstone_entry>());
 }
 
@@ -420,7 +420,7 @@ void range_tombstone_list::erase_undo_op::undo(const schema& s, range_tombstone_
 
 void range_tombstone_list::update_undo_op::undo(const schema& s, range_tombstone_list& rt_list) noexcept {
     auto it = rt_list.find(s, _new_rt);
-    assert (it != rt_list.end());
+    SCYLLA_ASSERT (it != rt_list.end());
     *it = std::move(_old_rt);
 }
 

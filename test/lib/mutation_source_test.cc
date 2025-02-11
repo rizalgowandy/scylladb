@@ -3,12 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <set>
-#include <boost/range/adaptor/map.hpp>
 #include <boost/test/unit_test.hpp>
+#include <fmt/ranges.h>
 #include "partition_slice_builder.hh"
 #include "schema/schema_builder.hh"
 #include "test/lib/mutation_source_test.hh"
@@ -16,8 +16,8 @@
 #include "counters.hh"
 #include "mutation/mutation_rebuilder.hh"
 #include "test/lib/simple_schema.hh"
-#include "readers/flat_mutation_reader_v2.hh"
-#include "test/lib/flat_mutation_reader_assertions.hh"
+#include "readers/mutation_reader.hh"
+#include "test/lib/mutation_reader_assertions.hh"
 #include "mutation_query.hh"
 #include "mutation/mutation_rebuilder.hh"
 #include "test/lib/random_utils.hh"
@@ -27,12 +27,12 @@
 #include "test/lib/key_utils.hh"
 #include "test/lib/log.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
-#include <boost/algorithm/string/join.hpp>
 #include "types/user.hh"
 #include "types/map.hh"
 #include "types/list.hh"
 #include "types/set.hh"
 #include <seastar/util/closeable.hh>
+#include "utils/assert.hh"
 #include "utils/UUID_gen.hh"
 
 // partitions must be sorted by decorated key
@@ -66,7 +66,7 @@ public:
     void fast_forward_if_needed(flat_reader_assertions_v2& mr, const mutation& expected, bool verify_eos = true) {
         while (!current_range().contains(expected.decorated_key(), dht::ring_position_comparator(*expected.schema()))) {
             _current_position++;
-            assert(_current_position < _ranges.size());
+            SCYLLA_ASSERT(_current_position < _ranges.size());
             if (verify_eos) {
                 mr.produces_end_of_stream();
             }
@@ -319,9 +319,7 @@ static void test_slicing_and_fast_forwarding(tests::reader_concurrency_semaphore
 
     for (auto prange_size = 1u; prange_size < mutations.size(); prange_size += 2) {
         for (auto pstart = 0u; pstart + prange_size <= mutations.size(); pstart++) {
-            auto ms = boost::copy_range<std::vector<mutation>>(
-                mutations | boost::adaptors::sliced(pstart, pstart + prange_size)
-            );
+            auto ms = mutations | std::views::drop(pstart) | std::views::take(prange_size) | std::ranges::to<std::vector>();
             if (prange_size == 1) {
                 test_ckey({dht::partition_range::make_singular(mutations[pstart].decorated_key())}, ms, mutation_reader::forwarding::yes);
                 test_ckey({dht::partition_range::make_singular(mutations[pstart].decorated_key())}, ms, mutation_reader::forwarding::no);
@@ -390,7 +388,7 @@ static void test_streamed_mutation_forwarding_is_consistent_with_slicing(tests::
         }
         auto fwd_m = forwardable_reader_to_mutation(std::move(fwd_reader), position_ranges);
 
-        mutation_opt sliced_m = read_mutation_from_flat_mutation_reader(sliced_reader).get0();
+        mutation_opt sliced_m = read_mutation_from_mutation_reader(sliced_reader).get();
         BOOST_REQUIRE(bool(sliced_m));
         assert_that(*sliced_m).is_equal_to(fwd_m, slice_with_ranges.row_ranges(*m.schema(), m.key()));
     }
@@ -408,7 +406,7 @@ static void test_streamed_mutation_forwarding_guarantees(tests::reader_concurren
     };
 
     const int n_keys = 1001;
-    assert(!contains_key(n_keys - 1)); // so that we can form a range with position greater than all keys
+    SCYLLA_ASSERT(!contains_key(n_keys - 1)); // so that we can form a range with position greater than all keys
 
     mutation m(s, table.make_pkey());
     std::vector<clustering_key> keys;
@@ -550,7 +548,7 @@ static void test_fast_forwarding_across_partitions_to_empty_range(tests::reader_
     for (auto&& key : keys) {
         mutation m(s, key);
         sstring val = make_random_string(1024);
-        for (auto i : boost::irange(0u, ckeys_per_part)) {
+        for (auto i : std::views::iota(0u, ckeys_per_part)) {
             table.add_row(m, table.make_ckey(next_ckey + i), val);
         }
         next_ckey += ckeys_per_part;
@@ -1587,7 +1585,7 @@ void test_reader_conversions(tests::reader_concurrency_semaphore_wrapper& semaph
         {
             auto rd = ms.make_fragment_v1_stream(m.schema(), semaphore.make_permit());
             auto close_rd = deferred_close(rd);
-            match_compacted_mutation(read_mutation_from_flat_mutation_reader(rd).get0(), m_compacted, query_time);
+            match_compacted_mutation(read_mutation_from_mutation_reader(rd).get(), m_compacted, query_time);
         }
     });
 }
@@ -1728,7 +1726,9 @@ static mutation_source make_mutation_source(populate_fn_ex populate, schema_ptr 
             tracing::trace_state_ptr tr,
             streamed_mutation::forwarding fwd,
             mutation_reader::forwarding mr_fwd) mutable {
-        reversed_slices.emplace_back(partition_slice_builder(*table_schema, query::native_reverse_slice_to_legacy_reverse_slice(*table_schema, slice))
+        // Note that the clustering ranges of the provided slice are already reversed in relation to the table_schema
+        // above. Thus toggling its reverse option is all that needs to be done here.
+        reversed_slices.emplace_back(partition_slice_builder(*table_schema, slice)
                 .with_option<query::partition_slice::option::reversed>()
                 .build());
         return ms.make_reader_v2(query_schema, std::move(permit), pr, reversed_slices.back(), tr, fwd, mr_fwd);
@@ -1958,7 +1958,7 @@ void for_each_mutation_pair(std::function<void(const mutation&, const mutation&,
     auto&& ms = get_mutation_sets();
     for (auto&& mutations : ms.equal) {
         auto i = mutations.begin();
-        assert(i != mutations.end());
+        SCYLLA_ASSERT(i != mutations.end());
         const mutation& first = *i++;
         while (i != mutations.end()) {
             callback(first, *i, are_equal::yes);
@@ -1967,7 +1967,7 @@ void for_each_mutation_pair(std::function<void(const mutation&, const mutation&,
     }
     for (auto&& mutations : ms.unequal) {
         auto i = mutations.begin();
-        assert(i != mutations.end());
+        SCYLLA_ASSERT(i != mutations.end());
         const mutation& first = *i++;
         while (i != mutations.end()) {
             callback(first, *i, are_equal::no);
@@ -2095,11 +2095,11 @@ public:
         // The pre-existing assumption here is that the type of all the primary key components is blob.
         // So we generate partition keys and take the single blob component and save it as a random blob value.
         auto keys = tests::generate_partition_keys(n_blobs, _schema, _local_shard_only, tests::key_size{_external_blob_size, _external_blob_size});
-        _blobs =  boost::copy_range<std::vector<bytes>>(keys | boost::adaptors::transformed([] (const dht::decorated_key& dk) { return dk.key().explode().front(); }));
+        _blobs =  keys | std::views::transform([] (const dht::decorated_key& dk) { return dk.key().explode().front(); }) | std::ranges::to<std::vector<bytes>>();
     }
 
     void set_key_cardinality(size_t n_keys) {
-        assert(n_keys <= n_blobs);
+        SCYLLA_ASSERT(n_keys <= n_blobs);
         _ck_index_dist = std::uniform_int_distribution<size_t>{0, n_keys - 1};
     }
 
@@ -2307,7 +2307,7 @@ public:
                 case 1: return row_marker(random_tombstone(timestamp_level::row_marker_tombstone));
                 case 2: return row_marker(gen_timestamp(timestamp_level::data));
                 case 3: return row_marker(gen_timestamp(timestamp_level::data), std::chrono::seconds(1), new_expiry());
-                default: assert(0);
+                default: SCYLLA_ASSERT(0);
             }
             abort();
         };
@@ -2553,12 +2553,10 @@ void for_each_schema_change(std::function<void(schema_ptr, const std::vector<mut
     }
 
     auto max_generator_count = std::max(
-        // boost::max_elements wants the iterators to be copy-assignable. The ones we get
-        // from boost::adaptors::transformed aren't.
-        boost::accumulate(static_columns | boost::adaptors::transformed([] (const column_description& c) {
+        std::ranges::fold_left(static_columns | std::views::transform([] (const column_description& c) {
             return c.data_generators.size();
         }), 0u, [] (size_t a, size_t b) { return std::max(a, b); }),
-        boost::accumulate(regular_columns | boost::adaptors::transformed([] (const column_description& c) {
+        std::ranges::fold_left(regular_columns | std::views::transform([] (const column_description& c) {
             return c.data_generators.size();
         }), 0u, [] (size_t a, size_t b) { return std::max(a, b); })
     );
@@ -2728,7 +2726,7 @@ void for_each_schema_change(std::function<void(schema_ptr, const std::vector<mut
     test_mutated_schemas();
 }
 
-static bool compare_readers(const schema& s, flat_mutation_reader_v2& authority, flat_reader_assertions_v2& tested) {
+static bool compare_readers(const schema& s, mutation_reader& authority, flat_reader_assertions_v2& tested) {
     bool empty = true;
     while (auto expected = authority().get()) {
         tested.produces(s, *expected);
@@ -2738,14 +2736,14 @@ static bool compare_readers(const schema& s, flat_mutation_reader_v2& authority,
     return !empty;
 }
 
-void compare_readers(const schema& s, flat_mutation_reader_v2 authority, flat_mutation_reader_v2 tested, bool exact) {
+void compare_readers(const schema& s, mutation_reader authority, mutation_reader tested, bool exact) {
     auto close_authority = deferred_close(authority);
     auto assertions = assert_that(std::move(tested)).exact(exact);
     compare_readers(s, authority, assertions);
 }
 
 // Assumes that the readers return fragments from (at most) a single (and the same) partition.
-void compare_readers(const schema& s, flat_mutation_reader_v2 authority, flat_mutation_reader_v2 tested, const std::vector<position_range>& fwd_ranges) {
+void compare_readers(const schema& s, mutation_reader authority, mutation_reader tested, const std::vector<position_range>& fwd_ranges) {
     auto close_authority = deferred_close(authority);
     auto assertions = assert_that(std::move(tested));
     if (compare_readers(s, authority, assertions)) {
@@ -2757,7 +2755,7 @@ void compare_readers(const schema& s, flat_mutation_reader_v2 authority, flat_mu
     }
 }
 
-mutation forwardable_reader_to_mutation(flat_mutation_reader_v2 r, const std::vector<position_range>& fwd_ranges) {
+mutation forwardable_reader_to_mutation(mutation_reader r, const std::vector<position_range>& fwd_ranges) {
     auto close_reader = deferred_close(r);
 
     struct consumer {
@@ -2768,33 +2766,33 @@ mutation forwardable_reader_to_mutation(flat_mutation_reader_v2 r, const std::ve
             , _builder(builder) { }
 
         void consume_new_partition(const dht::decorated_key& dk) {
-            assert(!_builder);
+            SCYLLA_ASSERT(!_builder);
             _builder = mutation_rebuilder_v2(std::move(_s));
             _builder->consume_new_partition(dk);
         }
 
         stop_iteration consume(tombstone t) {
-            assert(_builder);
+            SCYLLA_ASSERT(_builder);
             return _builder->consume(t);
         }
 
         stop_iteration consume(range_tombstone_change&& rt) {
-            assert(_builder);
+            SCYLLA_ASSERT(_builder);
             return _builder->consume(std::move(rt));
         }
 
         stop_iteration consume(static_row&& sr) {
-            assert(_builder);
+            SCYLLA_ASSERT(_builder);
             return _builder->consume(std::move(sr));
         }
 
         stop_iteration consume(clustering_row&& cr) {
-            assert(_builder);
+            SCYLLA_ASSERT(_builder);
             return _builder->consume(std::move(cr));
         }
 
         stop_iteration consume_end_of_partition() {
-            assert(_builder);
+            SCYLLA_ASSERT(_builder);
             return stop_iteration::yes;
         }
 
@@ -2828,5 +2826,5 @@ std::vector<mutation> squash_mutations(std::vector<mutation> mutations) {
             it->second.apply(mut);
         }
     }
-    return boost::copy_range<std::vector<mutation>>(merged_muts | boost::adaptors::map_values);
+    return merged_muts | std::views::values | std::ranges::to<std::vector>();
 }

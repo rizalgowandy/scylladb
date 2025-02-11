@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -13,15 +13,11 @@
 namespace db {
 
 enum class schema_feature {
-    VIEW_VIRTUAL_COLUMNS,
-
     // When set, the schema digest is calculated in a way such that it doesn't change after all
     // tombstones in an empty partition expire.
     // See https://github.com/scylladb/scylla/issues/4485
     DIGEST_INSENSITIVE_TO_EXPIRY,
     COMPUTED_COLUMNS,
-    CDC_OPTIONS,
-    PER_TABLE_PARTITIONERS,
     SCYLLA_KEYSPACES,
     SCYLLA_AGGREGATES,
 
@@ -31,18 +27,23 @@ enum class schema_feature {
 
     // When enabled we'll add a new column to the `system_schema.scylla_tables` table.
     GROUP0_SCHEMA_VERSIONING,
+
+    // Unused.  Defined for backward compatibility only
+    IN_MEMORY_TABLES,
+
+    // Per-table tablet options
+    TABLET_OPTIONS,
 };
 
 using schema_features = enum_set<super_enum<schema_feature,
-    schema_feature::VIEW_VIRTUAL_COLUMNS,
     schema_feature::DIGEST_INSENSITIVE_TO_EXPIRY,
     schema_feature::COMPUTED_COLUMNS,
-    schema_feature::CDC_OPTIONS,
-    schema_feature::PER_TABLE_PARTITIONERS,
     schema_feature::SCYLLA_KEYSPACES,
     schema_feature::SCYLLA_AGGREGATES,
     schema_feature::TABLE_DIGEST_INSENSITIVE_TO_EXPIRY,
-    schema_feature::GROUP0_SCHEMA_VERSIONING
+    schema_feature::GROUP0_SCHEMA_VERSIONING,
+    schema_feature::IN_MEMORY_TABLES,
+    schema_feature::TABLET_OPTIONS
     >>;
 
 }

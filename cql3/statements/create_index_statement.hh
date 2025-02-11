@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -17,10 +17,7 @@
 
 #include <seastar/core/shared_ptr.hh>
 
-#include <unordered_map>
-#include <utility>
 #include <vector>
-#include <set>
 
 
 namespace cql3 {
@@ -47,10 +44,16 @@ public:
 
     future<> check_access(query_processor& qp, const service::client_state& state) const override;
     void validate(query_processor&, const service::client_state& state) const override;
-    future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>> prepare_schema_mutations(query_processor& qp, api::timestamp_type) const override;
+    future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>> prepare_schema_mutations(query_processor& qp, const query_options& options, api::timestamp_type) const override;
 
 
     virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats) override;
+
+    struct base_schema_with_new_index {
+        schema_ptr schema;
+        index_metadata index;
+    };
+    std::optional<base_schema_with_new_index> build_index_schema(data_dictionary::database db) const;
 private:
     void validate_for_local_index(const schema& schema) const;
     void validate_for_frozen_collection(const index_target& target) const;
@@ -65,8 +68,7 @@ private:
                                               const sstring& name,
                                               index_metadata_kind kind,
                                               const index_options_map& options);
-    std::vector<::shared_ptr<index_target>> validate_while_executing(query_processor& qp) const;
-    schema_ptr build_index_schema(query_processor& qp) const;
+    std::vector<::shared_ptr<index_target>> validate_while_executing(data_dictionary::database db) const;
 };
 
 }

@@ -3,10 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/coroutine.hh>
+#include <fmt/ranges.h>
 
 #include "api/api.hh"
 #include "api/storage_service.hh"
@@ -15,6 +16,7 @@
 #include "compaction/task_manager_module.hh"
 #include "service/storage_service.hh"
 #include "tasks/task_manager.hh"
+#include "replica/database.hh"
 
 using namespace seastar::httpd;
 
@@ -29,7 +31,7 @@ using ks_cf_func = std::function<future<json::json_return_type>(http_context&, s
 
 static auto wrap_ks_cf(http_context &ctx, ks_cf_func f) {
     return [&ctx, f = std::move(f)](std::unique_ptr<http::request> req) {
-        auto keyspace = validate_keyspace(ctx, req->param);
+        auto keyspace = validate_keyspace(ctx, req);
         auto table_infos = parse_table_infos(keyspace, ctx, req->query_parameters, "cf");
         return f(ctx, std::move(req), std::move(keyspace), std::move(table_infos));
     };
@@ -50,9 +52,9 @@ void set_tasks_compaction_module(http_context& ctx, routes& r, sharded<service::
         apilog.debug("force_keyspace_compaction_async: keyspace={} tables={}, flush={}", keyspace, table_infos, flush);
 
         auto& compaction_module = db.local().get_compaction_manager().get_task_manager_module();
-        std::optional<major_compaction_task_impl::flush_mode> fmopt;
+        std::optional<flush_mode> fmopt;
         if (!flush) {
-            fmopt = major_compaction_task_impl::flush_mode::skip;
+            fmopt = flush_mode::skip;
         }
         auto task = co_await compaction_module.make_and_start_task<major_keyspace_compaction_task_impl>({}, std::move(keyspace), tasks::task_id::create_null_id(), db, table_infos, fmopt);
 
@@ -61,7 +63,7 @@ void set_tasks_compaction_module(http_context& ctx, routes& r, sharded<service::
 
     t::force_keyspace_cleanup_async.set(r, [&ctx, &ss](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
         auto& db = ctx.db;
-        auto keyspace = validate_keyspace(ctx, req->param);
+        auto keyspace = validate_keyspace(ctx, req);
         auto table_infos = parse_table_infos(keyspace, ctx, req->query_parameters, "cf");
         apilog.info("force_keyspace_cleanup_async: keyspace={} tables={}", keyspace, table_infos);
         if (!co_await ss.local().is_cleanup_allowed(keyspace)) {
@@ -71,7 +73,7 @@ void set_tasks_compaction_module(http_context& ctx, routes& r, sharded<service::
         }
 
         auto& compaction_module = db.local().get_compaction_manager().get_task_manager_module();
-        auto task = co_await compaction_module.make_and_start_task<cleanup_keyspace_compaction_task_impl>({}, std::move(keyspace), db, table_infos);
+        auto task = co_await compaction_module.make_and_start_task<cleanup_keyspace_compaction_task_impl>({}, std::move(keyspace), db, table_infos, flush_mode::all_tables, tasks::is_user_task::yes);
 
         co_return json::json_return_type(task->get_status().id.to_sstring());
     });

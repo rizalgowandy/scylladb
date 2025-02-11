@@ -23,7 +23,7 @@ It’s recommended to have a balanced setup. If there are only 4-8 :term:`Logica
 This works in the opposite direction as well.
 ScyllaDB can be used in many types of installation environments.
 
-To see which system would best suit your workload requirements, use the `ScyllaDB Sizing Calculator <https://price-calc.gh.scylladb.com/>`_ to customize ScyllaDB for your usage.
+To see which system would best suit your workload requirements, use the `ScyllaDB Sizing Calculator <https://www.scylladb.com/product/scylla-cloud/get-pricing/>`_ to customize ScyllaDB for your usage.
 
 
 
@@ -52,7 +52,7 @@ In terms of the number of cores, any number will work since ScyllaDB scales up w
 A practical approach is to use a large number of cores as long as the hardware price remains reasonable. 
 Between 20-60 logical cores (including hyperthreading) is a recommended number. However, any number will fit. 
 When using virtual machines, containers, or the public cloud, remember that each virtual CPU is mapped to a single logical core, or thread. 
-Allow ScyllaDB to run independently without any additional CPU intensive tasks on the same server/cores as Scylla.
+Allow ScyllaDB to run independently without any additional CPU intensive tasks on the same server/cores as ScyllaDB.
 
 .. _system-requirements-memory:
 
@@ -99,7 +99,7 @@ Time-window Compaction Strategy (TWCS)  50%          70%
 Incremental Compaction Strategy (ICS)   70%          80%
 ======================================  ===========  ============
 
-Use the default ICS  unless you'll have a clear understanding that another strategy is better for your use case. More on :doc:`choosing a Compaction Strategy </architecture/compaction/compaction-strategies>`.
+Use the default ICS unless you'll have a clear understanding that another strategy is better for your use case. More on :doc:`choosing a Compaction Strategy </architecture/compaction/compaction-strategies>`.
 In order to maintain a high level of service availability, keep 50% to 20% free disk space at all times!
 
 .. _system-requirements-network:

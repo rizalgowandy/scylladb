@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 #include <seastar/core/metrics.hh>
 #include <seastar/core/coroutine.hh>
@@ -195,8 +195,4 @@ one_session_records::one_session_records(trace_type type, std::chrono::seconds s
 {
 }
 
-std::ostream& operator<<(std::ostream& os, const span_id& id) {
-    return os << id.get_id();
 }
-}
-

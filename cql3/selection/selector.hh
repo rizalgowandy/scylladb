@@ -5,16 +5,11 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
-#include <vector>
-#include "query-request.hh"
-#include "types/types.hh"
-#include "schema/schema_fwd.hh"
-#include "counters.hh"
 #include "cql3/expr/expression.hh"
 
 namespace cql3 {

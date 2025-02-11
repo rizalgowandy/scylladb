@@ -3,12 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/thread.hh>
 #include "test/lib/scylla_test_case.hh"
 
+#include "utils/assert.hh"
 #include "utils/fragmented_temporary_buffer.hh"
 
 #include "test/lib/random_utils.hh"
@@ -245,7 +246,7 @@ SEASTAR_THREAD_TEST_CASE(test_read_pod) {
 
 SEASTAR_THREAD_TEST_CASE(test_read_to) {
     auto test = [&] (bytes_view expected_value1, bytes_view expected_value2, fragmented_temporary_buffer& ftb) {
-        assert(expected_value2.size() < expected_value1.size());
+        SCYLLA_ASSERT(expected_value2.size() < expected_value1.size());
 
         bytes actual_value;
 
@@ -281,7 +282,7 @@ SEASTAR_THREAD_TEST_CASE(test_read_to) {
 
 SEASTAR_THREAD_TEST_CASE(test_read_view) {
     auto test = [&] (bytes_view expected_value1, bytes_view expected_value2, fragmented_temporary_buffer& ftb) {
-        assert(expected_value2.size() < expected_value1.size());
+        SCYLLA_ASSERT(expected_value2.size() < expected_value1.size());
 
         auto in = ftb.get_istream();
         BOOST_CHECK_EQUAL(in.bytes_left(), expected_value1.size() + expected_value2.size());
@@ -312,7 +313,7 @@ SEASTAR_THREAD_TEST_CASE(test_read_view) {
 SEASTAR_THREAD_TEST_CASE(test_read_bytes_view) {
     auto linearization_buffer = bytes_ostream();
     auto test = [&] (bytes_view expected_value1, bytes_view expected_value2, fragmented_temporary_buffer& ftb) {
-        assert(expected_value2.size() < expected_value1.size());
+        SCYLLA_ASSERT(expected_value2.size() < expected_value1.size());
 
         auto in = ftb.get_istream();
         BOOST_CHECK_EQUAL(in.read_bytes_view(0, linearization_buffer), bytes_view());
@@ -414,18 +415,18 @@ SEASTAR_THREAD_TEST_CASE(test_read_fragmented_buffer) {
 
         auto in = input_stream<char>(data_source(std::make_unique<memory_data_source>(std::move(buffers))));
 
-        auto prefix = in.read_exactly(prefix_size).get0();
+        auto prefix = in.read_exactly(prefix_size).get();
         BOOST_CHECK_EQUAL(prefix.size(), prefix_size);
         BOOST_CHECK_EQUAL(bytes_view(reinterpret_cast<const bytes::value_type*>(prefix.get()), prefix.size()),
                           expected_prefix);
 
         auto reader = fragmented_temporary_buffer::reader();
-        auto fbuf = reader.read_exactly(in, size).get0();
+        auto fbuf = reader.read_exactly(in, size).get();
         auto view = fragmented_temporary_buffer::view(fbuf);
         BOOST_CHECK_EQUAL(view.size_bytes(), size);
         BOOST_CHECK_EQUAL(linearized(view), expected_data);
 
-        auto suffix = in.read_exactly(suffix_size).get0();
+        auto suffix = in.read_exactly(suffix_size).get();
         BOOST_CHECK_EQUAL(suffix.size(), suffix_size);
         BOOST_CHECK_EQUAL(bytes_view(reinterpret_cast<const bytes::value_type*>(suffix.get()), suffix.size()),
                           expected_suffix);
@@ -494,7 +495,7 @@ static void do_test_read_exactly_eof(size_t input_size) {
     auto ds = data_source(std::make_unique<memory_data_source>(std::move(data)));
     auto is = input_stream<char>(std::move(ds));
     auto reader = fragmented_temporary_buffer::reader();
-    auto result = reader.read_exactly(is, input_size + 1).get0();
+    auto result = reader.read_exactly(is, input_size + 1).get();
     BOOST_CHECK_EQUAL(result.size_bytes(), size_t(0));
 }
 
