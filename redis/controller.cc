@@ -3,8 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
+
+#include <seastar/coroutine/switch_to.hh>
+#include <seastar/core/with_scheduling_group.hh>
 
 #include "timeout_config.hh"
 #include "redis/controller.hh"
@@ -12,7 +15,7 @@
 #include "redis/server.hh"
 #include "service/storage_proxy.hh"
 #include "db/config.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "auth/common.hh"
 
 static logging::logger slogger("controller");
@@ -20,8 +23,10 @@ static logging::logger slogger("controller");
 namespace redis {
 
 controller::controller(seastar::sharded<service::storage_proxy>& proxy, seastar::sharded<auth::service>& auth_service,
-        seastar::sharded<service::migration_manager>& mm, db::config& cfg, seastar::sharded<gms::gossiper>& gossiper)
-    : _proxy(proxy)
+        seastar::sharded<service::migration_manager>& mm, db::config& cfg, seastar::sharded<gms::gossiper>& gossiper,
+        seastar::scheduling_group sg)
+    : protocol_server(sg)
+    , _proxy(proxy)
     , _db(proxy.local().data_dictionary())
     , _auth_service(auth_service)
     , _mm(mm)
@@ -87,7 +92,7 @@ future<> controller::listen(seastar::sharded<auth::service>& auth_service, db::c
 
             return f.then([server, configs = std::move(configs), keepalive] {
                 return parallel_for_each(configs, [server, keepalive](const listen_cfg & cfg) {
-                    return server->invoke_on_all(&redis_transport::redis_server::listen, cfg.addr, cfg.cred, false, keepalive).then([cfg] {
+                    return server->invoke_on_all(&redis_transport::redis_server::listen, cfg.addr, cfg.cred, false, keepalive, std::nullopt, [&c = *server]() -> auto& { return c.local(); }).then([cfg] {
                         slogger.info("Starting listening for REDIS clients on {} ({})", cfg.addr, cfg.cred ? "encrypted" : "unencrypted");
                     });
                 });
@@ -118,19 +123,17 @@ std::vector<socket_address> controller::listen_addresses() const {
 
 future<> controller::start_server()
 {
+    co_await coroutine::switch_to(_sched_group);
     // 1. Create keyspace/tables used by redis API if not exists.
     // 2. Initialize the redis query processor.
     // 3. Listen on the redis transport port.
-    return redis::maybe_create_keyspace(_proxy, _db, _mm, _cfg, _gossiper).then([this] {
-        return _query_processor.start(std::ref(_proxy),
-                seastar::sharded_parameter([&] { return _proxy.local().data_dictionary(); }));
-    }).then([this] {
-        return _query_processor.invoke_on_all([] (auto& processor) {
-            return processor.start();
-        });
-    }).then([this] {
-        return listen(_auth_service, _cfg);
+    co_await redis::maybe_create_keyspace(_proxy, _db, _mm, _cfg, _gossiper);
+    co_await _query_processor.start(std::ref(_proxy),
+            seastar::sharded_parameter([&] { return _proxy.local().data_dictionary(); }));
+    co_await _query_processor.invoke_on_all([] (auto& processor) {
+        return processor.start();
     });
+    co_await listen(_auth_service, _cfg);
 }
 
 future<> controller::stop_server()
@@ -147,7 +150,9 @@ future<> controller::stop_server()
 }
 
 future<> controller::request_stop_server() {
-    return stop_server();
+    return with_scheduling_group(_sched_group, [this] {
+        return stop_server();
+    });
 }
 
 }

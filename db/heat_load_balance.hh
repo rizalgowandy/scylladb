@@ -3,8 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
+
+#pragma once
 
 /*
  * Given a vector of cache hit ratio (hits per request) for each of N nodes,
@@ -25,10 +27,12 @@
  *    uniformly, and we need to choose K nodes and forward the request
  *    to them).
  */
+#include "utils/assert.hh"
 #include <vector>
 #include <cassert>
-#include <boost/range/adaptor/map.hpp>
-#include "log.hh"
+#include <ranges>
+#include <fmt/ranges.h>  // IWYU pragma: keep
+#include "utils/log.hh"
 
 extern logging::logger hr_logger;
 
@@ -67,7 +71,7 @@ public:
     std::vector<Node> get() {
         auto n = _pp.size();
         auto ke = _k + (_extra ? 1 : 0);
-        assert(ke <= n);
+        SCYLLA_ASSERT(ke <= n);
         std::vector<Node> ret;
         ret.reserve(ke);
         std::vector<int> r = ssample(_k, _pp);
@@ -94,7 +98,7 @@ public:
                 }
             }
         }
-        assert(ret.size() == ke);
+        SCYLLA_ASSERT(ret.size() == ke);
         return ret;
     }
 };
@@ -122,7 +126,7 @@ miss_equalizing_combination(
     clip_probabilities(p, 1.0f / bf);
 
 
-    hr_logger.trace("desired probabilities: {}, {}", node_hit_rate | boost::adaptors::map_keys, p);
+    hr_logger.trace("desired probabilities: {}, {}", node_hit_rate | std::views::keys, p);
 
     // If me >= rf, this node is NOT one of the replicas, and we just need
     // to use the probabilities for these replicas, without doing the

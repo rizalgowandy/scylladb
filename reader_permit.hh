@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -67,8 +67,6 @@ inline bool operator==(const reader_resources& a, const reader_resources& b) {
     return a.count == b.count && a.memory == b.memory;
 }
 
-std::ostream& operator<<(std::ostream& os, const reader_resources& r);
-
 class reader_concurrency_semaphore;
 
 /// A permit for a specific read.
@@ -104,9 +102,9 @@ private:
 private:
     reader_permit() = default;
     reader_permit(shared_ptr<impl>);
-    explicit reader_permit(reader_concurrency_semaphore& semaphore, const schema* const schema, std::string_view op_name,
+    explicit reader_permit(reader_concurrency_semaphore& semaphore, schema_ptr schema, std::string_view op_name,
             reader_resources base_resources, db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr);
-    explicit reader_permit(reader_concurrency_semaphore& semaphore, const schema* const schema, sstring&& op_name,
+    explicit reader_permit(reader_concurrency_semaphore& semaphore, schema_ptr schema, sstring&& op_name,
             reader_resources base_resources, db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr);
 
     reader_permit::impl& operator*() { return *_impl; }
@@ -143,7 +141,7 @@ public:
 
     reader_concurrency_semaphore& semaphore();
 
-    const ::schema* get_schema() const;
+    const schema_ptr& get_schema() const;
     std::string_view get_op_name() const;
     state get_state() const;
 
@@ -176,7 +174,7 @@ public:
 
     // If the read was aborted, throw the exception the read was aborted with.
     // Otherwise no-op.
-    void check_abort();
+    void check_abort() const;
 
     query::max_result_size max_result_size() const;
     void set_max_result_size(query::max_result_size);
@@ -211,8 +209,6 @@ public:
     reader_permit permit() const { return _permit; }
     reader_resources resources() const { return _resources; }
 };
-
-std::ostream& operator<<(std::ostream& os, reader_permit::state s);
 
 /// Mark a permit as needing CPU.
 ///
@@ -325,3 +321,10 @@ template <typename T>
 bool operator==(const tracking_allocator<T>& a, const tracking_allocator<T>& b) {
     return a._semaphore == b._semaphore;
 }
+
+template <> struct fmt::formatter<reader_permit::state> : fmt::formatter<string_view> {
+    auto format(reader_permit::state, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+template <> struct fmt::formatter<reader_resources> : fmt::formatter<string_view> {
+    auto format(const reader_resources&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

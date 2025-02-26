@@ -3,14 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
 #pragma once
 
 #include "cql3/expr/expression.hh"
-#include "data_dictionary/data_dictionary.hh"
 
 namespace cql3::selection {
 

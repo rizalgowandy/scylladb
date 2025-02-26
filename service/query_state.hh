@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #ifndef SERVICE_QUERY_STATE_HH
@@ -12,6 +12,7 @@
 
 #include "service/client_state.hh"
 #include "tracing/tracing.hh"
+#include "tracing/trace_state.hh"
 #include "service_permit.hh"
 
 namespace qos {

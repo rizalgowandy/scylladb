@@ -3,12 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include "bytes.hh"
 #include "schema/schema_fwd.hh"
 #include "replica/database_fwd.hh"
 #include "bytes_ostream.hh"
@@ -20,6 +19,7 @@
 class canonical_mutation {
     bytes_ostream _data;
 public:
+    canonical_mutation() = default;
     explicit canonical_mutation(bytes_ostream);
     explicit canonical_mutation(const mutation&);
 
@@ -35,9 +35,21 @@ public:
     // is not intended, user should sync the schema first.
     mutation to_mutation(schema_ptr) const;
 
+    partition_key key() const;
+
     table_id column_family_id() const;
 
     const bytes_ostream& representation() const { return _data; }
+    bytes_ostream& representation() { return _data; }
 
-    friend std::ostream& operator<<(std::ostream& os, const canonical_mutation& cm);
+    friend fmt::formatter<canonical_mutation>;
 };
+
+template <> struct fmt::formatter<canonical_mutation> : fmt::formatter<string_view> {
+    auto format(const canonical_mutation&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+inline std::ostream& operator<<(std::ostream& os, const canonical_mutation& cm) {
+    fmt::print(os, "{}", cm);
+    return os;
+}

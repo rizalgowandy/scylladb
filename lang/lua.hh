@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -27,8 +27,6 @@ struct runtime_config {
     utils::updateable_value<unsigned> max_bytes;
     utils::updateable_value<unsigned> max_contiguous;
 };
-
-runtime_config make_runtime_config(const db::config& config);
 
 sstring compile(const runtime_config& cfg, const std::vector<sstring>& arg_names, sstring script);
 seastar::future<bytes_opt> run_script(bitcode_view bitcode, const std::vector<data_value>& values,

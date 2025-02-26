@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 #include <utility>
 
@@ -325,8 +325,8 @@ operation::set_counter_value_from_tuple_list::prepare(data_dictionary::database 
                 if (id <= last) {
                     throw marshal_exception(
                                     format("invalid counter id order, {} <= {}",
-                                                    id.uuid().to_sstring(),
-                                                    last.uuid().to_sstring()));
+                                                    id.uuid(),
+                                                    last.uuid()));
                 }
                 last = id;
                 // TODO: maybe allow more than global values to propagate,

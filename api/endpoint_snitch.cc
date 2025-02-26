@@ -3,11 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "locator/snitch_base.hh"
-#include "locator/production_snitch_base.hh"
 #include "endpoint_snitch.hh"
 #include "api/api-doc/endpoint_snitch_info.json.hh"
 #include "api/api-doc/storage_service.json.hh"

@@ -5,20 +5,16 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
+#include "utils/assert.hh"
 #include "cql3/user_types.hh"
-
-#include "cql3/cql3_type.hh"
-#include "cql3/constants.hh"
 
 #include "cql3/expr/evaluate.hh"
 #include "cql3/expr/expr-utils.hh"
 
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/algorithm/cxx11/any_of.hpp>
-
+#include "mutation/mutation.hh"
 #include "types/user.hh"
 
 namespace cql3 {
@@ -51,7 +47,7 @@ void user_types::setter::execute(mutation& m, const clustering_key_prefix& row_k
             const auto& elems = expr::get_user_type_elements(ut_value, type);
             // There might be fewer elements given than fields in the type
             // (e.g. when the user uses a short tuple literal), but never more.
-            assert(elems.size() <= type.size());
+            SCYLLA_ASSERT(elems.size() <= type.size());
 
             for (size_t i = 0; i < elems.size(); ++i) {
                 if (!elems[i]) {
@@ -75,7 +71,7 @@ void user_types::setter::execute(mutation& m, const clustering_key_prefix& row_k
 }
 
 void user_types::setter_by_field::execute(mutation& m, const clustering_key_prefix& row_key, const update_parameters& params) {
-    assert(column.type->is_user_type() && column.type->is_multi_cell());
+    SCYLLA_ASSERT(column.type->is_user_type() && column.type->is_multi_cell());
 
     auto value = expr::evaluate(*_e, params._options);
 
@@ -90,7 +86,7 @@ void user_types::setter_by_field::execute(mutation& m, const clustering_key_pref
 }
 
 void user_types::deleter_by_field::execute(mutation& m, const clustering_key_prefix& row_key, const update_parameters& params) {
-    assert(column.type->is_user_type() && column.type->is_multi_cell());
+    SCYLLA_ASSERT(column.type->is_user_type() && column.type->is_multi_cell());
 
     collection_mutation_description mut;
     mut.cells.emplace_back(serialize_field_index(_field_idx), params.make_dead_cell());

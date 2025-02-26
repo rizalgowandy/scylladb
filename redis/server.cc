@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "redis/server.hh"
@@ -11,12 +11,7 @@
 #include "redis/request.hh"
 #include "redis/reply.hh"
 
-#include "auth/authenticator.hh"
-#include "db/config.hh"
 #include "db/consistency_level_type.hh"
-#include "db/write_type.hh"
-#include "exceptions/exceptions.hh"
-#include "service/query_state.hh"
 
 #include <seastar/core/future-util.hh>
 #include <seastar/core/seastar.hh>
@@ -25,7 +20,6 @@
 #include <seastar/util/defer.hh>
 
 #include <cassert>
-#include <string>
 #include <unordered_map>
 
 namespace redis_transport {

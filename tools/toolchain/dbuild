@@ -16,10 +16,14 @@ EOF
     exit 1
 }
 
-if which docker >/dev/null 2>&1 ; then
-  tool=${DBUILD_TOOL-docker}
-elif which podman >/dev/null 2>&1 ; then
+command_exists() {
+    type -p "$1" > /dev/null
+}
+
+if command_exists podman ; then
   tool=${DBUILD_TOOL-podman}
+elif command_exists docker ; then
+  tool=${DBUILD_TOOL-docker}
 else
   die "Please make sure you install either podman or docker on this machine to run dbuild"
 fi
@@ -192,11 +196,16 @@ if [[ "${OSTYPE}" == "darwin"* ]]; then
   hard_limit=1024000
 fi
 
+if [[ -n "$interactive" || -t 0 ]]; then
+    docker_common_args+=("--tty")
+fi
+
 docker_common_args+=(
        --security-opt seccomp=unconfined \
        --security-opt label=disable \
        --network host \
        --cap-add SYS_PTRACE \
+       --privileged \
        --ulimit nofile=$(ulimit -Sn):$hard_limit \
        -v "$PWD:$PWD" \
        -v "$tmpdir:/tmp" \
@@ -210,7 +219,6 @@ docker_common_args+=(
        "$image" \
        "${args[@]}"
 )
-
 cleanup() {
     rm -rf "$tmpdir"
     if [ -v TMP_PASSWD ]; then

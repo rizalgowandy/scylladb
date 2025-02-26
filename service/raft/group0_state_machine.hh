@@ -3,19 +3,25 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #pragma once
 
 #include <seastar/core/gate.hh>
 #include <seastar/core/abort_source.hh>
 
-#include "seastar/core/abort_source.hh"
+#include "data_dictionary/data_dictionary.hh"
 #include "service/broadcast_tables/experimental/lang.hh"
 #include "raft/raft.hh"
+#include "service/raft/group0_state_id_handler.hh"
 #include "utils/UUID_gen.hh"
 #include "mutation/canonical_mutation.hh"
 #include "service/raft/raft_state_machine.hh"
+#include "gms/feature.hh"
+
+namespace gms {
+class feature_service;
+}
 
 namespace service {
 class raft_group0_client;
@@ -23,9 +29,6 @@ class migration_manager;
 class storage_proxy;
 class storage_service;
 struct group0_state_machine_merger;
-
-template <typename C> class raft_address_map_t;
-using raft_address_map = raft_address_map_t<seastar::lowres_clock>;
 
 struct schema_change {
     // Mutations of schema tables (such as `system_schema.keyspaces`, `system_schema.tables` etc.)
@@ -41,14 +44,21 @@ struct topology_change {
     std::vector<canonical_mutation> mutations;
 };
 
+// Allows executing combined topology & schema mutations under a single RAFT command.
+// The order of the mutations doesn't matter.
+struct mixed_change {
+    std::vector<canonical_mutation> mutations;
+};
+
 // This command is used to write data to tables other than topology or
-// schema tables and it doesn't update any in-memory data structures.
+// schema tables. and it updates any in-memory data structures based on
+// mutations' table_id.
 struct write_mutations {
     std::vector<canonical_mutation> mutations;
 };
 
 struct group0_command {
-    std::variant<schema_change, broadcast_table_query, topology_change, write_mutations> change;
+    std::variant<schema_change, broadcast_table_query, topology_change, write_mutations, mixed_change> change;
 
     // Mutation of group0 history table, appending a new state ID and optionally a description.
     canonical_mutation history_append;
@@ -83,19 +93,29 @@ struct group0_command {
 // Raft state machine implementation for managing group 0 changes (e.g. schema changes).
 // NOTE: group 0 raft server is always instantiated on shard 0.
 class group0_state_machine : public raft_state_machine {
+    struct modules_to_reload {
+        bool service_levels_cache = false;
+        bool service_levels_effective_cache = false;
+        bool compression_dictionary = false;
+    };
+
     raft_group0_client& _client;
     migration_manager& _mm;
     storage_proxy& _sp;
     storage_service& _ss;
-    raft_address_map& _address_map;
     seastar::gate _gate;
     abort_source _abort_source;
     bool _topology_change_enabled;
+    group0_state_id_handler _state_id_handler;
+    gms::feature_service& _feature_service;
+    gms::feature::listener_registration _topology_on_raft_support_listener;
 
+    modules_to_reload get_modules_to_reload(const std::vector<canonical_mutation>& mutations);
+    future<> reload_modules(modules_to_reload modules);
     future<> merge_and_apply(group0_state_machine_merger& merger);
 public:
-    group0_state_machine(raft_group0_client& client, migration_manager& mm, storage_proxy& sp, storage_service& ss, raft_address_map& address_map, bool topology_change_enabled)
-            : _client(client), _mm(mm), _sp(sp), _ss(ss), _address_map(address_map), _topology_change_enabled(topology_change_enabled) {}
+    group0_state_machine(raft_group0_client& client, migration_manager& mm, storage_proxy& sp, storage_service& ss,
+            group0_server_accessor server_accessor, gms::gossiper& gossiper, gms::feature_service& feat, bool topology_change_enabled);
     future<> apply(std::vector<raft::command_cref> command) override;
     future<raft::snapshot_id> take_snapshot() override;
     void drop_snapshot(raft::snapshot_id id) override;
@@ -103,5 +123,10 @@ public:
     future<> transfer_snapshot(raft::server_id from_id, raft::snapshot_descriptor snp) override;
     future<> abort() override;
 };
+
+bool should_flush_system_topology_after_applying(const mutation& mut, const data_dictionary::database db);
+
+// Used to write data to topology and other tables except schema tables.
+future<> write_mutations_to_database(storage_proxy& proxy, gms::inet_address from, std::vector<canonical_mutation> cms);
 
 } // end of namespace service

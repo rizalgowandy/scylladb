@@ -3,20 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <seastar/core/sstring.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/shared_future.hh>
 #include <seastar/core/sharded.hh>
 #include <unordered_map>
 #include <functional>
-#include <exception>
 #include <set>
-#include <any>
+#include <unordered_set>
 #include "seastarx.hh"
 #include "db/schema_features.hh"
 #include "gms/feature.hh"
@@ -31,9 +29,9 @@ namespace gms {
 
 class gossiper;
 class feature_service;
+class i_endpoint_state_change_subscriber;
 
 struct feature_config {
-    bool use_raft_cluster_features = false;
 private:
     std::set<sstring> _disabled_features;
     feature_config();
@@ -65,10 +63,14 @@ class feature_service final : public peering_sharded_service<feature_service> {
     void unregister_feature(feature& f);
     friend class feature;
     std::unordered_map<sstring, std::reference_wrapper<feature>> _registered_features;
+    std::unordered_set<sstring> _suppressed_features;
 
     feature_config _config;
 
     future<> enable_features_on_startup(db::system_keyspace&);
+#ifdef SCYLLA_ENABLE_ERROR_INJECTION
+    void initialize_suppressed_features_set();
+#endif
 public:
     explicit feature_service(feature_config cfg);
     ~feature_service() = default;
@@ -83,18 +85,6 @@ public:
 
 public:
     gms::feature user_defined_functions { *this, "UDF"sv };
-    gms::feature md_sstable { *this, "MD_SSTABLE_FORMAT"sv };
-    gms::feature me_sstable { *this, "ME_SSTABLE_FORMAT"sv };
-    gms::feature view_virtual_columns { *this, "VIEW_VIRTUAL_COLUMNS"sv };
-    gms::feature digest_insensitive_to_expiry { *this, "DIGEST_INSENSITIVE_TO_EXPIRY"sv };
-    gms::feature cdc { *this, "CDC"sv };
-    gms::feature nonfrozen_udts { *this, "NONFROZEN_UDTS"sv };
-    gms::feature hinted_handoff_separate_connection { *this, "HINTED_HANDOFF_SEPARATE_CONNECTION"sv };
-    gms::feature lwt { *this, "LWT"sv };
-    gms::feature per_table_partitioners { *this, "PER_TABLE_PARTITIONERS"sv };
-    gms::feature per_table_caching { *this, "PER_TABLE_CACHING"sv };
-    gms::feature digest_for_null_values { *this, "DIGEST_FOR_NULL_VALUES"sv };
-    gms::feature correct_idx_token_in_secondary_index { *this, "CORRECT_IDX_TOKEN_IN_SECONDARY_INDEX"sv };
     gms::feature alternator_streams { *this, "ALTERNATOR_STREAMS"sv };
     gms::feature alternator_ttl { *this, "ALTERNATOR_TTL"sv };
     gms::feature range_scan_data_variant { *this, "RANGE_SCAN_DATA_VARIANT"sv };
@@ -125,6 +115,8 @@ public:
     gms::feature aggregate_storage_options { *this, "AGGREGATE_STORAGE_OPTIONS"sv };
     gms::feature collection_indexing { *this, "COLLECTION_INDEXING"sv };
     gms::feature large_collection_detection { *this, "LARGE_COLLECTION_DETECTION"sv };
+    gms::feature range_tombstone_and_dead_rows_detection { *this, "RANGE_TOMBSTONE_AND_DEAD_ROWS_DETECTION"sv };
+    gms::feature truncate_as_topology_operation { *this, "TRUNCATE_AS_TOPOLOGY_OPERATION"sv };
     gms::feature secondary_indexes_on_static_columns { *this, "SECONDARY_INDEXES_ON_STATIC_COLUMNS"sv };
     gms::feature tablets { *this, "TABLETS"sv };
     gms::feature uuid_sstable_identifiers { *this, "UUID_SSTABLE_IDENTIFIERS"sv };
@@ -137,18 +129,47 @@ public:
     // tombstones and flags to schema tables when performing schema changes, allowing us to
     // revert to the digest method when necessary (if we must perform a schema change during RECOVERY).
     gms::feature group0_schema_versioning { *this, "GROUP0_SCHEMA_VERSIONING"sv };
+    gms::feature supports_consistent_topology_changes { *this, "SUPPORTS_CONSISTENT_TOPOLOGY_CHANGES"sv };
+    gms::feature host_id_based_hinted_handoff { *this, "HOST_ID_BASED_HINTED_HANDOFF"sv };
+    gms::feature topology_requests_type_column { *this, "TOPOLOGY_REQUESTS_TYPE_COLUMN"sv };
+    gms::feature native_reverse_queries { *this, "NATIVE_REVERSE_QUERIES"sv };
+    gms::feature zero_token_nodes { *this, "ZERO_TOKEN_NODES"sv };
+    gms::feature view_build_status_on_group0 { *this, "VIEW_BUILD_STATUS_ON_GROUP0"sv };
+    gms::feature views_with_tablets { *this, "VIEWS_WITH_TABLETS"sv };
+
+    // Whether to allow fragmented commitlog entries. While this is a node-local feature as such, hide
+    // behind a feature to ensure an upgrading cluster appears to be at least functional before using,
+    // to avoid data loss if rolling back in a dirty state, but also because it changes which/how mutations
+    // can be applied to a given node - i.e. with it on, a node can accept larger, say, schema mutations,
+    // whereas without it, it will fail the insert - i.e. for things like raft etc _all_ nodes should
+    // have it or none, otherwise we can get partial failures on writes.
+    gms::feature fragmented_commitlog_entries { *this, "FRAGMENTED_COMMITLOG_ENTRIES"sv };
+    gms::feature maintenance_tenant { *this, "MAINTENANCE_TENANT"sv };
+
+    gms::feature tablet_repair_scheduler { *this, "TABLET_REPAIR_SCHEDULER"sv };
+    gms::feature tablet_merge { *this, "TABLET_MERGE"sv };
+    gms::feature tablet_rack_aware_view_pairing { *this, "TABLET_RACK_AWARE_VIEW_PAIRING"sv };
+
+    gms::feature tablet_migration_virtual_task { *this, "TABLET_MIGRATION_VIRTUAL_TASK"sv };
+    gms::feature tablet_resize_virtual_task { *this, "TABLET_RESIZE_VIRTUAL_TASK"sv };
 
     // A feature just for use in tests. It must not be advertised unless
     // the "features_enable_test_feature" injection is enabled.
     // This feature MUST NOT be advertised in release mode!
     gms::feature test_only_feature { *this, "TEST_ONLY_FEATURE"sv };
+    gms::feature address_nodes_by_host_ids { *this, "ADDRESS_NODES_BY_HOST_IDS"sv };
 
+    gms::feature in_memory_tables { *this, "IN_MEMORY_TABLES"sv };
+    gms::feature workload_prioritization { *this, "WORKLOAD_PRIORITIZATION"sv };
+    gms::feature file_stream { *this, "FILE_STREAM"sv };
+    gms::feature compression_dicts { *this, "COMPRESSION_DICTS"sv };
+    gms::feature tablet_options { *this, "TABLET_OPTIONS"sv };
 public:
 
     const std::unordered_map<sstring, std::reference_wrapper<feature>>& registered_features() const;
 
     static std::set<sstring> to_feature_set(sstring features_string);
-    future<> enable_features_on_join(gossiper&, db::system_keyspace&);
+    future<> enable_features_on_join(gossiper&, db::system_keyspace&, service::storage_service&);
     future<> on_system_tables_loaded(db::system_keyspace& sys_ks);
 
     // Performs the feature check.

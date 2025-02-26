@@ -3,13 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include "test/lib/data_model.hh"
+#include <algorithm>
 
-#include <boost/algorithm/string/join.hpp>
-#include <boost/range/algorithm/sort.hpp>
+#include "utils/assert.hh"
+#include "test/lib/data_model.hh"
 
 #include "schema/schema_builder.hh"
 #include "concrete_types.hh"
@@ -38,7 +38,7 @@ mutation_description::row_marker::row_marker(api::timestamp_type timestamp, gc_c
 { }
 
 void mutation_description::remove_column(row& r, const sstring& name) {
-    auto it = boost::range::find_if(r, [&] (const cell& c) {
+    auto it = std::ranges::find_if(r, [&] (const cell& c) {
         return c.column_name == name;
     });
     if (it != r.end()) {
@@ -82,10 +82,10 @@ void mutation_description::remove_regular_column(const sstring& name) {
 }
 
 void mutation_description::add_range_tombstone(const key& start, const key& end, tombstone tomb) {
-    add_range_tombstone(nonwrapping_range<key>::make(start, end), tomb);
+    add_range_tombstone(interval<key>::make(start, end), tomb);
 }
 
-void mutation_description::add_range_tombstone(nonwrapping_range<key> range, tombstone tomb) {
+void mutation_description::add_range_tombstone(interval<key> range, tombstone tomb) {
     _range_tombstones.emplace_back(range_tombstone { std::move(range), tomb });
 }
 
@@ -94,10 +94,10 @@ mutation mutation_description::build(schema_ptr s) const {
     m.partition().apply(_partition_tombstone);
     for (auto& [ column, value_or_collection ] : _static_row) {
         auto cdef = s->get_column_definition(utf8_type->decompose(column));
-        assert(cdef);
+        SCYLLA_ASSERT(cdef);
         std::visit(make_visitor(
             [&] (const atomic_value& v) {
-                assert(cdef->is_atomic());
+                SCYLLA_ASSERT(cdef->is_atomic());
                 if (!v.expiring) {
                     m.set_static_cell(*cdef, atomic_cell::make_live(*cdef->type, v.timestamp, v.value));
                 } else {
@@ -106,7 +106,7 @@ mutation mutation_description::build(schema_ptr s) const {
                 }
             },
             [&] (const collection& c) {
-                assert(!cdef->is_atomic());
+                SCYLLA_ASSERT(!cdef->is_atomic());
 
                 auto get_value_type = visit(*cdef->type, make_visitor(
                     [] (const collection_type_impl& ctype) -> std::function<const abstract_type&(bytes_view)> {
@@ -116,7 +116,7 @@ mutation mutation_description::build(schema_ptr s) const {
                         return [&] (bytes_view key) -> const abstract_type& { return *utype.type(deserialize_field_index(key)); };
                     },
                     [] (const abstract_type& o) -> std::function<const abstract_type&(bytes_view)> {
-                        assert(false);
+                        SCYLLA_ASSERT(false);
                     }
                 ));
 
@@ -144,10 +144,10 @@ mutation mutation_description::build(schema_ptr s) const {
         auto ck = clustering_key::from_exploded(*s, ckey);
         for (auto& [ column, value_or_collection ] : cells) {
             auto cdef = s->get_column_definition(utf8_type->decompose(column));
-            assert(cdef);
+            SCYLLA_ASSERT(cdef);
             std::visit(make_visitor(
             [&] (const atomic_value& v) {
-                    assert(cdef->is_atomic());
+                    SCYLLA_ASSERT(cdef->is_atomic());
                     if (!v.expiring) {
                         m.set_clustered_cell(ck, *cdef, atomic_cell::make_live(*cdef->type, v.timestamp, v.value));
                     } else {
@@ -156,7 +156,7 @@ mutation mutation_description::build(schema_ptr s) const {
                     }
                 },
             [&] (const collection& c) {
-                    assert(!cdef->is_atomic());
+                    SCYLLA_ASSERT(!cdef->is_atomic());
 
                     auto get_value_type = visit(*cdef->type, make_visitor(
                         [] (const collection_type_impl& ctype) -> std::function<const abstract_type&(bytes_view)> {
@@ -166,7 +166,7 @@ mutation mutation_description::build(schema_ptr s) const {
                             return [&] (bytes_view key) -> const abstract_type& { return *utype.type(deserialize_field_index(key)); };
                         },
                         [] (const abstract_type& o) -> std::function<const abstract_type&(bytes_view)> {
-                            assert(false);
+                            SCYLLA_ASSERT(false);
                         }
                     ));
 
@@ -210,7 +210,7 @@ mutation mutation_description::build(schema_ptr s) const {
             auto start = clustering_range.start();
             auto end = clustering_range.end();
             if (start && end && cmp(end->value(), start->value())) {
-                clustering_range = nonwrapping_range<clustering_key>(std::move(end), std::move(start));
+                clustering_range = interval<clustering_key>(std::move(end), std::move(start));
             }
         }
         auto rt = ::range_tombstone(
@@ -223,13 +223,13 @@ mutation mutation_description::build(schema_ptr s) const {
 }
 
 std::vector<table_description::column>::iterator table_description::find_column(std::vector<column>& columns, const sstring& name) {
-    return boost::range::find_if(columns, [&] (const column& c) {
+    return std::ranges::find_if(columns, [&] (const column& c) {
         return std::get<sstring>(c) == name;
     });
 }
 
 void table_description::add_column(std::vector<column>& columns, const sstring& name, data_type type) {
-    assert(find_column(columns, name) == columns.end());
+    SCYLLA_ASSERT(find_column(columns, name) == columns.end());
     columns.emplace_back(name, type);
 }
 
@@ -239,14 +239,14 @@ void table_description::add_old_column(const sstring& name, data_type type) {
 
 void table_description::remove_column(std::vector<column>& columns, const sstring& name) {
     auto it = find_column(columns, name);
-    assert(it != columns.end());
+    SCYLLA_ASSERT(it != columns.end());
     _removed_columns.emplace_back(removed_column { name, std::get<data_type>(*it), column_removal_timestamp });
     columns.erase(it);
 }
 
 void table_description::alter_column_type(std::vector<column>& columns, const sstring& name, data_type new_type) {
     auto it = find_column(columns, name);
-    assert(it != columns.end());
+    SCYLLA_ASSERT(it != columns.end());
     std::get<data_type>(*it) = new_type;
 }
 
@@ -273,12 +273,10 @@ schema_ptr table_description::build_schema() const {
 }
 
 std::vector<mutation> table_description::build_mutations(schema_ptr s) const {
-    auto ms = boost::copy_range<std::vector<mutation>>(
-        _mutations | boost::adaptors::transformed([&] (const mutation_description& md) {
+    auto ms = _mutations | std::views::transform([&] (const mutation_description& md) {
             return md.build(s);
-        })
-    );
-    boost::sort(ms, mutation_decorated_key_less_comparator());
+        }) | std::ranges::to<std::vector<mutation>>();
+    std::ranges::sort(ms, mutation_decorated_key_less_comparator());
     return ms;
 }
 
@@ -344,19 +342,19 @@ void table_description::alter_regular_column_type(const sstring& name, data_type
 void table_description::rename_partition_column(const sstring& from, const sstring& to) {
     _change_log.emplace_back(format("renamed partition column \'{}\' to \'{}\'", from, to));
     auto it = find_column(_partition_key, from);
-    assert(it != _partition_key.end());
+    SCYLLA_ASSERT(it != _partition_key.end());
     std::get<sstring>(*it) = to;
 }
 void table_description::rename_clustering_column(const sstring& from, const sstring& to) {
     _change_log.emplace_back(format("renamed clustering column \'{}\' to \'{}\'", from, to));
     auto it = find_column(_clustering_key, from);
-    assert(it != _clustering_key.end());
+    SCYLLA_ASSERT(it != _clustering_key.end());
     std::get<sstring>(*it) = to;
 }
 
 table_description::table table_description::build() const {
     auto s = build_schema();
-    return { boost::algorithm::join(_change_log, "\n"), s, build_mutations(s) };
+    return { fmt::to_string(fmt::join(_change_log, "\n")), s, build_mutations(s) };
 }
 
 }

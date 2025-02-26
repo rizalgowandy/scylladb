@@ -4,8 +4,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
+
+#define BOOST_TEST_MODULE test-serialization
+#include <boost/test/unit_test.hpp>
 
 #include <iostream>
 #include <assert.h>
@@ -16,10 +19,8 @@
 #include "types/types.hh"
 #include "gms/inet_address.hh"
 #include "gms/inet_address_serializer.hh"
+#include "test/lib/test_utils.hh"
 #include "serializer_impl.hh"
-
-#define BOOST_TEST_MODULE test-serialization
-#include <boost/test/unit_test.hpp>
 
 void show(std::stringstream &ss) {
 	char c;
@@ -176,7 +177,7 @@ BOOST_AUTO_TEST_CASE(inet_address) {
         BOOST_CHECK(ip.addr().is_ipv4());
         auto buf = ser::serialize_to_buffer<bytes>(ip);
         BOOST_CHECK_EQUAL(buf.size(), sizeof(uint32_t));
-        auto res = ser::deserialize_from_buffer(buf, boost::type<gms::inet_address>{});
+        auto res = ser::deserialize_from_buffer(buf, std::type_identity<gms::inet_address>{});
         uint32_t rip = res.addr().as_ipv4_address().ip;
         BOOST_CHECK_EQUAL(hip, rip);
     }
@@ -184,7 +185,7 @@ BOOST_AUTO_TEST_CASE(inet_address) {
         gms::inet_address ip("2001:6b0:8:2::232");
         BOOST_CHECK(ip.addr().is_ipv6());
         auto buf = ser::serialize_to_buffer<bytes>(ip);
-        auto res = ser::deserialize_from_buffer(buf, boost::type<gms::inet_address>{});
+        auto res = ser::deserialize_from_buffer(buf, std::type_identity<gms::inet_address>{});
         BOOST_CHECK_EQUAL(res, ip);
     }
 

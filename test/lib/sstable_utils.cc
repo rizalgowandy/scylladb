@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "test/lib/sstable_utils.hh"
@@ -12,10 +12,8 @@
 #include "replica/memtable-sstable.hh"
 #include "dht/i_partitioner.hh"
 #include "dht/murmur3_partitioner.hh"
-#include <boost/range/irange.hpp>
-#include <boost/range/adaptor/reversed.hpp>
 #include "sstables/version.hh"
-#include "test/lib/flat_mutation_reader_assertions.hh"
+#include "test/lib/mutation_reader_assertions.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
 #include "test/boost/sstable_test.hh"
 #include <seastar/core/reactor.hh>
@@ -39,6 +37,14 @@ lw_shared_ptr<replica::memtable> make_memtable(schema_ptr s, const std::vector<m
     }
 
     return mt;
+}
+
+std::vector<replica::memtable*> active_memtables(replica::table& t) {
+    std::vector<replica::memtable*> active_memtables;
+    t.for_each_active_memtable([&] (replica::memtable& mt) {
+        active_memtables.push_back(&mt);
+    });
+    return active_memtables;
 }
 
 sstables::shared_sstable make_sstable_containing(std::function<sstables::shared_sstable()> sst_factory, lw_shared_ptr<replica::memtable> mt) {
@@ -85,7 +91,7 @@ sstables::shared_sstable make_sstable_containing(sstables::shared_sstable sst, s
     return sst;
 }
 
-shared_sstable make_sstable_easy(test_env& env, flat_mutation_reader_v2 rd, sstable_writer_config cfg,
+shared_sstable make_sstable_easy(test_env& env, mutation_reader rd, sstable_writer_config cfg,
         sstables::generation_type gen, const sstables::sstable::version_types version, int expected_partition, gc_clock::time_point query_time) {
     auto s = rd.schema();
     auto sst = env.make_sstable(s, gen, version, sstable_format_types::big, default_sstable_buffer_size, query_time);
@@ -118,20 +124,6 @@ future<compaction_result> compact_sstables(test_env& env, sstables::compaction_d
         });
     });
     co_return ret;
-}
-
-static sstring toc_filename(const sstring& dir, schema_ptr schema, sstables::generation_type generation, sstable_version_types v) {
-    return sstable::filename(dir, schema->ks_name(), schema->cf_name(), v, generation,
-                             sstable_format_types::big, component_type::TOC);
-}
-
-future<shared_sstable> test_env::reusable_sst(schema_ptr schema, sstring dir, sstables::generation_type generation) {
-    for (auto v : boost::adaptors::reverse(all_sstable_versions)) {
-        if (co_await file_exists(toc_filename(dir, schema, generation, v))) {
-            co_return co_await reusable_sst(schema, dir, generation, v);
-        }
-    }
-    throw sst_not_found(dir, generation);
 }
 
 class compaction_manager_test_task : public compaction::compaction_task_executor {
@@ -172,7 +164,7 @@ shared_sstable verify_mutation(test_env& env, shared_sstable sstp, bytes key, st
     auto pr = dht::partition_range::make_singular(make_dkey(s, key));
     auto rd = sstp->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
     auto close_rd = deferred_close(rd);
-    auto mopt = read_mutation_from_flat_mutation_reader(rd).get();
+    auto mopt = read_mutation_from_mutation_reader(rd).get();
     verify(mopt);
     return sstp;
 }
@@ -186,7 +178,7 @@ shared_sstable verify_mutation(test_env& env, shared_sstable sstp, dht::partitio
     auto s = sstp->get_schema();
     auto rd = sstp->make_reader(s, env.make_reader_permit(), std::move(pr), s->full_slice());
     auto close_rd = deferred_close(rd);
-    while (auto mopt = read_mutation_from_flat_mutation_reader(rd).get()) {
+    while (auto mopt = read_mutation_from_mutation_reader(rd).get()) {
         if (verify(mopt) == stop_iteration::yes) {
             break;
         }

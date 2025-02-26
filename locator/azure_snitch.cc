@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 /*
@@ -20,6 +20,8 @@
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <fmt/format.h>
+
+#include "utils/class_registrator.hh"
 
 namespace locator {
 
@@ -64,11 +66,36 @@ future<> azure_snitch::start() {
 }
 
 future<sstring> azure_snitch::azure_api_call(sstring path) {
+    return do_with(int(0), [this, path] (int& i) {
+        return repeat_until_value([this, path, &i]() -> future<std::optional<sstring>> {
+            ++i;
+            return azure_api_call_once(path).then([] (auto res) {
+                return make_ready_future<std::optional<sstring>>(std::move(res));
+            }).handle_exception([this, &i] (auto ep) {
+                try {
+                    std::rethrow_exception(ep);
+                } catch (const std::system_error &e) {
+                    if (i >= AZURE_API_CALL_RETRIES - 1) {
+                        logger().error("Azure API call failed: {}. Maximum number of retries exceeded", e.what());
+                        throw e;
+                    } else {
+                        logger().error("Azure API call failed: {}. Will retry in {} seconds", e.what(), std::chrono::duration_cast<std::chrono::seconds>(_azure_api_retry.sleep_time()).count());
+                    }
+                }
+                return _azure_api_retry.retry().then([] {
+                    return make_ready_future<std::optional<sstring>>(std::nullopt);
+                });
+            });
+        });
+    });
+}
+
+future<sstring> azure_snitch::azure_api_call_once(sstring path) {
     return seastar::async([path = std::move(path)] () -> sstring {
         using namespace boost::algorithm;
 
-        net::inet_address a = seastar::net::dns::resolve_name(AZURE_SERVER_ADDR, net::inet_address::family::INET).get0();
-        connected_socket sd(connect(socket_address(a, 80)).get0());
+        net::inet_address a = seastar::net::dns::resolve_name(AZURE_SERVER_ADDR, net::inet_address::family::INET).get();
+        connected_socket sd(connect(socket_address(a, 80)).get());
         input_stream<char> in(sd.input());
         output_stream<char> out(sd.output());
         auto close_in = deferred_close(in);
@@ -100,7 +127,7 @@ future<sstring> azure_snitch::azure_api_call(sstring path) {
         auto content_len = std::stoi(it->second);
 
         // Read HTTP response body
-        temporary_buffer<char> buf = in.read_exactly(content_len).get0();
+        temporary_buffer<char> buf = in.read_exactly(content_len).get();
 
         return sstring(buf.get(), buf.size());
     });

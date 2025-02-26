@@ -5,12 +5,11 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 #pragma once
 
 #include <vector>
-#include <atomic>
 #include <random>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/sstring.hh>
@@ -19,7 +18,7 @@
 #include "utils/UUID.hh"
 #include "gms/inet_address.hh"
 #include "enum_set.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "seastarx.hh"
 
 namespace service {
@@ -90,8 +89,6 @@ public:
      */
     static span_id make_span_id();
 };
-
-std::ostream& operator<<(std::ostream& os, const span_id& id);
 
 // !!!!IMPORTANT!!!!
 //
@@ -178,6 +175,7 @@ struct event_record {
     std::string message;
     elapsed_clock::duration elapsed;
     i_tracing_backend_helper::wall_clock::time_point event_time_point;
+    sstring scheduling_group_name = current_scheduling_group().name();
 
     event_record(sstring message_, elapsed_clock::duration elapsed_, i_tracing_backend_helper::wall_clock::time_point event_time_point_)
         : message(std::move(message_))
@@ -662,3 +660,10 @@ inline span_id span_id::make_span_id() {
     return 1 + (tracing::get_local_tracing_instance().get_next_rand_uint64() << 1);
 }
 }
+
+template <> struct fmt::formatter<tracing::span_id> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const tracing::span_id& id, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", id.get_id());
+    }
+};

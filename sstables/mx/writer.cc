@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "sstables/mx/writer.hh"
@@ -14,16 +14,14 @@
 #include "vint-serialization.hh"
 #include "sstables/types.hh"
 #include "sstables/mx/types.hh"
-#include "db/config.hh"
 #include "mutation/atomic_cell.hh"
+#include "utils/assert.hh"
 #include "utils/exceptions.hh"
 #include "db/large_data_handler.hh"
 
 #include <functional>
 #include <boost/iterator/iterator_facade.hpp>
 #include <boost/container/static_vector.hpp>
-#include <boost/range/adaptor/indexed.hpp>
-#include <boost/range/algorithm/stable_partition.hpp>
 
 logging::logger slogger("mc_writer");
 
@@ -91,7 +89,7 @@ public:
         {}
 
         void increment() {
-            assert(_range);
+            SCYLLA_ASSERT(_range);
             if (!_range->next()) {
                 _range = nullptr;
             }
@@ -102,7 +100,7 @@ public:
         }
 
         const ValueType dereference() const {
-            assert(_range);
+            SCYLLA_ASSERT(_range);
             return _range->get_value();
         }
 
@@ -153,7 +151,7 @@ public:
         auto limit = std::min(_serialization_limit_size, _offset + clustering_block::max_block_size);
 
         _current_block = {};
-        assert (_offset % clustering_block::max_block_size == 0);
+        SCYLLA_ASSERT (_offset % clustering_block::max_block_size == 0);
         while (_offset < limit) {
             auto shift = _offset % clustering_block::max_block_size;
             if (_offset < _prefix.size(_schema)) {
@@ -253,10 +251,10 @@ public:
 
         if (_mode ==  encoding_mode::small) {
             // Set bit for every missing column
-            for (const auto& element: _columns | boost::adaptors::indexed()) {
-                auto cell = _row.find_cell(element.value().get().id);
+            for (const auto& [index, column]: _columns | std::views::enumerate) {
+                auto cell = _row.find_cell(column.get().id);
                 if (!cell) {
-                    _current_value |= (uint64_t(1) << element.index());
+                    _current_value |= (uint64_t(1) << index);
                 }
             }
             _current_index = total_size;
@@ -280,7 +278,7 @@ public:
                     ++_current_index;
                 }
             } else {
-                assert(_mode == encoding_mode::large_encode_missing);
+                SCYLLA_ASSERT(_mode == encoding_mode::large_encode_missing);
                 while (_current_index < total_size) {
                     auto cell = _row.find_cell(_columns[_current_index].get().id);
                     if (!cell) {
@@ -364,11 +362,11 @@ static sstring pk_type_to_string(const schema& s) {
     if (s.partition_key_size() == 1) {
         return s.partition_key_columns().begin()->type->name();
     } else {
-        auto type_params = fmt::join(s.partition_key_columns()
-                                          | boost::adaptors::transformed(std::mem_fn(&column_definition::type))
-                                          | boost::adaptors::transformed(std::mem_fn(&abstract_type::name)),
-                                        ",");
-        return format("org.apache.cassandra.db.marshal.CompositeType({})", type_params);
+        return seastar::format("org.apache.cassandra.db.marshal.CompositeType({})",
+                               fmt::join(s.partition_key_columns()
+                                          | std::views::transform(std::mem_fn(&column_definition::type))
+                                          | std::views::transform(std::mem_fn(&abstract_type::name)),
+                                        ","));
     }
 }
 
@@ -418,8 +416,8 @@ sstable_schema make_sstable_schema(const schema& s, const encoding_stats& enc_st
     // For static and regular columns, we write all simple columns first followed by collections
     // These containers have columns partitioned by atomicity
     auto pred = [] (const std::reference_wrapper<const column_definition>& column) { return column.get().is_atomic(); };
-    boost::range::stable_partition(sst_sch.regular_columns, pred);
-    boost::range::stable_partition(sst_sch.static_columns, pred);
+    std::ranges::stable_partition(sst_sch.regular_columns, pred);
+    std::ranges::stable_partition(sst_sch.static_columns, pred);
 
     return sst_sch;
 }
@@ -544,6 +542,7 @@ private:
     std::optional<key> _first_key, _last_key;
     index_sampling_state _index_sampling_state;
     bytes_ostream _tmp_bufs;
+    uint64_t _num_partitions_consumed = 0;
 
     const sstable_schema _sst_schema;
 
@@ -688,7 +687,7 @@ private:
         std::optional<gc_clock::time_point> local_deletion_time;
     };
 
-    void maybe_record_large_partitions(const sstables::sstable& sst, const sstables::key& partition_key, uint64_t partition_size, uint64_t rows);
+    void maybe_record_large_partitions(const sstables::sstable& sst, const sstables::key& partition_key, uint64_t partition_size, uint64_t rows, uint64_t range_tombstones, uint64_t dead_rows);
     void maybe_record_large_rows(const sstables::sstable& sst, const sstables::key& partition_key,
             const clustering_key_prefix* clustering_key, const uint64_t row_size);
     void maybe_record_large_cells(const sstables::sstable& sst, const sstables::key& partition_key,
@@ -709,9 +708,16 @@ private:
         const row& row_body, const row_time_properties& properties, bool has_complex_deletion);
     void write_row_body(bytes_ostream& writer, const clustering_row& row, bool has_complex_deletion);
     void write_static_row(const row&, column_kind);
-    void collect_row_stats(uint64_t row_size, const clustering_key_prefix* clustering_key) {
+    void collect_row_stats(uint64_t row_size, const clustering_key_prefix* clustering_key, bool is_dead = false) {
         ++_c_stats.rows_count;
+        if (is_dead) {
+            ++_c_stats.dead_rows_count;
+        }
         maybe_record_large_rows(_sst, *_partition_key, clustering_key, row_size);
+    }
+    void collect_range_tombstone_stats() {
+        ++_c_stats.rows_count;
+        ++_c_stats.range_tombstones_count;
     }
 
     // Clustered is a term used to denote an entity that has a clustering key prefix
@@ -789,14 +795,14 @@ public:
         // exactly what callers used to do anyway.
         estimated_partitions = std::max(uint64_t(1), estimated_partitions);
 
-        _sst.open_sstable();
+        _sst.open_sstable(cfg.origin);
         _sst.create_data().get();
         _compression_enabled = !_sst.has_component(component_type::CRC);
         init_file_writers();
         _sst._shards = { shard };
 
         _cfg.monitor->on_write_started(_data_writer->offset_tracker());
-        _sst._components->filter = utils::i_filter::get_filter(estimated_partitions, _schema.bloom_filter_fp_chance(), utils::filter_format::m_format);
+        _sst._components->filter = utils::i_filter::get_filter(estimated_partitions, _sst._schema->bloom_filter_fp_chance(), utils::filter_format::m_format);
         _pi_write_m.promoted_index_block_size = cfg.promoted_index_block_size;
         _pi_write_m.promoted_index_auto_scale_threshold = cfg.promoted_index_auto_scale_threshold;
         _index_sampling_state.summary_byte_cost = _cfg.summary_byte_cost;
@@ -875,7 +881,7 @@ void writer::maybe_add_pi_block() {
 }
 
 void writer::init_file_writers() {
-    auto out = _sst._storage->make_data_or_index_sink(_sst, component_type::Data).get0();
+    auto out = _sst._storage->make_data_or_index_sink(_sst, component_type::Data).get();
 
     if (!_compression_enabled) {
         _data_writer = std::make_unique<crc32_checksummed_file_writer>(std::move(out), _sst.sstable_buffer_size, _sst.filename(component_type::Data));
@@ -884,10 +890,10 @@ void writer::init_file_writers() {
             make_compressed_file_m_format_output_stream(
                 output_stream<char>(std::move(out)),
                 &_sst._components->compression,
-                _schema.get_compressor_params()), _sst.filename(component_type::Data));
+                _sst._schema->get_compressor_params()), _sst.filename(component_type::Data));
     }
 
-    out = _sst._storage->make_data_or_index_sink(_sst, component_type::Index).get0();
+    out = _sst._storage->make_data_or_index_sink(_sst, component_type::Index).get();
     _index_writer = std::make_unique<file_writer>(output_stream<char>(std::move(out)), _sst.filename(component_type::Index));
 }
 
@@ -917,6 +923,7 @@ void writer::consume_new_partition(const dht::decorated_key& dk) {
 
     _sst._components->filter->add(bytes_view(*_partition_key));
     _collector.add_key(bytes_view(*_partition_key));
+    _num_partitions_consumed++;
 
     auto p_key = disk_string_view<uint16_t>();
     p_key.value = bytes_view(*_partition_key);
@@ -962,12 +969,12 @@ void writer::consume(tombstone t) {
 }
 
 void writer::maybe_record_large_partitions(const sstables::sstable& sst, const sstables::key& partition_key,
-                                           uint64_t partition_size, uint64_t rows) {
+                                           uint64_t partition_size, uint64_t rows, uint64_t range_rombstones, uint64_t dead_rows) {
     auto& size_entry = _partition_size_entry;
     auto& row_count_entry = _rows_in_partition_entry;
     size_entry.max_value = std::max(size_entry.max_value, partition_size);
     row_count_entry.max_value = std::max(row_count_entry.max_value, rows);
-    auto ret = _sst.get_large_data_handler().maybe_record_large_partitions(sst, partition_key, partition_size, rows).get0();
+    auto ret = _sst.get_large_data_handler().maybe_record_large_partitions(sst, partition_key, partition_size, rows, range_rombstones, dead_rows).get();
     size_entry.above_threshold += unsigned(bool(ret.size));
     row_count_entry.above_threshold += unsigned(bool(ret.rows));
 }
@@ -978,7 +985,7 @@ void writer::maybe_record_large_rows(const sstables::sstable& sst, const sstable
     if (entry.max_value < row_size) {
         entry.max_value = row_size;
     }
-    if (_sst.get_large_data_handler().maybe_record_large_rows(sst, partition_key, clustering_key, row_size).get0()) {
+    if (_sst.get_large_data_handler().maybe_record_large_rows(sst, partition_key, clustering_key, row_size).get()) {
         entry.above_threshold++;
     };
 }
@@ -993,7 +1000,7 @@ void writer::maybe_record_large_cells(const sstables::sstable& sst, const sstabl
     if (collection_elements_entry.max_value < collection_elements) {
         collection_elements_entry.max_value = collection_elements;
     }
-    if (_sst.get_large_data_handler().maybe_record_large_cells(_sst, *_partition_key, clustering_key, cdef, cell_size, collection_elements).get0()) {
+    if (_sst.get_large_data_handler().maybe_record_large_cells(_sst, *_partition_key, clustering_key, cdef, cell_size, collection_elements).get()) {
         if (cell_size > cell_size_entry.threshold) {
             cell_size_entry.above_threshold++;
         }
@@ -1053,7 +1060,7 @@ void writer::write_cell(bytes_ostream& writer, const clustering_key_prefix* clus
 
     if (cdef.is_counter()) {
         if (!is_deleted) {
-            assert(!cell.is_counter_update());
+            SCYLLA_ASSERT(!cell.is_counter_update());
             auto ccv = counter_cell_view(cell);
             write_counter_value(ccv, writer, _sst.get_version(), [] (bytes_ostream& out, uint32_t value) {
                 return write_vint(out, value);
@@ -1072,12 +1079,15 @@ void writer::write_cell(bytes_ostream& writer, const clustering_key_prefix* clus
         maybe_record_large_cells(_sst, *_partition_key, clustering_key, cdef, size, 0);
     }
 
-    _c_stats.update_timestamp(cell.timestamp());
+    auto timestamp = cell.timestamp();
     if (is_deleted) {
+        _c_stats.update_timestamp(timestamp, is_live::no);
         _c_stats.update_local_deletion_time_and_tombstone_histogram(cell.deletion_time());
         _sst.get_stats().on_cell_tombstone_write();
         return;
     }
+
+    _c_stats.update_timestamp(timestamp, is_live::yes);
 
     if (is_cell_expiring) {
         _c_stats.update_ttl(cell.ttl());
@@ -1097,7 +1107,12 @@ void writer::write_liveness_info(bytes_ostream& writer, const row_marker& marker
     }
 
     api::timestamp_type timestamp = marker.timestamp();
-    _c_stats.update_timestamp(timestamp);
+    if (marker.is_live()) {
+        _c_stats.update_timestamp(timestamp, is_live::yes);
+        _c_stats.update_live_row_marker_timestamp(timestamp);
+    } else {
+        _c_stats.update_timestamp(timestamp, is_live::no);
+    }
     write_delta_timestamp(writer, timestamp);
 
     auto write_expiring_liveness_info = [this, &writer] (gc_clock::duration ttl, gc_clock::time_point ldt) {
@@ -1252,6 +1267,8 @@ void writer::write_clustered(const clustering_row& clustered_row, uint64_t prev_
         }
     }
 
+    const bool is_dead = !clustered_row.is_live(_schema, tombstone(), gc_clock::now());
+
     if (clustered_row.tomb().regular()) {
         flags |= row_flags::has_deletion;
     }
@@ -1283,7 +1300,7 @@ void writer::write_clustered(const clustering_row& clustered_row, uint64_t prev_
 
     // Collect statistics
     _collector.update_min_max_components(clustered_row.position());
-    collect_row_stats(_data_writer->offset() - current_pos, &clustered_row.key());
+    collect_row_stats(_data_writer->offset() - current_pos, &clustered_row.key(), is_dead);
 }
 
 stop_iteration writer::consume(clustering_row&& cr) {
@@ -1323,7 +1340,7 @@ template <typename W>
 requires Writer<W>
 static void write_clustering_prefix(sstable_version_types v, W& writer, bound_kind_m kind,
     const schema& s, const clustering_key_prefix& clustering) {
-    assert(kind != bound_kind_m::static_clustering);
+    SCYLLA_ASSERT(kind != bound_kind_m::static_clustering);
     write(v, writer, kind);
     auto is_ephemerally_full = ephemerally_full_prefix{s.is_compact_table()};
     if (kind != bound_kind_m::clustering) {
@@ -1381,6 +1398,8 @@ void writer::write_clustered(const rt_marker& marker, uint64_t prev_row_size) {
     write_vint(*_data_writer, _tmp_bufs.size());
     flush_tmp_bufs();
     _collector.update_min_max_components(marker.position());
+
+    collect_range_tombstone_stats();
 }
 
 void writer::consume(rt_marker&& marker) {
@@ -1414,10 +1433,22 @@ stop_iteration writer::consume_end_of_partition() {
     ensure_tombstone_is_written();
     ensure_static_row_is_written_if_needed();
 
-    write(_sst.get_version(), *_data_writer, row_flags::end_of_partition);
+    auto write_end_of_partition = [&] {
+        write(_sst.get_version(), *_data_writer, row_flags::end_of_partition);
+    };
 
-    if (_pi_write_m.promoted_index_size && _pi_write_m.first_clustering) {
-        add_pi_block();
+    auto maybe_add_pi_block = [&] {
+        if (_pi_write_m.promoted_index_size && _pi_write_m.first_clustering) {
+            add_pi_block();
+        }
+    };
+
+    if (_features.is_enabled(CorrectLastPiBlockWidth)) [[likely]] {
+        maybe_add_pi_block();
+        write_end_of_partition();
+    } else {
+        write_end_of_partition();
+        maybe_add_pi_block();
     }
 
     write_promoted_index();
@@ -1425,8 +1456,7 @@ stop_iteration writer::consume_end_of_partition() {
     // compute size of the current row.
     _c_stats.partition_size = _data_writer->offset() - _c_stats.start_offset;
 
-    maybe_record_large_partitions(_sst, *_partition_key, _c_stats.partition_size, _c_stats.rows_count);
-
+    maybe_record_large_partitions(_sst, *_partition_key, _c_stats.partition_size, _c_stats.rows_count, _c_stats.range_tombstones_count, _c_stats.dead_rows_count);
 
     // update is about merging column_stats with the data being stored by collector.
     _collector.update(std::move(_c_stats));
@@ -1454,14 +1484,14 @@ void writer::consume_end_of_stream() {
 
     _sst._components->statistics.contents[metadata_type::Serialization] = std::make_unique<serialization_header>(std::move(_sst_schema.header));
     seal_statistics(_sst.get_version(), _sst._components->statistics, _collector,
-        _sst._schema->get_partitioner().name(), _schema.bloom_filter_fp_chance(),
+        _sst._schema->get_partitioner().name(), _sst._schema->bloom_filter_fp_chance(),
         _sst._schema, _sst.get_first_decorated_key(), _sst.get_last_decorated_key(), _enc_stats);
     close_data_writer();
     _sst.write_summary();
+    _sst.maybe_rebuild_filter_from_index(_num_partitions_consumed);
     _sst.write_filter();
     _sst.write_statistics();
     _sst.write_compression();
-    auto features = sstable_enabled_features::all();
     run_identifier identifier{_run_identifier};
     std::optional<scylla_metadata::large_data_stats> ld_stats(scylla_metadata::large_data_stats{
         .map = {
@@ -1472,9 +1502,10 @@ void writer::consume_end_of_stream() {
             { large_data_type::elements_in_collection, std::move(_elements_in_collection_entry) },
         }
     });
-    const dht::sharder& sharder = _cfg.erm ? _cfg.erm->get_sharder(_schema)
-                                           : _schema.get_sharder(); // Used in tests
-    _sst.write_scylla_metadata(_shard, sharder, std::move(features), std::move(identifier), std::move(ld_stats), _cfg.origin);
+    std::optional<scylla_metadata::ext_timestamp_stats> ts_stats(scylla_metadata::ext_timestamp_stats{
+        .map = _collector.get_ext_timestamp_stats()
+    });
+    _sst.write_scylla_metadata(_shard, _features, std::move(identifier), std::move(ld_stats), std::move(ts_stats));
     _sst.seal_sstable(_cfg.backup).get();
 }
 

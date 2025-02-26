@@ -3,19 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <boost/test/unit_test.hpp>
 
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include "test/lib/cql_test_env.hh"
-#include "test/lib/cql_assertions.hh"
 #include "test/lib/log.hh"
-#include "cql3/query_processor.hh"
 #include "readers/filtering.hh"
 
 #include "db/data_listeners.hh"
+
+BOOST_AUTO_TEST_SUITE(data_listeners_test)
 
 using namespace std::chrono_literals;
 
@@ -25,8 +26,8 @@ class table_listener : public db::data_listener {
 public:
     table_listener(sstring cf_name) : _cf_name(cf_name) {}
 
-    virtual flat_mutation_reader_v2 on_read(const schema_ptr& s, const dht::partition_range& range,
-            const query::partition_slice& slice, flat_mutation_reader_v2&& rd) override {
+    virtual mutation_reader on_read(const schema_ptr& s, const dht::partition_range& range,
+            const query::partition_slice& slice, mutation_reader&& rd) override {
         if (s->cf_name() == _cf_name) {
             return make_filtering_reader(std::move(rd), [this, s = std::move(s)] (const dht::decorated_key& dk) {
                 testlog.info("listener {}: read {}", fmt::ptr(this), dk);
@@ -91,7 +92,7 @@ results test_data_listeners(cql_test_env& e, sstring cf_name) {
             res.read += li_res.read;
             res.write += li_res.write;
             return res;
-        }).get0();
+        }).get();
 
     testlog.info("test_data_listeners: rd={} wr={}", res.read, res.write);
 
@@ -113,3 +114,5 @@ SEASTAR_TEST_CASE(test_dlistener_t2) {
         BOOST_REQUIRE_EQUAL(0, res.write);
     });
 }
+
+BOOST_AUTO_TEST_SUITE_END()

@@ -3,14 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "reader_concurrency_semaphore.hh"
-#include "readers/flat_mutation_reader_fwd.hh"
-#include "readers/flat_mutation_reader_v2.hh"
+#include "readers/mutation_reader_fwd.hh"
+#include "readers/mutation_reader.hh"
 #include "tracing/trace_state.hh"
 #include "seastarx.hh"
 #include "locator/abstract_replication_strategy.hh"
@@ -32,7 +32,7 @@ class reader_lifecycle_policy_v2 {
 public:
     struct stopped_reader {
         reader_concurrency_semaphore::inactive_read_handle handle;
-        flat_mutation_reader_v2::tracked_buffer unconsumed_fragments;
+        mutation_reader::tracked_buffer unconsumed_fragments;
     };
 
 public:
@@ -45,7 +45,7 @@ public:
     /// remote shard stay alive, during the lifetime of the created reader.
     ///
     /// The \c permit parameter shall be obtained via `obtain_reader_permit()`
-    virtual flat_mutation_reader_v2 create_reader(
+    virtual mutation_reader create_reader(
             schema_ptr schema,
             reader_permit permit,
             const dht::partition_range& range,
@@ -103,6 +103,9 @@ public:
             tracing::trace_state_ptr trace_ptr) = 0;
 };
 
+using multishard_reader_buffer_hint = bool_class<struct multishard_reader_buffer_hint_tag>;
+using read_ahead = bool_class<struct read_ahead_tag>;
+
 /// Make a multishard_combining_reader.
 ///
 /// multishard_combining_reader takes care of reading a range from all shards
@@ -117,11 +120,12 @@ public:
 /// has to move between shards often. When concurrency is > 1, the reader
 /// issues background read-aheads to the next shards so that by the time it
 /// needs to move to them they have the data ready.
-/// For dense tables (where we rarely cross shards) we rely on the
-/// foreign_reader to issue sufficient read-aheads on its own to avoid blocking.
+/// Read-ahead can be disabled to reduce the multishard reader's footprint.
+/// Useful when the reader operates in the context of a possibly congested
+/// semaphore, and the avoidance of evictions is more important than low latencies.
 ///
 /// The readers' life-cycles are managed through the supplied lifecycle policy.
-flat_mutation_reader_v2 make_multishard_combining_reader_v2(
+mutation_reader make_multishard_combining_reader_v2(
         shared_ptr<reader_lifecycle_policy_v2> lifecycle_policy,
         schema_ptr schema,
         locator::effective_replication_map_ptr erm,
@@ -129,9 +133,11 @@ flat_mutation_reader_v2 make_multishard_combining_reader_v2(
         const dht::partition_range& pr,
         const query::partition_slice& ps,
         tracing::trace_state_ptr trace_state = nullptr,
-        mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::no);
+        mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::no,
+        multishard_reader_buffer_hint buffer_hint = multishard_reader_buffer_hint::no,
+        read_ahead read_ahead = read_ahead::yes);
 
-flat_mutation_reader_v2 make_multishard_combining_reader_v2_for_tests(
+mutation_reader make_multishard_combining_reader_v2_for_tests(
         const dht::sharder& sharder,
         shared_ptr<reader_lifecycle_policy_v2> lifecycle_policy,
         schema_ptr schema,
@@ -139,5 +145,7 @@ flat_mutation_reader_v2 make_multishard_combining_reader_v2_for_tests(
         const dht::partition_range& pr,
         const query::partition_slice& ps,
         tracing::trace_state_ptr trace_state = nullptr,
-        mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::no);
+        mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::no,
+        multishard_reader_buffer_hint buffer_hint = multishard_reader_buffer_hint::no,
+        read_ahead read_ahead = read_ahead::yes);
 

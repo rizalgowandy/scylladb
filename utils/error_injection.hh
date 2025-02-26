@@ -3,32 +3,29 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
+#include "utils/from_chars_exactly.hh"
 #include <seastar/core/future.hh>
 #include <seastar/core/sleep.hh>
-#include <seastar/core/seastar.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/on_internal_error.hh>
+#include <seastar/util/defer.hh>
 #include "seastarx.hh"
 
 #include "log.hh"
 
+#include <ranges>
 #include <algorithm>
 #include <chrono>
-#include <set>
 #include <type_traits>
-#include <concepts>
 #include <optional>
 #include <unordered_map>
-
-#include <boost/range/adaptor/map.hpp>
-#include <boost/range/adaptor/filtered.hpp>
-
 
 namespace utils {
 
@@ -42,6 +39,14 @@ public:
 extern logging::logger errinj_logger;
 
 using error_injection_parameters = std::unordered_map<sstring, sstring>;
+
+// Wraps the argument to breakpoint injection (see the relevant inject() overload
+// in class error_injection below). The only parameter is the timeout after which
+// the pause is aborted
+struct wait_for_message {
+    std::chrono::milliseconds timeout;
+    wait_for_message(std::chrono::milliseconds tmo) noexcept : timeout(tmo) {}
+};
 
 /**
  * Error injection class can be used to create and manage code injections
@@ -100,11 +105,26 @@ using error_injection_parameters = std::unordered_map<sstring, sstring>;
  *          }, f);
  *    Expected use case: emulate custom errors like timeouts.
  *
- * 4. inject_with_handler(name, func)
+ * 4. inject(name, future<> func(injection_handler&), share_messages)
  *    Inserts code that can wait for an event.
  *    Requires func to be a function taking an injection_handler reference and
- *    returning a future<>.
+ *    returning a future<>. Depending on the share_messages value,
+ *    handlers can share events or not.
  *    Expected use case: wait for an event from tests.
+ * 5. inject_parameter(name)
+ *    Enables tests to inject parameters into the system, like lowering timeouts or limits, to
+ *    make the tests run faster.
+ *    Logically it is the same as
+ *      T value{}
+ *      co_await inject(name, [&value](auto& handler) { value = handler.get("value"); }
+ *    The function simply returns the 'value' parameter.
+ *    Expected use case: adjusting system parameters for tests.
+ * 6. set_parameter(injection_name, parameter_name, parameter_value)
+ *    Enable tests to observe the value of internal parameters, without having to
+ *    publicly expose said parameters.
+ *    This is the opposite of inject_parameter(name).
+ *    Expected use case: validate that certain code path was taken, and/or the
+ *    value of some parameter is the expected value, on given code-path.
  */
 
 template <bool injection_enabled>
@@ -118,26 +138,63 @@ class error_injection {
      */
     struct injection_shared_data {
         size_t received_message_count{0};
+        size_t shared_read_message_count{0};
         condition_variable received_message_cv;
         error_injection_parameters parameters;
+        sstring injection_name;
 
-        explicit injection_shared_data(error_injection_parameters parameters)
-            : parameters(std::move(parameters)) {}
+        explicit injection_shared_data(error_injection_parameters parameters, std::string_view injection_name)
+            : parameters(std::move(parameters))
+            , injection_name(injection_name)
+            {}
+
+        template <typename T>
+        std::optional<T> get(sstring name) const {
+            const auto it = parameters.find(name);
+            if (it == parameters.end()) {
+                return std::nullopt;
+            }
+            const auto& s = it->second;
+            errinj_logger.debug("Injected value [{}] for parameter [{}], injection [{}]",
+                s, name, injection_name);
+            if constexpr (std::is_same_v<T, std::string_view>) {
+                return s;
+            } else {
+                return utils::from_chars_exactly<T>(s, [&] (std::string_view s) {
+                    return std::runtime_error(fmt::format("Failed to convert injected value [{}] for parameter [{}], injection [{}]",
+                        s, name, injection_name));
+                });
+            }
+        }
     };
 
     class injection_data;
 public:
     /**
      * The injection handler class is used to wait for events inside the injected code.
-     * If multiple inject_with_handler are called concurrently for the same injection_name,
+     * If multiple inject (with handler) are called concurrently for the same injection_name,
      * all of them will have separate handlers.
+     *
+     * Handlers can be of two types depending on the share_messages value passed to inject
+     * (with handler):
+     * 1. By default, handlers share received messages. It means that every message can be
+     * received by all handlers (even if they start waiting in the future).
+     * 2. When handlers do not share received messages, only one can receive a specific
+     * message. Other handlers will wait for new messages.
+     *
+     * For a single injection, these two types of handlers are independent. A handler of one
+     * type never impacts a handler of the second type.
+     *
+     * In most cases, using the default type is sufficient or required. The second type
+     * allows waiting for new messages during every execution of the injected code.
      */
     class injection_handler: public bi::list_base_hook<bi::link_mode<bi::auto_unlink>> {
         lw_shared_ptr<injection_shared_data> _shared_data;
         size_t _read_messages_counter{0};
+        bool _share_messages;
 
-        explicit injection_handler(lw_shared_ptr<injection_shared_data> shared_data)
-            : _shared_data(std::move(shared_data)) {}
+        explicit injection_handler(lw_shared_ptr<injection_shared_data> shared_data, bool share_messages)
+            : _shared_data(std::move(shared_data)), _share_messages(share_messages) {}
 
     public:
         template <typename Clock, typename Duration>
@@ -148,6 +205,15 @@ public:
 
             try {
                 co_await _shared_data->received_message_cv.wait(timeout, [&] {
+                    if (!_share_messages) {
+                        bool wakes_up = _shared_data->shared_read_message_count < _shared_data->received_message_count;
+                        if (wakes_up) {
+                            // Increase shared_read_message_count here, so other sharing handlers don't wake up.
+                            ++_shared_data->shared_read_message_count;
+                        }
+                        return wakes_up;
+                    }
+
                     return _read_messages_counter < _shared_data->received_message_count;
                 });
             }
@@ -164,49 +230,59 @@ public:
                 on_internal_error(errinj_logger, "injection_shared_data is not initialized");
             }
 
-            if (_read_messages_counter < _shared_data->received_message_count) {
+            if (_share_messages && _read_messages_counter < _shared_data->received_message_count) {
                 ++_read_messages_counter;
+                return true;
+            }
+            if (!_share_messages && _shared_data->shared_read_message_count < _shared_data->received_message_count) {
+                ++_shared_data->shared_read_message_count;
                 return true;
             }
             return false;
         }
 
-        std::optional<std::string_view> get(std::string_view key) {
+        template <typename T = std::string_view>
+        std::optional<T> get(std::string_view key) const {
             if (!_shared_data) {
                 on_internal_error(errinj_logger, "injection_shared_data is not initialized");
             }
-
-            auto it = _shared_data->parameters.find(std::string(key));
-            if (it == _shared_data->parameters.end()) {
-                return std::nullopt;
-            }
-            return it->second;
+            return _shared_data->template get<T>(std::string(key));
         }
 
         friend class error_injection;
     };
 
 private:
+    using waiting_handler_fun = std::function<future<>(injection_handler&)>;
+
     /**
      * - there is a counter of received messages; it is shared between the injection_data,
      *   which is created once when enabling an injection on a given shard, and all injection_handlers,
      *   that are created separately for each firing of this injection.
      * - the counter is incremented when receiving a message from the REST endpoint and the condition variable is signaled.
+     *
+     * Handlers sharing messages:
      * - each injection_handler (separate for each firing) stores its own private counter, _read_messages_counter.
      * - that private counter is incremented whenever we wait for a message, and compared to the received counter.
      *   We sleep on the condition variable if not enough messages were received.
+     *
+     * Handlers not sharing messages:
+     * - injection_shared_data stores a counter, shared_read_message_count, which is shared by all handlers.
+     * - that shared counter is incremented whenever a handler finishes waiting for a message. While waiting for
+     *   a message, a handler compares this counter to the received counter. It sleeps on the condition variable if
+     *   they are equal.
      */
     struct injection_data {
         bool one_shot;
         lw_shared_ptr<injection_shared_data> shared_data;
         bi::list<injection_handler, bi::constant_time_size<false>> handlers;
 
-        explicit injection_data(bool one_shot, error_injection_parameters parameters)
+        explicit injection_data(bool one_shot, error_injection_parameters parameters, std::string_view injection_name)
             : one_shot(one_shot)
-            , shared_data(make_lw_shared<injection_shared_data>(std::move(parameters))) {}
+            , shared_data(make_lw_shared<injection_shared_data>(std::move(parameters), injection_name)) {}
 
         void receive_message() {
-            assert(shared_data);
+            SCYLLA_ASSERT(shared_data);
 
             ++shared_data->received_message_count;
             shared_data->received_message_cv.broadcast();
@@ -221,21 +297,8 @@ private:
         }
     };
 
-    // String cross-type comparator
-    class str_less
-    {
-    public:
-        using is_transparent = std::true_type;
-
-        template<typename TypeLeft, typename TypeRight>
-        bool operator()(const TypeLeft& left, const TypeRight& right) const
-        {
-            return left < right;
-        }
-    };
     // Map enabled-injection-name -> is-one-shot
-    // TODO: change to unordered_set once we have heterogeneous lookups
-    std::map<sstring, injection_data, str_less> _enabled;
+    std::unordered_map<std::string_view, injection_data> _enabled;
 
     bool is_one_shot(const std::string_view& injection_name) const {
         const auto it = _enabled.find(injection_name);
@@ -282,18 +345,15 @@ public:
     }
 
     void enable(const std::string_view& injection_name, bool one_shot = false, error_injection_parameters parameters = {}) {
-        _enabled.emplace(injection_name, injection_data{one_shot, std::move(parameters)});
+        auto data = injection_data{one_shot, std::move(parameters), injection_name};
+        std::string_view name = data.shared_data->injection_name;
+        _enabled.emplace(name, std::move(data));
         errinj_logger.debug("Enabling injection {} \"{}\"",
                 one_shot? "one-shot ": "", injection_name);
     }
 
     void disable(const std::string_view& injection_name) {
-        // TODO: plain erase once _enabled has heterogeneous lookups
-        auto it = _enabled.find(injection_name);
-        if (it == _enabled.end()) {
-            return;
-        }
-        _enabled.erase(it);
+        _enabled.erase(injection_name);
     }
 
     void disable_all() {
@@ -301,20 +361,18 @@ public:
     }
 
     std::vector<sstring> enabled_injections() const {
-        return boost::copy_range<std::vector<sstring>>(_enabled | boost::adaptors::filtered([] (const auto& pair) {
-            return !pair.second.is_ongoing_oneshot();
-        }) | boost::adaptors::map_keys);
+        return _enabled
+                | std::views::filter([] (const auto& pair) { return !pair.second.is_ongoing_oneshot(); })
+                | std::views::keys
+                | std::ranges::to<std::vector<sstring>>();
     }
 
     // \brief Inject a lambda call
     // \param f lambda to be run
     [[gnu::always_inline]]
     void inject(const std::string_view& name, handler_fun f) {
-        if (!is_enabled(name)) {
+        if (!enter(name)) {
             return;
-        }
-        if (is_one_shot(name)) {
-            disable(name);
         }
         errinj_logger.debug("Triggering injection \"{}\"", name);
         f();
@@ -322,14 +380,9 @@ public:
 
     // \brief Inject a sleep for milliseconds
     [[gnu::always_inline]]
-    future<> inject(const std::string_view& name,
-            const std::chrono::milliseconds duration) {
-
-        if (!is_enabled(name)) {
+    future<> inject(const std::string_view& name, const std::chrono::milliseconds duration) {
+        if (!enter(name)) {
             return make_ready_future<>();
-        }
-        if (is_one_shot(name)) {
-            disable(name);
         }
         errinj_logger.debug("Triggering sleep injection \"{}\" ({}ms)", name, duration.count());
         return seastar::sleep(duration);
@@ -339,37 +392,14 @@ public:
     template <typename Clock, typename Duration>
     [[gnu::always_inline]]
     future<> inject(const std::string_view& name, std::chrono::time_point<Clock, Duration> deadline) {
-
-        if (!is_enabled(name)) {
+        if (!enter(name)) {
             return make_ready_future<>();
-        }
-        if (is_one_shot(name)) {
-            disable(name);
         }
 
         // Time left until deadline
-        std::chrono::milliseconds duration = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now());
-        errinj_logger.debug("Triggering sleep injection \"{}\" ({}ms)", name, duration.count());
+        auto duration = deadline - Clock::now();
+        errinj_logger.debug("Triggering sleep injection \"{}\" ({})", name, duration);
         return seastar::sleep<Clock>(duration);
-    }
-
-    // \brief Inject a sleep to deadline with lambda(timeout)
-    // Avoid adding a sleep continuation in the chain for disabled error injection
-    template <typename Clock, typename Duration, typename Func>
-    [[gnu::always_inline]]
-    std::result_of_t<Func()> inject(const std::string_view& name, std::chrono::time_point<Clock, Duration> deadline,
-                Func&& func) {
-        if (is_enabled(name)) {
-            if (is_one_shot(name)) {
-                disable(name);
-            }
-            std::chrono::milliseconds duration = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now());
-            errinj_logger.debug("Triggering sleep injection \"{}\" ({}ms)", name, duration.count());
-            return seastar::sleep<Clock>(duration).then([func = std::move(func)] {
-                    return func(); });
-        } else {
-            return func();
-        }
     }
 
     // \brief Inject exception
@@ -378,25 +408,19 @@ public:
     requires std::is_invocable_r_v<std::exception_ptr, Func>
     [[gnu::always_inline]]
     future<>
-    inject(const std::string_view& name,
-            Func&& exception_factory) {
-
-        if (!is_enabled(name)) {
+    inject(const std::string_view& name, Func&& exception_factory) {
+        if (!enter(name)) {
             return make_ready_future<>();
         }
-        if (is_one_shot(name)) {
-            disable(name);
-        }
+
         errinj_logger.debug("Triggering exception injection \"{}\"", name);
         return make_exception_future<>(exception_factory());
     }
 
     // \brief Inject exception
     // \param func function returning a future and taking an injection handler
-    template <typename Func>
-    requires std::is_invocable_r_v<future<>, Func, injection_handler&>
-    future<> inject_with_handler(const std::string_view& name,
-                                 Func&& func) {
+    // \param share_messages if true, injection handlers share received messages
+    future<> inject(const std::string_view& name, waiting_handler_fun func, bool share_messages = true) {
         auto* data = get_data(name);
         if (!data) {
             co_return;
@@ -410,7 +434,7 @@ public:
         }
 
         errinj_logger.debug("Triggering injection \"{}\" with injection handler", name);
-        injection_handler handler(data->shared_data);
+        injection_handler handler(data->shared_data, share_messages);
         data->handlers.push_back(handler);
 
         auto disable_one_shot = defer([this, one_shot, name = sstring(name)] {
@@ -420,6 +444,50 @@ public:
         });
 
         co_await func(handler);
+    }
+
+    // \brief Inject "breakpoint"
+    // Injects a pause in the code execution that's woken up explicitly by the injector
+    // request
+    // \param wfm -- the wait_for_message instance that describes details of the pause
+    future<> inject(const std::string_view& name, utils::wait_for_message wfm) {
+        co_await inject(name, [name, wfm] (injection_handler& handler) -> future<> {
+            errinj_logger.info("{}: waiting for message", name);
+            co_await handler.wait_for_message(std::chrono::steady_clock::now() + wfm.timeout);
+            errinj_logger.info("{}: message received", name);
+        });
+    }
+
+    template <typename T = std::string_view>
+    std::optional<T> inject_parameter(const std::string_view& name) {
+        auto* data = get_data(name);
+        if (!data) {
+            return std::nullopt;
+        }
+        return data->shared_data->template get<T>("value");
+    }
+
+    // \brief Export the value of the parameter with the given name
+    // \param injection_name the name of the error injection
+    // \param parameter_name the name of the exported parameter
+    // \param parameter_value the value of the exported parameter
+    //
+    // This method is inject_parameter() in the other direction, allows external
+    // code to observe internal values.
+    void set_parameter(std::string_view injection_name, sstring parameter_name, sstring parameter_value) {
+        if (auto data = get_data(injection_name); data) {
+            data->shared_data->parameters[std::move(parameter_name)] = std::move(parameter_value);
+        }
+        if (is_one_shot(injection_name)) {
+            disable(injection_name);
+        }
+    }
+
+    error_injection_parameters get_injection_parameters(std::string_view name) {
+        if (auto data = get_data(name); data) {
+            return data->shared_data->parameters;
+        }
+        return {};
     }
 
     future<> enable_on_all(const std::string_view& injection_name, bool one_shot = false, error_injection_parameters parameters = {}) {
@@ -476,6 +544,7 @@ template <>
 class error_injection<false> {
     static thread_local error_injection _local;
     using handler_fun = std::function<void()>;
+    using waiting_handler_fun = std::function<future<>(error_injection<true>::injection_handler&)>;
 public:
     bool is_enabled(const std::string_view& name) const {
         return false;
@@ -515,15 +584,6 @@ public:
         return make_ready_future<>();
     }
 
-    // \brief Inject a sleep to deadline (timeout) with lambda
-    // Avoid adding a continuation in the chain for disabled error injections
-    template <typename Clock, typename Duration, typename Func>
-    [[gnu::always_inline]]
-    std::result_of_t<Func()> inject(const std::string_view& name, std::chrono::time_point<Clock, Duration> deadline,
-                Func&& func) {
-        return func();
-    }
-
     // Inject exception
     template <typename Func>
     requires std::is_invocable_r_v<std::exception_ptr, Func>
@@ -536,12 +596,29 @@ public:
 
     // \brief Inject exception
     // \param func function returning a future and taking an injection handler
-    template <typename Func>
-    requires std::is_invocable_r_v<future<>, Func, error_injection<true>::injection_handler&>
     [[gnu::always_inline]]
-    future<> inject_with_handler(const std::string_view& name,
-                                 Func&& func) {
+    future<> inject(const std::string_view& name, waiting_handler_fun func, bool share_messages = true) {
         return make_ready_future<>();
+    }
+
+    // \brief Inject "breakpoint"
+    [[gnu::always_inline]]
+    future<> inject(const std::string_view& name, utils::wait_for_message wfm) {
+        return make_ready_future<>();
+    }
+
+    template <typename T>
+    [[gnu::always_inline]]
+    std::optional<T> inject_parameter(const std::string_view& name) {
+        return std::nullopt;
+    }
+
+    [[gnu::always_inline]]
+    void set_parameter(std::string_view injection_name, sstring parameter_name, sstring parameter_value) { }
+
+    [[gnu::always_inline]]
+    error_injection_parameters get_injection_parameters(std::string_view name) {
+        return {};
     }
 
     [[gnu::always_inline]]
@@ -563,6 +640,9 @@ public:
     static future<> receive_message_on_all(const std::string_view& injection_name) {
         return make_ready_future<>();
     }
+
+    [[gnu::always_inline]]
+    static void receive_message(const std::string_view& injection_name) {}
 
     [[gnu::always_inline]]
     static std::vector<sstring> enabled_injections_on_all() { return {}; }

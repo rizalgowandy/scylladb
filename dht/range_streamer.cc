@@ -5,19 +5,19 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
-#include <seastar/core/sleep.hh>
 #include "dht/range_streamer.hh"
 #include "replica/database.hh"
 #include "gms/gossiper.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "streaming/stream_plan.hh"
-#include "streaming/stream_state.hh"
 #include "db/config.hh"
+#include <fmt/ranges.h>
 #include <seastar/core/semaphore.hh>
-#include <boost/range/adaptors.hpp>
+#include <seastar/core/sleep.hh>
+#include "utils/assert.hh"
 #include "utils/stall_free.hh"
 
 namespace dht {
@@ -26,15 +26,15 @@ static logging::logger logger("range_streamer");
 
 using inet_address = gms::inet_address;
 
-std::unordered_map<inet_address, dht::token_range_vector>
-range_streamer::get_range_fetch_map(const std::unordered_map<dht::token_range, std::vector<inet_address>>& ranges_with_sources,
+std::unordered_map<locator::host_id, dht::token_range_vector>
+range_streamer::get_range_fetch_map(const std::unordered_map<dht::token_range, std::vector<locator::host_id>>& ranges_with_sources,
                                     const std::unordered_set<std::unique_ptr<i_source_filter>>& source_filters,
                                     const sstring& keyspace) {
-    std::unordered_map<inet_address, dht::token_range_vector> range_fetch_map_map;
+    std::unordered_map<locator::host_id, dht::token_range_vector> range_fetch_map_map;
     const auto& topo = _token_metadata_ptr->get_topology();
     for (const auto& x : ranges_with_sources) {
         const dht::token_range& range_ = x.first;
-        const std::vector<inet_address>& addresses = x.second;
+        const std::vector<locator::host_id>& addresses = x.second;
         bool found_source = false;
         for (const auto& address : addresses) {
             if (topo.is_me(address)) {
@@ -63,7 +63,7 @@ range_streamer::get_range_fetch_map(const std::unordered_map<dht::token_range, s
 
         if (!found_source) {
             auto& ks = _db.local().find_keyspace(keyspace);
-            auto rf = ks.get_effective_replication_map()->get_replication_factor();
+            auto rf = ks.get_vnode_effective_replication_map()->get_replication_factor();
             // When a replacing node replaces a dead node with keyspace of RF
             // 1, it is expected that replacing node could not find a peer node
             // that contains data to stream from.
@@ -79,26 +79,26 @@ range_streamer::get_range_fetch_map(const std::unordered_map<dht::token_range, s
 }
 
 // Must be called from a seastar thread
-std::unordered_map<dht::token_range, std::vector<inet_address>>
+std::unordered_map<dht::token_range, std::vector<locator::host_id>>
 range_streamer::get_all_ranges_with_sources_for(const sstring& keyspace_name, locator::vnode_effective_replication_map_ptr erm, dht::token_range_vector desired_ranges) {
     logger.debug("{} ks={}", __func__, keyspace_name);
 
-    auto range_addresses = erm->get_range_addresses().get0();
+    auto range_addresses = erm->get_range_host_ids().get();
 
     logger.debug("keyspace={}, desired_ranges.size={}, range_addresses.size={}", keyspace_name, desired_ranges.size(), range_addresses.size());
 
-    std::unordered_map<dht::token_range, std::vector<inet_address>> range_sources;
+    std::unordered_map<dht::token_range, std::vector<locator::host_id>> range_sources;
     for (auto& desired_range : desired_ranges) {
         auto found = false;
         for (auto& x : range_addresses) {
             if (need_preempt()) {
                 seastar::thread::yield();
             }
-            const range<token>& src_range = x.first;
-            if (src_range.contains(desired_range, dht::operator<=>)) {
-                inet_address_vector_replica_set preferred(x.second.begin(), x.second.end());
+            const wrapping_interval<token>& src_range = x.first;
+            if (src_range.contains(desired_range, dht::token_comparator{})) {
+                host_id_vector_replica_set preferred(x.second.begin(), x.second.end());
                 get_token_metadata().get_topology().sort_by_proximity(_address, preferred);
-                for (inet_address& p : preferred) {
+                for (locator::host_id& p : preferred) {
                     range_sources[desired_range].push_back(p);
                 }
                 found = true;
@@ -114,47 +114,47 @@ range_streamer::get_all_ranges_with_sources_for(const sstring& keyspace_name, lo
 }
 
 // Must be called from a seastar thread
-std::unordered_map<dht::token_range, std::vector<inet_address>>
+std::unordered_map<dht::token_range, std::vector<locator::host_id>>
 range_streamer::get_all_ranges_with_strict_sources_for(const sstring& keyspace_name, locator::vnode_effective_replication_map_ptr erm, dht::token_range_vector desired_ranges, gms::gossiper& gossiper) {
     logger.debug("{} ks={}", __func__, keyspace_name);
-    assert (_tokens.empty() == false);
+    SCYLLA_ASSERT (_tokens.empty() == false);
 
     auto& strat = erm->get_replication_strategy();
 
     //Active ranges
-    auto metadata_clone = get_token_metadata().clone_only_token_map().get0();
-    auto range_addresses = strat.get_range_addresses(metadata_clone).get0();
+    auto metadata_clone = get_token_metadata().clone_only_token_map().get();
+    auto range_addresses = strat.get_range_host_ids(metadata_clone).get();
 
     //Pending ranges
     metadata_clone.update_topology(_address, _dr);
     metadata_clone.update_normal_tokens(_tokens, _address).get();
-    auto pending_range_addresses  = strat.get_range_addresses(metadata_clone).get0();
+    auto pending_range_addresses  = strat.get_range_host_ids(metadata_clone).get();
     metadata_clone.clear_gently().get();
 
     //Collects the source that will have its range moved to the new node
-    std::unordered_map<dht::token_range, std::vector<inet_address>> range_sources;
+    std::unordered_map<dht::token_range, std::vector<locator::host_id>> range_sources;
 
     logger.debug("keyspace={}, desired_ranges.size={}, range_addresses.size={}", keyspace_name, desired_ranges.size(), range_addresses.size());
 
     for (auto& desired_range : desired_ranges) {
         for (auto& x : range_addresses) {
-            const range<token>& src_range = x.first;
+            const wrapping_interval<token>& src_range = x.first;
             if (need_preempt()) {
                 seastar::thread::yield();
             }
-            if (src_range.contains(desired_range, dht::operator<=>)) {
-                std::vector<inet_address> old_endpoints(x.second.begin(), x.second.end());
+            if (src_range.contains(desired_range, dht::token_comparator{})) {
+                std::vector<locator::host_id> old_endpoints(x.second.begin(), x.second.end());
                 auto it = pending_range_addresses.find(desired_range);
                 if (it == pending_range_addresses.end()) {
                     throw std::runtime_error(format("Can not find desired_range = {} in pending_range_addresses", desired_range));
                 }
 
-                std::unordered_set<inet_address> new_endpoints(it->second.begin(), it->second.end());
+                std::unordered_set<locator::host_id> new_endpoints(it->second.begin(), it->second.end());
                 //Due to CASSANDRA-5953 we can have a higher RF then we have endpoints.
                 //So we need to be careful to only be strict when endpoints == RF
                 if (old_endpoints.size() == erm->get_replication_factor()) {
                     std::erase_if(old_endpoints,
-                        [&new_endpoints] (inet_address ep) { return new_endpoints.contains(ep); });
+                        [&new_endpoints] (locator::host_id ep) { return new_endpoints.contains(ep); });
                     if (old_endpoints.size() != 1) {
                         throw std::runtime_error(format("Expected 1 endpoint but found {:d}", old_endpoints.size()));
                     }
@@ -173,10 +173,10 @@ range_streamer::get_all_ranges_with_strict_sources_for(const sstring& keyspace_n
             throw std::runtime_error(format("Multiple endpoints found for {}", desired_range));
         }
 
-        inet_address source_ip = it->second.front();
+        locator::host_id source_id = it->second.front();
 
-        if (gossiper.is_enabled() && !gossiper.is_alive(source_ip)) {
-            throw std::runtime_error(format("A node required to move the data consistently is down ({}).  If you wish to move the data from a potentially inconsistent replica, restart the node with consistent_rangemovement=false", source_ip));
+        if (gossiper.is_enabled() && !gossiper.is_alive(source_id)) {
+            throw std::runtime_error(format("A node required to move the data consistently is down ({}).  If you wish to move the data from a potentially inconsistent replica, restart the node with consistent_rangemovement=false", source_id));
         }
     }
 
@@ -185,7 +185,7 @@ range_streamer::get_all_ranges_with_strict_sources_for(const sstring& keyspace_n
 
 bool range_streamer::use_strict_sources_for_ranges(const sstring& keyspace_name, const locator::vnode_effective_replication_map_ptr& erm) {
     auto rf = erm->get_replication_factor();
-    auto nr_nodes_in_ring = get_token_metadata().get_all_endpoints().size();
+    auto nr_nodes_in_ring = get_token_metadata().get_normal_token_owners().size();
     bool everywhere_topology = erm->get_replication_strategy().get_type() == locator::replication_strategy_type::everywhere_topology;
     // Use strict when number of nodes in the ring is equal or more than RF
     auto strict = _db.local().get_config().consistent_rangemovement()
@@ -197,7 +197,7 @@ bool range_streamer::use_strict_sources_for_ranges(const sstring& keyspace_name,
     return strict;
 }
 
-void range_streamer::add_tx_ranges(const sstring& keyspace_name, std::unordered_map<inet_address, dht::token_range_vector> ranges_per_endpoint) {
+void range_streamer::add_tx_ranges(const sstring& keyspace_name, std::unordered_map<locator::host_id, dht::token_range_vector> ranges_per_endpoint) {
     if (_nr_rx_added) {
         throw std::runtime_error("Mixed sending and receiving is not supported");
     }
@@ -205,7 +205,7 @@ void range_streamer::add_tx_ranges(const sstring& keyspace_name, std::unordered_
     _to_stream.emplace(keyspace_name, std::move(ranges_per_endpoint));
 }
 
-void range_streamer::add_rx_ranges(const sstring& keyspace_name, std::unordered_map<inet_address, dht::token_range_vector> ranges_per_endpoint) {
+void range_streamer::add_rx_ranges(const sstring& keyspace_name, std::unordered_map<locator::host_id, dht::token_range_vector> ranges_per_endpoint) {
     if (_nr_tx_added) {
         throw std::runtime_error("Mixed sending and receiving is not supported");
     }
@@ -230,7 +230,7 @@ future<> range_streamer::add_ranges(const sstring& keyspace_name, locator::vnode
         }
     }
 
-    std::unordered_map<inet_address, dht::token_range_vector> range_fetch_map = get_range_fetch_map(ranges_for_keyspace, _source_filters, keyspace_name);
+    std::unordered_map<locator::host_id, dht::token_range_vector> range_fetch_map = get_range_fetch_map(ranges_for_keyspace, _source_filters, keyspace_name);
     utils::clear_gently(ranges_for_keyspace).get();
 
     if (logger.is_enabled(logging::log_level::debug)) {
@@ -251,7 +251,7 @@ future<> range_streamer::stream_async() {
     return do_for_each(_to_stream, [this, description = _description] (auto& stream) {
         const auto& keyspace = stream.first;
         auto& ip_range_vec = stream.second;
-        auto ips = boost::copy_range<std::list<inet_address>>(ip_range_vec | boost::adaptors::map_keys);
+        auto ips = ip_range_vec | std::views::keys | std::ranges::to<std::list>();
         // Fetch from or send to peer node in parallel
         logger.info("{} with {} for keyspace={} started, nodes_to_stream={}", description, ips, keyspace, ip_range_vec.size());
         return parallel_for_each(ip_range_vec, [this, description, keyspace] (auto& ip_range) {

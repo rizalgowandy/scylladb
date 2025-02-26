@@ -1,4 +1,4 @@
-add_library(test-lib)
+add_library(test-lib STATIC)
 target_sources(test-lib
   PRIVATE
     cql_assertions.cc
@@ -12,12 +12,14 @@ target_sources(test-lib
     expr_test_utils.cc
     test_services.cc
     key_utils.cc
+    mutation_assertions.cc
     mutation_source_test.cc
     random_schema.cc
     result_set_assertions.cc
     sstable_run_based_compaction_strategy_for_tests.cc
     sstable_utils.cc
-    data_model.cc)
+    data_model.cc
+    eventually.cc)
 target_include_directories(test-lib
   PUBLIC
     ${CMAKE_SOURCE_DIR})
@@ -28,6 +30,7 @@ target_link_libraries(test-lib
     Seastar::seastar
     xxHash::xxhash
   PRIVATE
+    audit
     auth
     cdc
     compaction

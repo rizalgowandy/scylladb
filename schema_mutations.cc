@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "schema_mutations.hh"
@@ -138,17 +138,17 @@ bool schema_mutations::is_view() const {
     return _columnfamilies.schema() == db::schema_tables::views();
 }
 
-std::ostream& operator<<(std::ostream& out, const schema_mutations& sm) {
-    out << "schema_mutations{\n";
-    out << " tables=" << sm.columnfamilies_mutation() << ",\n";
-    out << " scylla_tables=" << sm.scylla_tables() << ",\n";
-    out << " columns=" << sm.columns_mutation() << ",\n";
-    out << " dropped_columns=" << sm.dropped_columns_mutation() << ",\n";
-    out << " indices=" << sm.indices_mutation() << ",\n";
-    out << " computed_columns=" << sm.computed_columns_mutation() << ",\n";
-    out << " view_virtual_columns=" << sm.view_virtual_columns_mutation() << "\n";
-    out << "}";
-    return out;
+auto fmt::formatter<schema_mutations>::format(const schema_mutations& sm, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    auto out = fmt::format_to(ctx.out(), "schema_mutations{{\n");
+    out = fmt::format_to(out, " tables={},\n", sm.columnfamilies_mutation());
+    out = fmt::format_to(out, " scylla_tables={},\n", sm.scylla_tables());
+    out = fmt::format_to(out, " tables={},\n", sm.columns_mutation());
+    out = fmt::format_to(out, " dropped_columns={},\n", sm.dropped_columns_mutation());
+    out = fmt::format_to(out, " indices={},\n", sm.indices_mutation());
+    out = fmt::format_to(out, " computed_columns={},\n", sm.computed_columns_mutation());
+    out = fmt::format_to(out, " view_virtual_columns={},\n", sm.view_virtual_columns_mutation());
+    return fmt::format_to(out, "}}");
 }
 
 schema_mutations& schema_mutations::operator+=(schema_mutations&& sm) {

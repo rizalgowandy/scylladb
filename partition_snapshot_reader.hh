@@ -3,25 +3,24 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "mutation/partition_version.hh"
-#include "readers/flat_mutation_reader_fwd.hh"
-#include "readers/flat_mutation_reader_v2.hh"
+#include "readers/mutation_reader_fwd.hh"
+#include "readers/mutation_reader.hh"
 #include "readers/range_tombstone_change_merger.hh"
 #include "clustering_key_filter.hh"
 #include "query-request.hh"
-#include "partition_snapshot_row_cursor.hh"
-#include <boost/range/algorithm/heap_algorithm.hpp>
+#include "db/partition_snapshot_row_cursor.hh"
 #include <any>
 
 extern seastar::logger mplog;
 
 template <bool Reversing, typename Accounter>
-class partition_snapshot_flat_reader : public flat_mutation_reader_v2::impl, public Accounter {
+class partition_snapshot_flat_reader : public mutation_reader::impl, public Accounter {
     struct row_info {
         mutation_fragment_v2 row;
         tombstone rt_for_row;
@@ -55,10 +54,6 @@ class partition_snapshot_flat_reader : public flat_mutation_reader_v2::impl, pub
         // for result ordering. This schema is passed from the query and is reversed iff
         // the query was reversed (i.e. `Reversing==true`).
         const schema& _query_schema;
-        // _snapshot_schema is a schema that induces the same clustering key order as the
-        // schema from the underlying snapshot. The schemas mentioned might differ, for
-        // instance, if a query used newer version of the schema.
-        const schema_ptr _snapshot_schema;
         reader_permit _permit;
         partition_snapshot_ptr _snapshot;
         logalloc::region& _region;
@@ -78,7 +73,6 @@ class partition_snapshot_flat_reader : public flat_mutation_reader_v2::impl, pub
                                       logalloc::region& region, logalloc::allocating_section& read_section,
                                       bool digest_requested)
             : _query_schema(s)
-            , _snapshot_schema(Reversing ? s.make_reversed() : s.shared_from_this())
             , _permit(permit)
             , _snapshot(std::move(snp))
             , _region(region)
@@ -155,9 +149,6 @@ private:
     query::clustering_row_ranges::const_iterator _current_ck_range;
     query::clustering_row_ranges::const_iterator _ck_range_end;
 
-    // Holds reversed current clustering key range, if Reversing was needed.
-    std::optional<query::clustering_range> opt_reversed_range;
-
     std::optional<position_in_partition> _lower_bound;
 
     // Last emitted range_tombstone_change.
@@ -181,7 +172,7 @@ private:
     // ck_range_snapshot uses the snapshot order, while ck_range_query uses the
     // query order. These two differ if the query was reversed (`Reversing==true`).
     const query::clustering_range& current_ck_range_query() {
-        return opt_reversed_range ? *opt_reversed_range : *_current_ck_range;
+        return *_current_ck_range;
     }
 
     void emit_next_interval() {
@@ -223,13 +214,9 @@ private:
 
     void on_new_range() {
         if (_current_ck_range == _ck_range_end) {
-            opt_reversed_range = std::nullopt;
             _end_of_stream = true;
             push_mutation_fragment(mutation_fragment_v2(*_schema, _permit, partition_end()));
         } else {
-            if constexpr (Reversing) {
-                opt_reversed_range = query::reverse(*_current_ck_range);
-            }
             _lower_bound = position_in_partition_view::for_range_start(current_ck_range_query());
             _reader.on_new_range(*_lower_bound);
         }
@@ -294,7 +281,7 @@ public:
 };
 
 template <bool Reversing, typename Accounter, typename... Args>
-inline flat_mutation_reader_v2
+inline mutation_reader
 make_partition_snapshot_flat_reader(schema_ptr s,
                                     reader_permit permit,
                                     dht::decorated_key dk,
@@ -307,7 +294,7 @@ make_partition_snapshot_flat_reader(schema_ptr s,
                                     streamed_mutation::forwarding fwd,
                                     Args&&... args)
 {
-    auto res = make_flat_mutation_reader_v2<partition_snapshot_flat_reader<Reversing, Accounter>>(std::move(s), std::move(permit), std::move(dk),
+    auto res = make_mutation_reader<partition_snapshot_flat_reader<Reversing, Accounter>>(std::move(s), std::move(permit), std::move(dk),
             snp, std::move(crr), digest_requested, region, read_section, std::move(pointer_to_container), std::forward<Args>(args)...);
     if (fwd) {
         return make_forwardable(std::move(res)); // FIXME: optimize

@@ -5,8 +5,10 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
+
+trap 'echo "error $? in $0 line $LINENO"' ERR
 
 PROGRAM=$(basename $0)
 
@@ -51,7 +53,7 @@ if [ -f /.dockerenv ]; then
 fi
 
 container_images=(
-    docker.io/centos:7
+    docker.io/rockylinux:9
 )
 
 for container_image in "${container_images=[@]}"
@@ -59,7 +61,7 @@ do
     container_script="${container_image//:/-}"
     install_sh="$(pwd)/tools/testing/dist-check/$container_script.sh"
     if [ -f "$install_sh" ]; then
-        $contool run -i --rm -v $(pwd):$(pwd) $container_image /bin/bash -c "cd $(pwd) && $install_sh --mode $MODE"
+        $contool run -i --rm -v $(pwd):$(pwd):Z $container_image /bin/bash -c "cd $(pwd) && $install_sh --mode $MODE"
     else
         echo "internal error: $install_sh does not exist, please create one to verify packages on $container_image."
         exit 1

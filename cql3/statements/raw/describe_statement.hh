@@ -5,14 +5,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include "cql3/functions/function_name.hh"
 #include "cql3/statements/raw/parsed_statement.hh"
-#include "query-request.hh"
 #include "cql3/cf_name.hh"
 
 #include <memory>
@@ -44,7 +43,8 @@ private:
 
     struct describe_cluster {};
     struct describe_schema {
-        bool full_schema;
+        bool full_schema = false;
+        bool with_hashed_passwords = false;
     };
     struct describe_keyspace {
         std::optional<sstring> keyspace;
@@ -75,9 +75,11 @@ private:
     describe_config _config;
     internals _with_internals = internals(false);
 
+    virtual audit::audit_info_ptr audit_info() const override;
+    virtual audit::statement_category category() const override;
 public:
     explicit describe_statement(describe_config config);
-    void with_internals_details();
+    void with_internals_details(bool with_hashed_passwords);
 
     virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats) override;
 

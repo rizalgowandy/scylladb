@@ -3,20 +3,23 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "auth/service.hh"
 #include <seastar/core/seastar.hh>
+#include "seastar/core/scheduling.hh"
 #include "service/endpoint_lifecycle_subscriber.hh"
 #include "service/migration_listener.hh"
 #include "auth/authenticator.hh"
 #include <seastar/core/distributed.hh>
+#include "service/qos/qos_configuration_change_subscriber.hh"
 #include "timeout_config.hh"
 #include <seastar/core/semaphore.hh>
 #include <memory>
+#include <type_traits>
 #include <boost/intrusive/list.hpp>
 #include <seastar/net/tls.hh>
 #include <seastar/core/metrics_registration.hh>
@@ -28,15 +31,21 @@
 #include "generic_server.hh"
 #include "service/query_state.hh"
 #include "cql3/query_options.hh"
+#include "cql3/dialect.hh"
 #include "transport/messages/result_message.hh"
 #include "utils/chunked_vector.hh"
 #include "exceptions/coordinator_result.hh"
 #include "db/operation_type.hh"
+#include "service/maintenance_mode.hh"
 
 namespace cql3 {
 
 class query_processor;
 
+}
+
+namespace db {
+class config;
 }
 
 namespace scollectd {
@@ -122,12 +131,21 @@ struct cql_sg_stats {
         uint64_t response_size = 0;
     };
 
-    cql_sg_stats();
+    cql_sg_stats(maintenance_socket_enabled);
     request_kind_stats& get_cql_opcode_stats(cql_binary_opcode op) { return _cql_requests_stats[static_cast<uint8_t>(op)]; }
     void register_metrics();
+    void rename_metrics();
 private:
+    bool _use_metrics = false;
     seastar::metrics::metric_groups _metrics;
     std::vector<request_kind_stats> _cql_requests_stats;
+};
+
+struct connection_service_level_params {
+    sstring role_name;
+    timeout_config timeout_config;
+    qos::service_level_options::workload_type workload_type;
+    sstring scheduling_group_name;
 };
 
 class cql_server : public seastar::peering_sharded_service<cql_server>, public generic_server::server {
@@ -152,6 +170,7 @@ private:
     cql_server_config _config;
     size_t _max_request_size;
     utils::updateable_value<uint32_t> _max_concurrent_requests;
+    utils::updateable_value<bool> _cql_duplicate_bind_variable_names_refer_to_same_variable;
     semaphore& _memory_available;
     seastar::metrics::metric_groups _metrics;
     std::unique_ptr<event_notifier> _notifier;
@@ -168,17 +187,27 @@ public:
             const db::config& db_cfg,
             qos::service_level_controller& sl_controller,
             gms::gossiper& g,
-            scheduling_group_key stats_key);
+            scheduling_group_key stats_key,
+            maintenance_socket_enabled used_by_maintenance_socket);
+    ~cql_server();
+
 public:
     using response = cql_transport::response;
     using result_with_foreign_response_ptr = exceptions::coordinator_result<foreign_ptr<std::unique_ptr<cql_server::response>>>;
+    using result_with_bounce_to_shard = foreign_ptr<seastar::shared_ptr<messages::result_message::bounce_to_shard>>;
+    using process_fn_return_type = std::variant<result_with_foreign_response_ptr, result_with_bounce_to_shard>;
+
     service::endpoint_lifecycle_subscriber* get_lifecycle_listener() const noexcept;
     service::migration_listener* get_migration_listener() const noexcept;
+    qos::qos_configuration_change_subscriber* get_qos_configuration_listener() const noexcept;
     cql_sg_stats::request_kind_stats& get_cql_opcode_stats(cql_binary_opcode op) {
         return scheduling_group_get_specific<cql_sg_stats>(_stats_key).get_cql_opcode_stats(op);
     }
 
     future<utils::chunked_vector<client_data>> get_client_data();
+    future<> update_connections_scheduling_group();
+    future<> update_connections_service_level_params();
+    future<std::vector<connection_service_level_params>> get_connections_service_level_params();
 private:
     class fmt_visitor;
     friend class connection;
@@ -193,10 +222,11 @@ private:
         cql_compression _compression = cql_compression::none;
         service::client_state _client_state;
         timer<lowres_clock> _shedding_timer;
+        scheduling_group _current_scheduling_group;
         bool _shed_incoming_requests = false;
-        unsigned _request_cpu = 0;
         bool _ready = false;
         bool _authenticating = false;
+        bool _tenant_switch = false;
 
         enum class tracing_request_type : uint8_t {
             not_requested,
@@ -220,9 +250,12 @@ private:
         future<> process_request() override;
         void handle_error(future<>&& f) override;
         void on_connection_close() override;
-        static std::tuple<net::inet_address, int, client_type> make_client_key(const service::client_state& cli_state);
+        static std::pair<net::inet_address, int> make_client_key(const service::client_state& cli_state);
         client_data make_client_data() const;
         const service::client_state& get_client_state() const { return _client_state; }
+        void update_scheduling_group();
+        service::client_state& get_client_state() { return _client_state; }
+        scheduling_group get_scheduling_group() const { return _current_scheduling_group; }
     private:
         friend class process_request_executor;
         future<foreign_ptr<std::unique_ptr<cql_server::response>>> process_request_one(fragmented_temporary_buffer::istream buf, uint8_t op, uint16_t stream, service::client_state& client_state, tracing_request_type tracing_request, service_permit permit);
@@ -259,15 +292,42 @@ private:
         std::unique_ptr<cql_server::response> make_auth_success(int16_t, bytes, const tracing::trace_state_ptr& tr_state) const;
         std::unique_ptr<cql_server::response> make_auth_challenge(int16_t, bytes, const tracing::trace_state_ptr& tr_state) const;
 
+        cql3::dialect get_dialect() const;
+
         // Helper functions to encapsulate bounce_to_shard processing for query, execute and batch verbs
-        template<typename Process>
+        template <typename Process>
+            requires std::is_invocable_r_v<future<cql_server::process_fn_return_type>,
+                                           Process,
+                                           service::client_state&,
+                                           distributed<cql3::query_processor>&,
+                                           request_reader,
+                                           uint16_t,
+                                           cql_protocol_version_type,
+                                           service_permit,
+                                           tracing::trace_state_ptr,
+                                           bool,
+                                           cql3::computed_function_values,
+                                           cql3::dialect>
         future<result_with_foreign_response_ptr>
         process(uint16_t stream, request_reader in, service::client_state& client_state, service_permit permit, tracing::trace_state_ptr trace_state,
                 Process process_fn);
-        template<typename Process>
-        future<result_with_foreign_response_ptr>
-        process_on_shard(::shared_ptr<messages::result_message::bounce_to_shard> bounce_msg, uint16_t stream, fragmented_temporary_buffer::istream is, service::client_state& cs,
-                service_permit permit, tracing::trace_state_ptr trace_state, Process process_fn);
+
+        template <typename Process>
+            requires std::is_invocable_r_v<future<cql_server::process_fn_return_type>,
+                                           Process,
+                                           service::client_state&,
+                                           distributed<cql3::query_processor>&,
+                                           request_reader,
+                                           uint16_t,
+                                           cql_protocol_version_type,
+                                           service_permit,
+                                           tracing::trace_state_ptr,
+                                           bool,
+                                           cql3::computed_function_values,
+                                           cql3::dialect>
+        future<process_fn_return_type>
+        process_on_shard(shard_id shard, uint16_t stream, fragmented_temporary_buffer::istream is, service::client_state& cs,
+                tracing::trace_state_ptr trace_state, cql3::dialect dialect, cql3::computed_function_values&& cached_vals, Process process_fn);
 
         void write_response(foreign_ptr<std::unique_ptr<cql_server::response>>&& response, service_permit permit = empty_service_permit(), cql_compression compression = cql_compression::none);
 
@@ -285,9 +345,10 @@ private:
 };
 
 class cql_server::event_notifier : public service::migration_listener,
-                                   public service::endpoint_lifecycle_subscriber
+                                   public service::endpoint_lifecycle_subscriber,
+                                   public qos::qos_configuration_change_subscriber
 {
-    const cql_server& _server;
+    cql_server& _server;
     std::set<cql_server::connection*> _topology_change_listeners;
     std::set<cql_server::connection*> _status_change_listeners;
     std::set<cql_server::connection*> _schema_change_listeners;
@@ -299,7 +360,7 @@ class cql_server::event_notifier : public service::migration_listener,
 
     void send_join_cluster(const gms::inet_address& endpoint);
 public:
-    explicit event_notifier(const cql_server& s) noexcept : _server(s) {}
+    explicit event_notifier(cql_server& s) noexcept : _server(s) {}
     void register_event(cql_transport::event::event_type et, cql_server::connection* conn);
     void unregister_connection(cql_server::connection* conn);
 
@@ -316,7 +377,7 @@ public:
     virtual void on_update_view(const sstring& ks_name, const sstring& view_name, bool columns_changed) override;
     virtual void on_update_function(const sstring& ks_name, const sstring& function_name) override;
     virtual void on_update_aggregate(const sstring& ks_name, const sstring& aggregate_name) override;
-    virtual void on_update_tablet_metadata() override;
+    virtual void on_update_tablet_metadata(const locator::tablet_metadata_change_hint&) override;
 
     virtual void on_drop_keyspace(const sstring& ks_name) override;
     virtual void on_drop_column_family(const sstring& ks_name, const sstring& cf_name) override;
@@ -325,12 +386,18 @@ public:
     virtual void on_drop_function(const sstring& ks_name, const sstring& function_name) override;
     virtual void on_drop_aggregate(const sstring& ks_name, const sstring& aggregate_name) override;
 
+    virtual future<> on_before_service_level_add(qos::service_level_options, qos::service_level_info sl_info) override;
+    virtual future<> on_after_service_level_remove(qos::service_level_info sl_info) override;
+    virtual future<> on_before_service_level_change(qos::service_level_options slo_before, qos::service_level_options slo_after, qos::service_level_info sl_info) override;
+    virtual future<> on_effective_service_levels_cache_reloaded() override;
+
     virtual void on_join_cluster(const gms::inet_address& endpoint) override;
-    virtual void on_leave_cluster(const gms::inet_address& endpoint) override;
+    virtual void on_leave_cluster(const gms::inet_address& endpoint, const locator::host_id& hid) override;
     virtual void on_up(const gms::inet_address& endpoint) override;
     virtual void on_down(const gms::inet_address& endpoint) override;
 };
 
 inline service::endpoint_lifecycle_subscriber* cql_server::get_lifecycle_listener() const noexcept { return _notifier.get(); }
 inline service::migration_listener* cql_server::get_migration_listener() const noexcept { return _notifier.get(); }
+inline qos::qos_configuration_change_subscriber* cql_server::get_qos_configuration_listener() const noexcept { return _notifier.get(); }
 }

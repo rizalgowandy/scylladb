@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -39,7 +39,7 @@ public:
     }
 };
 
-static inline
+inline
 gc_clock::time_point to_gc_clock(db_clock::time_point tp) noexcept {
     // Converting time points through `std::time_t` means that we don't have to make any assumptions about the epochs
     // of `gc_clock` and `db_clock`, though we require that that the period of `gc_clock` is also 1 s like
@@ -56,7 +56,7 @@ gc_clock::time_point to_gc_clock(db_clock::time_point tp) noexcept {
 
 /* For debugging and log messages. */
 template <>
-struct fmt::formatter<db_clock::time_point> : fmt::formatter<std::string_view> {
+struct fmt::formatter<db_clock::time_point> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const db_clock::time_point& tp, FormatContext& ctx) const {
         auto t = db_clock::to_time_t(tp);

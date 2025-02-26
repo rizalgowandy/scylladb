@@ -3,11 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #pragma once
 
 #include <seastar/core/gate.hh>
+#include <seastar/util/std-compat.hh>
 #include "raft/raft.hh"
 #include "message/messaging_service_fwd.hh"
 #include "utils/UUID.hh"
@@ -27,21 +28,23 @@ protected:
     raft::group_id _group_id;
     raft::server_id _my_id;                     // Raft server id of this node.
     netw::messaging_service& _messaging;
-    raft_address_map& _address_map;
     shared_ptr<raft::failure_detector> _failure_detector;
     seastar::gate _shutdown_gate;
 
+    // Limits the total memory usage of raft::append_request messages that are currently being sent
+    seastar::semaphore _append_entries_semaphore;
+
     explicit raft_rpc(raft_state_machine& sm, netw::messaging_service& ms,
-            raft_address_map& address_map, shared_ptr<raft::failure_detector> failure_detector, raft::group_id gid, raft::server_id my_id);
+             shared_ptr<raft::failure_detector> failure_detector, raft::group_id gid, raft::server_id my_id);
 
 private:
     enum class one_way_kind { request, reply };
 
     template <one_way_kind rpc_kind, typename Verb, typename Msg> void
-    one_way_rpc(std::source_location loc, raft::server_id id, Verb&& verb, Msg&& msg);
+    one_way_rpc(seastar::compat::source_location loc, raft::server_id id, Verb&& verb, Msg&& msg);
 
     template <typename Verb, typename... Args> auto
-    two_way_rpc(std::source_location loc, raft::server_id id, Verb&& verb, Args&&... args);
+    two_way_rpc(seastar::compat::source_location loc, raft::server_id id, Verb&& verb, Args&&... args);
 
 public:
     future<raft::snapshot_reply> send_snapshot(raft::server_id server_id, const raft::install_snapshot& snap, seastar::abort_source& as) override;

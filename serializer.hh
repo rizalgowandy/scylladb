@@ -3,30 +3,22 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #pragma once
 
-#include <vector>
-#include <unordered_set>
-#include <list>
-#include <array>
 #include <seastar/core/sstring.hh>
-#include <unordered_map>
 #include <optional>
-#include "enum_set.hh"
+#include "utils/assert.hh"
 #include "utils/managed_bytes.hh"
 #include "bytes_ostream.hh"
 #include <seastar/core/simple-stream.hh>
 #include "boost/variant/variant.hpp"
 #include "bytes_ostream.hh"
-#include "utils/input_stream.hh"
 #include "utils/fragment_range.hh"
-#include "utils/chunked_vector.hh"
 #include <variant>
 
-#include <boost/range/algorithm/for_each.hpp>
-#include <boost/type.hpp>
+#include <type_traits>
 
 namespace ser {
 
@@ -162,11 +154,10 @@ public:
 
     bytes linearize() const {
         bytes b(bytes::initialized_later(), size_bytes());
-        using boost::range::for_each;
         auto dst = b.begin();
-        for_each(*this, [&] (bytes_view fragment) {
+        for (bytes_view fragment : *this) {
             dst = std::copy(fragment.begin(), fragment.end(), dst);
-        });
+        }
         return b;
     }
 
@@ -268,12 +259,12 @@ inline void serialize(Output& out, const std::reference_wrapper<T> v) {
 }
 
 template<typename T, typename Input>
-inline auto deserialize(Input& in, boost::type<T> t) {
+inline auto deserialize(Input& in, std::type_identity<T> t) {
     return serializer<T>::read(in);
 }
 
 template<typename T, typename Input>
-inline void skip(Input& v, boost::type<T>) {
+inline void skip(Input& v, std::type_identity<T>) {
     return serializer<T>::skip(v);
 }
 
@@ -290,19 +281,19 @@ template<typename Buffer, typename T>
 Buffer serialize_to_buffer(const T& v, size_t head_space = 0);
 
 template<typename T, typename Buffer>
-T deserialize_from_buffer(const Buffer&, boost::type<T>, size_t head_space = 0);
+T deserialize_from_buffer(const Buffer&, std::type_identity<T>, size_t head_space = 0);
 
 template<typename Output, typename ...T>
 void serialize(Output& out, const boost::variant<T...>& v);
 
 template<typename Input, typename ...T>
-boost::variant<T...> deserialize(Input& in, boost::type<boost::variant<T...>>);
+boost::variant<T...> deserialize(Input& in, std::type_identity<boost::variant<T...>>);
 
 template<typename Output, typename ...T>
 void serialize(Output& out, const std::variant<T...>& v);
 
 template<typename Input, typename ...T>
-std::variant<T...> deserialize(Input& in, boost::type<std::variant<T...>>);
+std::variant<T...> deserialize(Input& in, std::type_identity<std::variant<T...>>);
 
 struct unknown_variant_type {
     size_type index;
@@ -313,7 +304,7 @@ template<typename Output>
 void serialize(Output& out, const unknown_variant_type& v);
 
 template<typename Input>
-unknown_variant_type deserialize(Input& in, boost::type<unknown_variant_type>);
+unknown_variant_type deserialize(Input& in, std::type_identity<unknown_variant_type>);
 
 template <typename T>
 struct normalize {
@@ -385,7 +376,7 @@ serialize_gc_clock_duration_value(Output& out, int64_t v) {
     if (!gc_clock_using_3_1_0_serialization) {
         // This should have been caught by the CQL layer, so this is just
         // for extra safety.
-        assert(int32_t(v) == v);
+        SCYLLA_ASSERT(int32_t(v) == v);
         serializer<int32_t>::write(out, v);
     } else {
         serializer<int64_t>::write(out, v);

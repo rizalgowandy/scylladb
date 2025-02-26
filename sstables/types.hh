@@ -3,19 +3,22 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "disk_types.hh"
 #include <seastar/core/enum.hh>
+#include <seastar/core/weak_ptr.hh>
 #include "bytes.hh"
 #include "gc_clock.hh"
+#include "locator/host_id.hh"
 #include "mutation/tombstone.hh"
 #include "utils/streaming_histogram.hh"
 #include "utils/estimated_histogram.hh"
 #include "sstables/key.hh"
+#include "sstables/file_writer.hh"
 #include "db/commitlog/replay_position.hh"
 #include "version.hh"
 #include <vector>
@@ -24,13 +27,11 @@
 #include <concepts>
 #include "version.hh"
 #include "encoding_stats.hh"
-#include "utils/UUID.hh"
-#include "locator/host_id.hh"
 #include "types_fwd.hh"
 
 // While the sstable code works with char, bytes_view works with int8_t
 // (signed char). Rather than change all the code, let's do a cast.
-static inline bytes_view to_bytes_view(const temporary_buffer<char>& b) {
+inline bytes_view to_bytes_view(const temporary_buffer<char>& b) {
     using byte = bytes_view::value_type;
     return bytes_view(reinterpret_cast<const byte*>(b.get()), b.size());
 }
@@ -75,7 +76,6 @@ struct deletion_time {
     explicit operator tombstone() {
         return !live() ? tombstone(marked_for_delete_at, gc_clock::time_point(gc_clock::duration(local_deletion_time))) : tombstone();
     }
-    friend std::ostream& operator<<(std::ostream&, const deletion_time&);
 };
 
 struct option {
@@ -113,9 +113,8 @@ enum class indexable_element {
     cell
 };
 
-inline std::ostream& operator<<(std::ostream& o, indexable_element e) {
-    o << static_cast<std::underlying_type_t<indexable_element>>(e);
-    return o;
+inline auto format_as(indexable_element e) {
+    return fmt::underlying(e);
 }
 
 class summary_entry {
@@ -237,8 +236,6 @@ private:
     unsigned _summary_index_pos = 0;
 };
 using summary = summary_ka;
-
-class file_writer;
 
 struct metadata {
     virtual ~metadata() {}
@@ -492,7 +489,8 @@ enum sstable_feature : uint8_t {
     CorrectStaticCompact = 3, // See #4139
     CorrectEmptyCounters = 4, // See #4363
     CorrectUDTsInCollections = 5, // See #6130
-    End = 6,
+    CorrectLastPiBlockWidth = 6,
+    End = 7,
 };
 
 // Scylla-specific features enabled for a particular sstable.
@@ -535,6 +533,8 @@ enum class scylla_metadata_type : uint32_t {
     SSTableOrigin = 6,
     ScyllaBuildId = 7,
     ScyllaVersion = 8,
+    ExtTimestampStats = 9,
+    SSTableIdentifier = 10,
 };
 
 // UUID is used for uniqueness across nodes, such that an imported sstable
@@ -546,6 +546,19 @@ struct run_identifier {
 
     template <typename Describer>
     auto describe_type(sstable_version_types v, Describer f) { return f(id); }
+};
+
+using sstable_id = utils::tagged_uuid<struct sstable_id_tag>;
+
+// UUID is used for uniqueness across nodes, such that an imported sstable
+// will not have its identifier conflicted with the one of a local sstable.
+// The identifier is initialized using the sstable UUID generation, if available,
+// or a time-UUID otherwise.
+struct sstable_identifier_type {
+    sstable_id value;
+
+    template <typename Describer>
+    auto describe_type(sstable_version_types v, Describer f) { return f(value); }
 };
 
 // Types of large data statistics.
@@ -569,12 +582,23 @@ struct large_data_stats_entry {
     auto describe_type(sstable_version_types v, Describer f) { return f(max_value, threshold, above_threshold); }
 };
 
+// Types of extended timestamp statistics.
+//
+// Note: For extensibility, never reuse an identifier,
+// only add new ones, since these are stored on stable storage.
+enum class ext_timestamp_stats_type : uint32_t {
+    min_live_timestamp = 1,
+    min_live_row_marker_timestamp = 2,
+};
+
 struct scylla_metadata {
     using extension_attributes = disk_hash<uint32_t, disk_string<uint32_t>, disk_string<uint32_t>>;
     using large_data_stats = disk_hash<uint32_t, large_data_type, large_data_stats_entry>;
     using sstable_origin = disk_string<uint32_t>;
     using scylla_build_id = disk_string<uint32_t>;
     using scylla_version = disk_string<uint32_t>;
+    using ext_timestamp_stats = disk_hash<uint32_t, ext_timestamp_stats_type, int64_t>;
+    using sstable_identifier = sstable_identifier_type;
 
     disk_set_of_tagged_union<scylla_metadata_type,
             disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::Sharding, sharding_metadata>,
@@ -584,7 +608,9 @@ struct scylla_metadata {
             disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::LargeDataStats, large_data_stats>,
             disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::SSTableOrigin, sstable_origin>,
             disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::ScyllaBuildId, scylla_build_id>,
-            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::ScyllaVersion, scylla_version>
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::ScyllaVersion, scylla_version>,
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::ExtTimestampStats, ext_timestamp_stats>,
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::SSTableIdentifier, sstable_identifier>
             > data;
 
     sstable_enabled_features get_features() const {
@@ -600,6 +626,9 @@ struct scylla_metadata {
     const extension_attributes* get_extension_attributes() const {
         return data.get<scylla_metadata_type::ExtensionAttributes, extension_attributes>();
     }
+    void remove_extension_attributes() {
+        data.data.erase(scylla_metadata_type::ExtensionAttributes);
+    }
     extension_attributes& get_or_create_extension_attributes() {
         auto* ext = data.get<scylla_metadata_type::ExtensionAttributes, extension_attributes>();
         if (ext == nullptr) {
@@ -612,6 +641,13 @@ struct scylla_metadata {
         auto* m = data.get<scylla_metadata_type::RunIdentifier, run_identifier>();
         return m ? std::make_optional(m->id) : std::nullopt;
     }
+    const ext_timestamp_stats* get_ext_timestamp_stats() const {
+        return data.get<scylla_metadata_type::ExtTimestampStats, ext_timestamp_stats>();
+    }
+    sstable_id get_optional_sstable_identifier() const {
+        auto* sid = data.get<scylla_metadata_type::SSTableIdentifier, scylla_metadata::sstable_identifier>();
+        return sid ? sid->value : sstable_id::create_null_id();
+    }
 
     template <typename Describer>
     auto describe_type(sstable_version_types v, Describer f) { return f(data); }
@@ -620,9 +656,19 @@ struct scylla_metadata {
 static constexpr int DEFAULT_CHUNK_SIZE = 65536;
 
 // checksums are generated using adler32 algorithm.
-struct checksum {
+struct checksum : public weakly_referencable<checksum>, enable_lw_shared_from_this<checksum> {
     uint32_t chunk_size;
     utils::chunked_vector<uint32_t> checksums;
+
+    checksum()
+            : chunk_size(0)
+            , checksums()
+    {}
+
+    explicit checksum(uint32_t chunk_size, utils::chunked_vector<uint32_t> checksums)
+            : chunk_size(chunk_size)
+            , checksums(std::move(checksums))
+    {}
 
     template <typename Describer>
     auto describe_type(sstable_version_types v, Describer f) { return f(chunk_size, checksums); }
@@ -785,3 +831,12 @@ public:
 };
 }
 
+template <>
+struct fmt::formatter<sstables::deletion_time> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const sstables::deletion_time& dt, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(),
+                              "{{timestamp={}, deletion_time={}}}",
+                              dt.marked_for_delete_at, dt.marked_for_delete_at);
+    }
+};

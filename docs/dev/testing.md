@@ -38,6 +38,20 @@ If you want to run only a specific test:
 
     $ ./test.py suitename/testname
 
+This will select and run all tests having suitename/testname as substring,
+e.g. suitename/testname_ext and others.
+
+If you want to run only a specific test-case from a specific test:
+
+    $ ./test.py suitename/testname::casename
+
+This will select only the test with the suitename/testname name, no
+substring search is performed in this case. If the casename is `*`, then
+all test-cases will be selected.
+
+Note that not all tests are divided into cases. Below sections will
+shed more light on this.
+
 Build artefacts, such as test output and harness output is stored
 in `./testlog`. Scylla data files are stored in `/tmp`.
 
@@ -117,6 +131,10 @@ The same unit test can be run in different seastar configurations, i.e. with
 different command line arguments. The custom arguments can be set in
 `custom_args` key of the `suite.yaml` file.
 
+Tests from boost suite are divided into test-cases. These are top-level
+functions wrapped by `BOOST_AUTO_TEST_CASE`, `SEASTAR_TEST_CASE` or alike.
+Boost tests support `suitename/testname::casename` selection described above.
+
 ### Debugging unit tests
 
 If a test fails, its log can be found in `testlog/${mode}/testname.log`.
@@ -136,11 +154,15 @@ test writers don't need to create or cleanup connections or keyspaces.
 down the server when all tests  using it end.
 
 Note that some suites have a convenience helper script called `run`. Find
-more information about it in [test/cql-pytest](../../test/cql-pytest/README.md) and [test/alternator](../../test/alternator/README.md).
+more information about it in [test/cqlpy](../../test/cqlpy/README.md) and [test/alternator](../../test/alternator/README.md).
+
+All tests in pytest suites consist of test-cases -- top-level functions
+starting with test_ -- and thus support the `suitename/testname::casename`
+selection described above.
 
 ## Sharing and pooling servers
 
-Since there can be many pytests in a single directory (e.g. cql-pytest)
+Since there can be many pytests in a single directory (e.g. cqlpy)
 `test.py` creates multiple servers to parallelize their execution.
 Each server is also shared among many tests, to save on setup/teardown
 steps. While this speeds up execution, sharing servers complicates debugging
@@ -167,16 +189,16 @@ A typical debugging journey should start with looking at `test.py.log` in
 to server log and pytest output.
 
 To extend `test.py` logging, you can use the standard 'logging' module API.
-Individual pytests are programmed to not gobble stdout, so you can can also
+Individual pytests are programmed to not gobble stdout, so you can also
 add prints to pytests, and they will end up in the test' log.
 
-For example, imagine `cql-pytest/test_null.py` fails. The relevant lines
+For example, imagine `cqlpy/test_null.py` fails. The relevant lines
 in `test.py.log` will be:
 
 ```
 21:53:04.789 INFO> Created cluster {127.101.161.1}
 21:53:04.790 INFO> Leasing Scylla cluster {127.101.161.1} for test test_null.1
-21:53:04.790 INFO> Starting test test_null.1: pytest --host=127.101.161.1 -s ...test/cql-pytest/test_null.py
+21:53:04.790 INFO> Starting test test_null.1: pytest --host=127.101.161.1 -s ...test/cqlpy/test_null.py
 21:53:05.533 INFO> Test test_null.1 failed
 ```
 To find out the working directory of instance 127.101.161.1 search
@@ -253,7 +275,7 @@ operations and can clean up resources, including added
 servers, when tests end.
 `test.py` automatically detects if a cluster can not be shared with a
 subsequent test because it was manipulated with. Today the check
-is quite simple: any cluster that has has nodes added or removed,
+is quite simple: any cluster that has nodes added or removed,
 started or stopped, even if it ended up in the same state
 as it was at the beginning of the test, is considered "dirty".
 Such clusters are not returned to the pool, but destroyed, and
@@ -276,9 +298,36 @@ Jenkins in event of test failure.
 ## Stability
 
 Testing is hard. Testing ScyllaDB is even harder, but we strive to ensure our testing
-suite is as solid as possible. The first step is contribuing a stable (read: non-flaky) test.
+suite is as solid as possible. The first step is contributing a stable (read: non-flaky) test.
 To do so, when developing tests, please run them (1) in debug mode and (2) 100 times in a row (using `--repeat 100`),
 and see that they pass successfully.
+
+## Allure reporting
+
+To make analyzing of the test results more convenient, an allure reporting tool is introduced.
+Python module allure-pytest is included in the toolchain image and an additional parameter added to gather allure
+data for the test run.
+However, the allure binary is not a part of the toolchain image.
+So to have the full benefit of the new reporting tool allure binary should be installed locally.
+
+### Allure installation
+
+To install allure tool, please follow [official documentation](https://allurereport.org/docs/install-for-linux/)
+
+**Note:** rpm package requires dependency `default-jre-headless` but on Fedora 38,39 none of the packages provides it.
+So manual installation of allure is required.
+
+### Basic allure usage
+
+1. Open directory with the Junit xml test results, e.g. testlog/dev/xml
+2. Execute allure serve to show report
+```shell
+$ allure serve -h localhost .
+```
+This will open the default system browser with an interactive allure report.
+
+For more information please refer to `allure -h` or [official documentation](https://allurereport.org/docs/)
+
 
 ## See also
 

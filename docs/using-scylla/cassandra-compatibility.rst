@@ -5,9 +5,9 @@ ScyllaDB and Apache Cassandra Compatibility
 ScyllaDB is a drop-in replacement for Apache Cassandra 3.11, with additional features from Apache Cassandra 4.0.
 This page contains information about ScyllaDB compatibility with Apache Cassandra. 
 
-The tables on this page include information about ScyllaDB Open Source support for Apache Cassandra features. 
-They do not include the ScyllaDB Enterprise-only features or ScyllaDB-specific features with no match in 
-Apache Cassandra.  See :doc:`ScyllaDB Features </using-scylla/features>` for more information about ScyllaDB features.
+The tables on this page include information about ScyllaDB support for Apache Cassandra features. 
+They do not include the ScyllaDB-specific features with no match in 
+Apache Cassandra.  See :doc:`ScyllaDB Features </features/index>` for more information about ScyllaDB features.
 
 How to Read the Tables on This Page
 -------------------------------------
@@ -30,13 +30,14 @@ Interfaces
      - | Fully compatible with version 3.3.1, with additional features from later CQL versions (for example, :ref:`Duration type <durations>`).
        | Fully compatible with protocol v4, with additional features from v5.
      - More below
-   * - Thrift 
-     - Deprecated in ScyllaDB and Cassandra
-     - Support for the Thrift protocol is deprecated and will be dropped in future releases of ScyllaDB. 
+   * - Thrift
+     - Not supported anymore in ScyllaDB 6.0
+     - | deprecated in Apache Cassandra and got dropped in 4.0
+       | deprecated in ScyllaDB 5.2 and got dropped in 6.0
    * - SSTable format (all versions)
      - 3.11(mc / md / me), 2.2(la), 2.1.8 (ka)
-     - | ``me`` - supported in ScyllaDB Open Source 5.1 and ScyllaDB Enterprise 2022.2.0 (and later)
-       | ``md`` - supported in ScyllaDB Open Source 4.3 and ScyllaDB Enterprise 2021.1.0 (and later)
+     - | ``me`` - supported in ScyllaDB 2022.2.0 and later
+       | ``md`` - supported in ScyllaDB 2021.1.0 and later
        
 
    * - JMX   
@@ -99,7 +100,7 @@ Consistency Level (read and write)
 | LOCAL_SERIAL                        | |v|:sup:`*`  |
 +-------------------------------------+--------------+
 
-:sup:`*` See :doc:`Scylla LWT </using-scylla/lwt>`.
+:sup:`*` See :doc:`ScyllaDB LWT </features/lwt>`.
 
 
 Snitches
@@ -196,7 +197,7 @@ Repair and Consistency
 +----------------------------------------------------------------------+--------------+
 |:doc:`Hinted Handoff </architecture/anti-entropy/hinted-handoff>`     | |v|          |
 +----------------------------------------------------------------------+--------------+
-|:doc:`Lightweight Transactions </using-scylla/lwt>`                   |  |v|         |
+|:doc:`Lightweight Transactions </features/lwt>`                       |  |v|         |
 +----------------------------------------------------------------------+--------------+
 
 
@@ -229,9 +230,9 @@ Indexing and Caching
 +--------------------------------------------------------------+--------------------------------------------------------------------------------------+
 |   Options                                                    | Support                                                                              |
 +==============================================================+======================================================================================+
-|:doc:`Secondary Index </using-scylla/secondary-indexes>`      | |v|                                                                                  |
+|:doc:`Secondary Index </features/secondary-indexes>`          | |v|                                                                                  |
 +--------------------------------------------------------------+--------------------------------------------------------------------------------------+
-|:doc:`Materialized Views </using-scylla/materialized-views>`  |  |v|                                                                                 |
+|:doc:`Materialized Views </features/materialized-views>`      |  |v|                                                                                 |
 +--------------------------------------------------------------+--------------------------------------------------------------------------------------+
 
 
@@ -325,8 +326,6 @@ Create Table Att
 +-----------------------------------+-------------------------------------+
 |compression                        | |v|                                 |
 +-----------------------------------+-------------------------------------+
-|dclocal_read_repair_chance         ||v|                                  |
-+-----------------------------------+-------------------------------------+
 |default_time_to_live               ||v|                                  |
 +-----------------------------------+-------------------------------------+
 | gc_grace_seconds                  ||v|                                  |
@@ -340,8 +339,6 @@ Create Table Att
 | min_index_interval                ||v|                                  |
 +-----------------------------------+-------------------------------------+
 |populate_io_cache_on_flush         | |x|                                 |
-+-----------------------------------+-------------------------------------+
-|read_repair_chance                 ||v|                                  |
 +-----------------------------------+-------------------------------------+
 |replicate_on_write                 | |x|                                 |
 +-----------------------------------+-------------------------------------+

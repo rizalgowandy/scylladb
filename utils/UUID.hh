@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 // This class is the parts of java.util.UUID that we need
@@ -17,9 +17,8 @@
 #include <compare>
 
 #include <seastar/core/sstring.hh>
-#include <seastar/core/print.hh>
-#include <seastar/net/byteorder.hh>
-#include "bytes.hh"
+#include "bytes_fwd.hh"
+#include "utils/assert.hh"
 #include "utils/hashing.hh"
 #include "utils/serialization.hh"
 
@@ -35,9 +34,9 @@ public:
         : most_sig_bits(most_sig_bits), least_sig_bits(least_sig_bits) {}
 
     // May throw marshal_exception is failed to parse uuid string.
-    explicit UUID(const sstring& uuid_string) : UUID(sstring_view(uuid_string)) { }
-    explicit UUID(const char * s) : UUID(sstring_view(s)) {}
-    explicit UUID(sstring_view uuid_string);
+    explicit UUID(const sstring& uuid_string) : UUID(std::string_view(uuid_string)) { }
+    explicit UUID(const char * s) : UUID(std::string_view(s)) {}
+    explicit UUID(std::string_view uuid_string);
 
     int64_t get_most_significant_bits() const noexcept {
         return most_sig_bits;
@@ -57,7 +56,7 @@ public:
         //if (version() != 1) {
         //     throw new UnsupportedOperationException("Not a time-based UUID");
         //}
-        assert(is_timestamp());
+        SCYLLA_ASSERT(is_timestamp());
 
         return ((most_sig_bits & 0xFFF) << 48) |
                (((most_sig_bits >> 16) & 0xFFFF) << 32) |
@@ -66,10 +65,6 @@ public:
     }
 
     friend ::fmt::formatter<UUID>;
-
-    sstring to_sstring() const {
-        return fmt::to_string(*this);
-    }
 
     friend std::ostream& operator<<(std::ostream& out, const UUID& uuid);
 
@@ -116,6 +111,10 @@ public:
         serialize_int64(out, least_sig_bits);
     }
 };
+
+// Convert the uuid to a uint32_t using xor.
+// It is useful to get a uint32_t number from the uuid.
+uint32_t uuid_xor_to_uint32(const UUID& uuid);
 
 inline constexpr UUID null_uuid() noexcept {
     return UUID();
@@ -219,7 +218,7 @@ struct tagged_uuid {
     }
 
     sstring to_sstring() const {
-        return id.to_sstring();
+        return fmt::to_string(id);
     }
 };
 } // namespace utils
@@ -265,7 +264,7 @@ std::ostream& operator<<(std::ostream& os, const utils::tagged_uuid<Tag>& id) {
 } // namespace std
 
 template <>
-struct fmt::formatter<utils::UUID> : fmt::formatter<std::string_view> {
+struct fmt::formatter<utils::UUID> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const utils::UUID& id, FormatContext& ctx) const {
         // This matches Java's UUID.toString() actual implementation. Note that
@@ -281,7 +280,7 @@ struct fmt::formatter<utils::UUID> : fmt::formatter<std::string_view> {
 };
 
 template <typename Tag>
-struct fmt::formatter<utils::tagged_uuid<Tag>> : fmt::formatter<std::string_view> {
+struct fmt::formatter<utils::tagged_uuid<Tag>> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const utils::tagged_uuid<Tag>& id, FormatContext& ctx) const {
         return fmt::format_to(ctx.out(), "{}", id.id);

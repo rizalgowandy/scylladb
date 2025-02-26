@@ -3,18 +3,21 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <boost/algorithm/string/join.hpp>
-#include <boost/range/algorithm/sort.hpp>
+#include <algorithm>
+
 #include <boost/range/algorithm/unique.hpp>
 
+#include <seastar/coroutine/maybe_yield.hh>
+
 #include "cql3/cql3_type.hh"
+#include "cql3/description.hh"
 #include "mutation/mutation.hh"
-#include "mutation/mutation_fragment.hh"
 #include "schema/schema_builder.hh"
 #include "test/lib/cql_test_env.hh"
+#include "test/lib/eventually.hh"
 #include "test/lib/random_schema.hh"
 #include "test/lib/random_utils.hh"
 #include "types/list.hh"
@@ -22,8 +25,10 @@
 #include "types/set.hh"
 #include "types/tuple.hh"
 #include "types/user.hh"
+#include "utils/assert.hh"
 #include "utils/big_decimal.hh"
 #include "utils/UUID_gen.hh"
+#include "replica/schema_describe_helper.hh"
 
 namespace tests {
 
@@ -111,7 +116,11 @@ data_type type_generator::operator()(std::mt19937& engine, is_multi_cell multi_c
     //
     // To cover all this, we simply disallow it altogether when multi_cell is
     // no, which will be the case in all the above cases.
-    while (!multi_cell && type == duration_type) {
+    //
+    // We also disallow boolean type in keys, due to the poor value distribution
+    // it provides. Generating keys which have a boolean in it, are prone to
+    // collision and will result in poor cardinality.
+    while (!multi_cell && (type == duration_type || type == boolean_type)) {
         type = (*this)(engine, multi_cell);
     }
     return type;
@@ -127,6 +136,7 @@ class default_random_schema_specification : public random_schema_specification {
     std::uniform_int_distribution<size_t> _regular_column_count_dist;
     std::uniform_int_distribution<size_t> _static_column_count_dist;
     type_generator _type_generator;
+    compress_sstable _compress;
 
 private:
     static unsigned generate_unique_id(std::mt19937& engine, std::unordered_set<unsigned>& used_ids) {
@@ -167,15 +177,16 @@ public:
             std::uniform_int_distribution<size_t> partition_column_count_dist,
             std::uniform_int_distribution<size_t> clustering_column_count_dist,
             std::uniform_int_distribution<size_t> regular_column_count_dist,
-            std::uniform_int_distribution<size_t> static_column_count_dist)
+            std::uniform_int_distribution<size_t> static_column_count_dist,
+            compress_sstable compress)
         : random_schema_specification(std::move(keyspace_name))
         , _partition_column_count_dist(partition_column_count_dist)
         , _clustering_column_count_dist(clustering_column_count_dist)
         , _regular_column_count_dist(regular_column_count_dist)
         , _static_column_count_dist(static_column_count_dist)
-        , _type_generator(*this) {
-        assert(_partition_column_count_dist.a() > 0);
-        assert(_regular_column_count_dist.a() > 0);
+        , _type_generator(*this)
+        , _compress(compress) {
+        SCYLLA_ASSERT(_partition_column_count_dist.a() > 0);
     }
     virtual sstring table_name(std::mt19937& engine) override {
         return format("table{}", generate_unique_id(engine, _used_table_ids));
@@ -195,6 +206,9 @@ public:
     virtual std::vector<data_type> static_columns(std::mt19937& engine) override {
         return generate_types(engine, _static_column_count_dist, type_generator::is_multi_cell::yes, false);
     }
+    virtual compress_sstable& compress() override {
+        return _compress;
+    }
 };
 
 } // anonymous namespace
@@ -204,9 +218,10 @@ std::unique_ptr<random_schema_specification> make_random_schema_specification(
         std::uniform_int_distribution<size_t> partition_column_count_dist,
         std::uniform_int_distribution<size_t> clustering_column_count_dist,
         std::uniform_int_distribution<size_t> regular_column_count_dist,
-        std::uniform_int_distribution<size_t> static_column_count_dist) {
+        std::uniform_int_distribution<size_t> static_column_count_dist,
+        random_schema_specification::compress_sstable compress) {
     return std::make_unique<default_random_schema_specification>(std::move(keyspace_name), partition_column_count_dist, clustering_column_count_dist,
-            regular_column_count_dist, static_column_count_dist);
+            regular_column_count_dist, static_column_count_dist, compress);
 }
 
 namespace {
@@ -444,7 +459,7 @@ data_value generate_utf8_value(std::mt19937& engine, size_t min_size_in_bytes, s
     char* to_next;
     std::mbstate_t mb{};
     auto res = f.out(mb, &wstr[0], &wstr[wstr.size()], from_next, &utf8_str[0], &utf8_str[utf8_str.size()], to_next);
-    assert(res == codec::ok);
+    SCYLLA_ASSERT(res == codec::ok);
     utf8_str.resize(to_next - &utf8_str[0]);
 
     return data_value(std::move(utf8_str));
@@ -510,44 +525,44 @@ data_value generate_duration_value(std::mt19937& engine, size_t, size_t) {
 }
 
 data_value generate_frozen_tuple_value(std::mt19937& engine, const tuple_type_impl& type, value_generator& val_gen, size_t min_size_in_bytes, size_t max_size_in_bytes) {
-    assert(!type.is_multi_cell());
+    SCYLLA_ASSERT(!type.is_multi_cell());
     return make_tuple_value(type.shared_from_this(), generate_frozen_tuple_values(engine, val_gen, type.all_types(), min_size_in_bytes, max_size_in_bytes));
 }
 
 data_value generate_frozen_user_value(std::mt19937& engine, const user_type_impl& type, value_generator& val_gen, size_t min_size_in_bytes, size_t max_size_in_bytes) {
-    assert(!type.is_multi_cell());
+    SCYLLA_ASSERT(!type.is_multi_cell());
     return make_user_value(type.shared_from_this(), generate_frozen_tuple_values(engine, val_gen, type.all_types(), min_size_in_bytes, max_size_in_bytes));
 }
 
 data_model::mutation_description::collection generate_list_value(std::mt19937& engine, const list_type_impl& type, value_generator& val_gen) {
-    assert(type.is_multi_cell());
+    SCYLLA_ASSERT(type.is_multi_cell());
     return generate_collection(engine, *type.name_comparator(), *type.value_comparator(), val_gen);
 }
 
 data_value generate_frozen_list_value(std::mt19937& engine, const list_type_impl& type, value_generator& val_gen, size_t min_size_in_bytes, size_t max_size_in_bytes) {
-    assert(!type.is_multi_cell());
+    SCYLLA_ASSERT(!type.is_multi_cell());
     return make_list_value(type.shared_from_this(),
             generate_frozen_list(engine, *type.get_elements_type(), val_gen, min_size_in_bytes, max_size_in_bytes));
 }
 
 data_model::mutation_description::collection generate_set_value(std::mt19937& engine, const set_type_impl& type, value_generator& val_gen) {
-    assert(type.is_multi_cell());
+    SCYLLA_ASSERT(type.is_multi_cell());
     return generate_collection(engine, *type.name_comparator(), *type.value_comparator(), val_gen);
 }
 
 data_value generate_frozen_set_value(std::mt19937& engine, const set_type_impl& type, value_generator& val_gen, size_t min_size_in_bytes, size_t max_size_in_bytes) {
-    assert(!type.is_multi_cell());
+    SCYLLA_ASSERT(!type.is_multi_cell());
     return make_set_value(type.shared_from_this(),
             generate_frozen_set(engine, *type.get_elements_type(), val_gen, min_size_in_bytes, max_size_in_bytes));
 }
 
 data_model::mutation_description::collection generate_map_value(std::mt19937& engine, const map_type_impl& type, value_generator& val_gen) {
-    assert(type.is_multi_cell());
+    SCYLLA_ASSERT(type.is_multi_cell());
     return generate_collection(engine, *type.name_comparator(), *type.value_comparator(), val_gen);
 }
 
 data_value generate_frozen_map_value(std::mt19937& engine, const map_type_impl& type, value_generator& val_gen, size_t min_size_in_bytes, size_t max_size_in_bytes) {
-    assert(!type.is_multi_cell());
+    SCYLLA_ASSERT(!type.is_multi_cell());
     return make_map_value(type.shared_from_this(),
             generate_frozen_map(engine, *type.get_keys_type(), *type.get_values_type(), val_gen, min_size_in_bytes, max_size_in_bytes));
 }
@@ -559,7 +574,7 @@ data_value value_generator::generate_atomic_value(std::mt19937& engine, const ab
 }
 
 data_value value_generator::generate_atomic_value(std::mt19937& engine, const abstract_type& type, size_t min_size_in_bytes, size_t max_size_in_bytes) {
-    assert(!type.is_multi_cell());
+    SCYLLA_ASSERT(!type.is_multi_cell());
     return get_atomic_value_generator(type)(engine, min_size_in_bytes, max_size_in_bytes);
 }
 
@@ -593,7 +608,7 @@ value_generator::value_generator()
 }
 
 size_t value_generator::min_size(const abstract_type& type) {
-    assert(!type.is_multi_cell());
+    SCYLLA_ASSERT(!type.is_multi_cell());
 
     auto it = _regular_value_min_sizes.find(&type);
     if (it != _regular_value_min_sizes.end()) {
@@ -630,7 +645,7 @@ size_t value_generator::min_size(const abstract_type& type) {
 }
 
 value_generator::atomic_value_generator value_generator::get_atomic_value_generator(const abstract_type& type) {
-    assert(!type.is_multi_cell());
+    SCYLLA_ASSERT(!type.is_multi_cell());
 
     auto it = _regular_value_generators.find(&type);
     if (it != _regular_value_generators.end()) {
@@ -754,6 +769,43 @@ timestamp_generator default_timestamp_generator() {
     };
 }
 
+timestamp_generator uncompactible_timestamp_generator(uint32_t seed) {
+    auto engine = std::mt19937(seed);
+
+    const auto rank = [] (timestamp_destination dest) -> api::timestamp_type {
+        switch (dest) {
+            case timestamp_destination::partition_tombstone:
+                return 0;
+            case timestamp_destination::range_tombstone:
+                return 1;
+            case timestamp_destination::row_tombstone:
+                return 2;
+            case timestamp_destination::collection_tombstone:
+                return 3;
+            case timestamp_destination::row_marker:
+            case timestamp_destination::cell_timestamp:
+            case timestamp_destination::collection_cell_timestamp:
+                return 4;
+        }
+    };
+    const auto max_rank = rank(timestamp_destination::collection_cell_timestamp);
+    const auto margin = 1000;
+    std::vector<api::timestamp_type> points;
+    points.push_back(api::min_timestamp);
+    for (api::timestamp_type i = 0; i < max_rank; ++i) {
+        const auto remaining_ranks = max_rank - i;
+        const auto point = std::uniform_int_distribution<api::timestamp_type>(points.back() + margin, api::max_timestamp - (remaining_ranks * margin))(engine);
+        points.push_back(point);
+    }
+    points.push_back(api::max_timestamp);
+
+    return [rank, points] (std::mt19937& engine, timestamp_destination destination, api::timestamp_type min_timestamp) {
+        const auto r = rank(destination);
+        auto ts_dist = std::uniform_int_distribution<api::timestamp_type>(points.at(r), points.at(r + 1) - 1);
+        return ts_dist(engine);
+    };
+}
+
 expiry_generator no_expiry_expiry_generator() {
     return [] (std::mt19937& engine, timestamp_destination destination) -> std::optional<expiry_info> {
         return std::nullopt;
@@ -767,7 +819,7 @@ schema_ptr build_random_schema(uint32_t seed, random_schema_specification& spec)
     auto builder = schema_builder(spec.keyspace_name(), spec.table_name(engine));
 
     auto pk_columns = spec.partition_key_columns(engine);
-    assert(!pk_columns.empty()); // Let's not pull in boost::test here
+    SCYLLA_ASSERT(!pk_columns.empty()); // Let's not pull in boost::test here
     for (size_t pk = 0; pk < pk_columns.size(); ++pk) {
         builder.with_column(to_bytes(format("pk{}", pk)), std::move(pk_columns[pk]), column_kind::partition_key);
     }
@@ -785,18 +837,19 @@ schema_ptr build_random_schema(uint32_t seed, random_schema_specification& spec)
     }
 
     const auto regular_columns = spec.regular_columns(engine);
-    assert(!regular_columns.empty()); // Let's not pull in boost::test here
     for (size_t r = 0; r < regular_columns.size(); ++r) {
         builder.with_column(to_bytes(format("v{}", r)), std::move(regular_columns[r]), column_kind::regular_column);
     }
 
+    if (spec.compress() == random_schema_specification::compress_sstable::no) {
+        builder.set_compressor_params(compression_parameters::no_compression());
+    }
     return builder.build();
 }
 
 sstring udt_to_str(const user_type_impl& udt) {
-    std::stringstream ss;
-    udt.describe(ss);
-    return ss.str();
+    auto udt_desc = udt.describe(cql3::with_create_statement::yes);
+    return *udt_desc.create_statement;
 }
 
 struct udt_list {
@@ -842,8 +895,9 @@ std::vector<const user_type_impl*> dump_udts(const schema& schema) {
     udt_list udts;
 
     const auto cdefs_to_types = [] (const schema::const_iterator_range_type& cdefs) -> std::vector<data_type> {
-        return boost::copy_range<std::vector<data_type>>(cdefs |
-                boost::adaptors::transformed([] (const column_definition& cdef) { return cdef.type; }));
+        return cdefs
+               | std::views::transform([] (const column_definition& cdef) { return cdef.type; })
+               | std::ranges::to<std::vector>();
     };
 
     udts.merge(dump_udts(cdefs_to_types(schema.partition_key_columns())));
@@ -908,7 +962,7 @@ void decorate_with_timestamps(const schema& schema, std::mt19937& engine, timest
                         }
                         for (auto& [ key, value ] : c.elements) {
                             value.timestamp = ts_gen(engine, timestamp_destination::collection_cell_timestamp, c.tomb.timestamp);
-                            assert(!c.tomb || value.timestamp > c.tomb.timestamp);
+                            SCYLLA_ASSERT(!c.tomb || value.timestamp > c.tomb.timestamp);
                             if (auto expiry_opt = exp_gen(engine, timestamp_destination::collection_cell_timestamp)) {
                                 value.expiring = data_model::mutation_description::expiry_info{expiry_opt->ttl, expiry_opt->expiry_point};
                             }
@@ -938,7 +992,7 @@ data_model::mutation_description::key random_schema::make_partition_key(uint32_t
 }
 
 data_model::mutation_description::key random_schema::make_clustering_key(uint32_t n, value_generator& gen) const {
-    assert(_schema->clustering_key_size() > 0);
+    SCYLLA_ASSERT(_schema->clustering_key_size() > 0);
     return make_key(n, gen, _schema->clustering_key_columns(), std::numeric_limits<clustering_key::compound::element_type::size_type>::max());
 }
 
@@ -951,8 +1005,8 @@ sstring random_schema::cql() const {
 
     sstring udts_str;
     if (!udts.empty()) {
-        udts_str = boost::algorithm::join(udts |
-                boost::adaptors::transformed([] (const user_type_impl* const udt) { return udt_to_str(*udt); }), "\n");
+        udts_str = seastar::format("{}", fmt::join(udts |
+                std::views::transform([] (const user_type_impl* const udt) { return udt_to_str(*udt); }), "\n"));
     }
 
     std::vector<sstring> col_specs;
@@ -961,22 +1015,22 @@ sstring random_schema::cql() const {
         std::move(cols.begin(), cols.end(), std::back_inserter(col_specs));
     }
 
-    sstring primary_key;
+    std::string primary_key;
     auto partition_column_names = column_names(_schema, column_kind::partition_key);
     auto clustering_key_names = column_names(_schema, column_kind::clustering_key);
     if (!clustering_key_names.empty()) {
-        primary_key = format("({}), {}", boost::algorithm::join(partition_column_names, ", "), boost::algorithm::join(clustering_key_names, ", "));
+        primary_key = fmt::format("({}), {}", fmt::join(partition_column_names, ", "), fmt::join(clustering_key_names, ", "));
     } else {
-        primary_key = format("{}", boost::algorithm::join(partition_column_names, ", "));
+        primary_key = fmt::format("{}", fmt::join(partition_column_names, ", "));
     }
 
     // FIXME include the clustering column orderings
-    return format(
+    return seastar::format(
             "{}\nCREATE TABLE {}.{} (\n\t{}\n\tPRIMARY KEY ({}))",
             udts_str,
             _schema->ks_name(),
             _schema->cf_name(),
-            boost::algorithm::join(col_specs, ",\n\t"),
+            fmt::join(col_specs, ",\n\t"),
             primary_key);
 }
 
@@ -995,8 +1049,9 @@ std::vector<data_model::mutation_description::key> random_schema::make_pkeys(siz
         ++i;
     }
 
-    return boost::copy_range<std::vector<data_model::mutation_description::key>>(keys |
-            boost::adaptors::transformed([] (const dht::decorated_key& dkey) { return dkey.key().explode(); }));
+    return keys
+        | std::views::transform([] (const dht::decorated_key& dkey) { return dkey.key().explode(); })
+        | std::ranges::to<std::vector<data_model::mutation_description::key>>();
 }
 
 data_model::mutation_description::key random_schema::make_ckey(uint32_t n) {
@@ -1012,8 +1067,9 @@ std::vector<data_model::mutation_description::key> random_schema::make_ckeys(siz
         keys.emplace(clustering_key::from_exploded(make_clustering_key(i, val_gen)));
     }
 
-    return boost::copy_range<std::vector<data_model::mutation_description::key>>(keys |
-            boost::adaptors::transformed([] (const clustering_key& ckey) { return ckey.explode(); }));
+    return keys
+        | std::views::transform([] (const clustering_key& ckey) { return ckey.explode(); })
+        | std::ranges::to<std::vector<data_model::mutation_description::key>>();
 }
 
 data_model::mutation_description random_schema::new_mutation(data_model::mutation_description::key pkey) {
@@ -1072,7 +1128,7 @@ void random_schema::add_static_row(std::mt19937& engine, data_model::mutation_de
 void random_schema::delete_range(
         std::mt19937& engine,
         data_model::mutation_description& md,
-        nonwrapping_range<data_model::mutation_description::key> range,
+        interval<data_model::mutation_description::key> range,
         timestamp_generator ts_gen,
         expiry_generator exp_gen) {
     auto expiry_opt = exp_gen(engine, timestamp_destination::range_tombstone);
@@ -1096,10 +1152,10 @@ future<> random_schema::create_with_cql(cql_test_env& env) {
 
         auto& db = env.local_db();
 
-        std::stringstream ss;
-        _schema->describe(db, ss, false);
+        replica::schema_describe_helper describe_helper{db.as_data_dictionary()};
+        auto schema_desc = _schema->describe(describe_helper, cql3::describe_option::STMTS);
 
-        env.execute_cql(ss.str()).get();
+        env.execute_cql(*schema_desc.create_statement).get();
         auto& tbl = db.find_column_family(ks_name, tbl_name);
 
         _schema = tbl.schema();
@@ -1144,14 +1200,14 @@ future<std::vector<mutation>> generate_random_mutations(
             random_schema.delete_range(
                     engine,
                     mut,
-                    nonwrapping_range<tests::data_model::mutation_description::key>::make(ckeys.at(std::min(a, b)), ckeys.at(std::max(a, b))),
+                    interval<tests::data_model::mutation_description::key>::make(ckeys.at(std::min(a, b)), ckeys.at(std::max(a, b))),
                     ts_gen,
                     exp_gen);
             co_await coroutine::maybe_yield();
         }
         muts.emplace_back(mut.build(random_schema.schema()));
     }
-    boost::sort(muts, [s = random_schema.schema()] (const mutation& a, const mutation& b) {
+    std::ranges::sort(muts, [s = random_schema.schema()] (const mutation& a, const mutation& b) {
             return a.decorated_key().less_compare(*s, b.decorated_key());
             });
     auto range = boost::unique(muts, [s = random_schema.schema()] (const mutation& a, const mutation& b) {

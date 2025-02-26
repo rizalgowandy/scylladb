@@ -3,16 +3,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #define BOOST_TEST_MODULE core
 
 #include <boost/test/unit_test.hpp>
-#include <boost/algorithm/cxx11/any_of.hpp>
-#include <boost/range/irange.hpp>
 #include <vector>
 #include <random>
+#include <ranges>
 
 #include "utils/dynamic_bitset.hh"
 
@@ -168,18 +167,18 @@ static void test_random_ops(size_t size, std::default_random_engine& re ) {
                 auto bit = bit_dist(re);
                 auto next = db.find_next_set(bit);
                 if (next == db.npos) {
-                    require(!boost::algorithm::any_of(boost::irange<size_t>(bit+1, size), is_set));
+                    require(!std::ranges::any_of(std::views::iota(bit+1, size), is_set));
                 } else {
-                    require(!boost::algorithm::any_of(boost::irange<size_t>(bit+1, next), is_set));
+                    require(!std::ranges::any_of(std::views::iota(bit+1, next), is_set));
                     require(is_set(next));
                 }
                 break;            }
             case 4: {
                 auto next = db.find_first_set();
                 if (next == db.npos) {
-                    require(!boost::algorithm::any_of(boost::irange<size_t>(0, size), is_set));
+                    require(!std::ranges::any_of(std::views::iota(0u, size), is_set));
                 } else {
-                    require(!boost::algorithm::any_of(boost::irange<size_t>(0, next), is_set));
+                    require(!std::ranges::any_of(std::views::iota(0u, next), is_set));
                     require(is_set(next));
                 }
                 break;
@@ -187,9 +186,9 @@ static void test_random_ops(size_t size, std::default_random_engine& re ) {
             case 5: {
                 auto next = db.find_last_set();
                 if (next == db.npos) {
-                    require(!boost::algorithm::any_of(boost::irange<size_t>(0, size), is_set));
+                    require(!std::ranges::any_of(std::views::iota(0u, size), is_set));
                 } else {
-                    require(!boost::algorithm::any_of(boost::irange<size_t>(next + 1, size), is_set));
+                    require(!std::ranges::any_of(std::views::iota(next + 1, size), is_set));
                     require(is_set(next));
                 }
                 break;

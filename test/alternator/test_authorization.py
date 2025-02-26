@@ -1,14 +1,16 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for authorization
 
-import pytest
-import botocore
-from botocore.exceptions import ClientError
 import boto3
+import pytest
 import requests
+from botocore.exceptions import ClientError
+
+from test.alternator.test_manual_requests import get_signed_request
+
 
 # Test that trying to perform an operation signed with a wrong key
 # will not succeed
@@ -40,7 +42,7 @@ def test_expired_signature(dynamodb, test_table):
     headers = {'Content-Type': 'application/x-amz-json-1.0',
                'X-Amz-Date': '20170101T010101Z',
                'X-Amz-Target': 'DynamoDB_20120810.DescribeEndpoints',
-               'Authorization': 'AWS4-HMAC-SHA256 Credential=alternator/2/3/4/aws4_request SignedHeaders=x-amz-date;host Signature=123'
+               'Authorization': 'AWS4-HMAC-SHA256 Credential=cassandra/2/3/4/aws4_request SignedHeaders=x-amz-date;host Signature=123'
     }
     response = requests.post(url, headers=headers, verify=False)
     assert not response.ok
@@ -67,7 +69,7 @@ def test_signature_too_futuristic(dynamodb, test_table):
     headers = {'Content-Type': 'application/x-amz-json-1.0',
                'X-Amz-Date': '30200101T010101Z',
                'X-Amz-Target': 'DynamoDB_20120810.DescribeEndpoints',
-               'Authorization': 'AWS4-HMAC-SHA256 Credential=alternator/2/3/4/aws4_request SignedHeaders=x-amz-date;host Signature=123'
+               'Authorization': 'AWS4-HMAC-SHA256 Credential=cassandra/2/3/4/aws4_request SignedHeaders=x-amz-date;host Signature=123'
     }
     response = requests.post(url, headers=headers, verify=False)
     assert not response.ok
@@ -79,7 +81,6 @@ def test_authorization_no_whitespace(dynamodb, test_table):
     # Unlike the above tests which checked error cases so didn't need to
     # calculate a real signature, in this test we really a correct signature,
     # so we use a function we already have in test_manual_requests.py.
-    from test_manual_requests import get_signed_request
     payload = '{"TableName": "' + test_table.name + '", "Item": {"p": {"S": "x"}, "c": {"S": "x"}}}'
     req = get_signed_request(dynamodb, 'PutItem', payload)
     # Boto3 separates the components of the Authorization header by spaces.

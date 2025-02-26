@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -21,3 +21,9 @@ class stream_state;
 using plan_id = utils::tagged_uuid<struct plan_id_tag>;
 
 } // namespace streaming
+
+namespace service {
+
+using session_id = utils::tagged_uuid<struct session_id_tag>;
+
+}

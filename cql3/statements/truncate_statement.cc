@@ -5,9 +5,10 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
+#include "utils/assert.hh"
 #include "cql3/statements/raw/truncate_statement.hh"
 #include "cql3/statements/truncate_statement.hh"
 #include "cql3/statements/prepared_statement.hh"
@@ -30,8 +31,8 @@ truncate_statement::truncate_statement(cf_name name, std::unique_ptr<attributes:
 {
     // Validate the attributes.
     // Currently, TRUNCATE supports only USING TIMEOUT
-    assert(!_attrs->timestamp.has_value());
-    assert(!_attrs->time_to_live.has_value());
+    SCYLLA_ASSERT(!_attrs->timestamp.has_value());
+    SCYLLA_ASSERT(!_attrs->time_to_live.has_value());
 }
 
 std::unique_ptr<prepared_statement> truncate_statement::prepare(data_dictionary::database db, cql_stats& stats) {
@@ -40,7 +41,7 @@ std::unique_ptr<prepared_statement> truncate_statement::prepare(data_dictionary:
     auto ctx = get_prepare_context();
     prepared_attributes->fill_prepare_context(ctx);
     auto stmt = ::make_shared<cql3::statements::truncate_statement>(std::move(schema), std::move(prepared_attributes));
-    return std::make_unique<prepared_statement>(std::move(stmt));
+    return std::make_unique<prepared_statement>(audit_info(), std::move(stmt));
 }
 
 } // namespace raw
@@ -84,9 +85,6 @@ future<> truncate_statement::check_access(query_processor& qp, const service::cl
 void truncate_statement::validate(query_processor&, const service::client_state& state) const
 {
     warn(unimplemented::cause::VALIDATION);
-#if 0
-    ThriftValidation.validateColumnFamily(keyspace(), columnFamily());
-#endif
 }
 
 future<::shared_ptr<cql_transport::messages::result_message>>
@@ -101,6 +99,10 @@ truncate_statement::execute(query_processor& qp, service::query_state& state, co
     }).then([] {
         return ::shared_ptr<cql_transport::messages::result_message>{};
     });
+}
+
+audit::statement_category raw::truncate_statement::category() const {
+    return audit::statement_category::DML;
 }
 
 db::timeout_clock::duration truncate_statement::get_timeout(const service::client_state& state, const query_options& options) const {

@@ -3,18 +3,21 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "resource_manager.hh"
+#include "gms/inet_address.hh"
+#include "locator/token_metadata.hh"
 #include "manager.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include <boost/range/algorithm/for_each.hpp>
-#include <boost/range/adaptor/map.hpp>
+#include <boost/range/numeric.hpp>
 #include "utils/disk-error-handler.hh"
 #include "seastarx.hh"
 #include <seastar/core/sleep.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/when_all.hh>
 #include "utils/div_ceil.hh"
 #include "utils/lister.hh"
 
@@ -35,7 +38,7 @@ future<bool> is_mountpoint(const fs::path& path) {
         return make_ready_future<bool>(true);
     }
     return when_all(get_device_id(path), get_device_id(path.parent_path())).then([](std::tuple<future<dev_t>, future<dev_t>> ids) {
-        return std::get<0>(ids).get0() != std::get<1>(ids).get0();
+        return std::get<0>(ids).get() != std::get<1>(ids).get();
     });
 }
 
@@ -91,28 +94,25 @@ future<> space_watchdog::stop() noexcept {
 }
 
 // Called under the end_point_hints_manager::file_update_mutex() of the corresponding end_point_hints_manager instance.
-future<> space_watchdog::scan_one_ep_dir(fs::path path, manager& shard_manager, ep_key_type ep_key) {
-    return do_with(std::move(path), [this, ep_key, &shard_manager] (fs::path& path) {
-        // It may happen that we get here and the directory has already been deleted in the context of manager::drain_for().
-        // In this case simply bail out.
-        return file_exists(path.native()).then([this, ep_key, &shard_manager, &path] (bool exists) {
-            if (!exists) {
-                return make_ready_future<>();
-            } else {
-                return lister::scan_dir(path, lister::dir_entry_types::of<directory_entry_type::regular>(), [this, ep_key, &shard_manager] (fs::path dir, directory_entry de) {
-                    // Put the current end point ID to state.eps_with_pending_hints when we see the second hints file in its directory
-                    if (_files_count == 1) {
-                        shard_manager.add_ep_with_pending_hints(ep_key);
-                    }
-                    ++_files_count;
+future<> space_watchdog::scan_one_ep_dir(fs::path path, manager& shard_manager,
+        std::optional<std::variant<locator::host_id, gms::inet_address>> maybe_ep_key) {
+    // It may happen that we get here and the directory has already been deleted in the context of manager::drain_for().
+    // In this case simply bail out.
+    if (!co_await file_exists(path.native())) {
+        co_return;
+    }
 
-                    return io_check(file_size, (dir / de.name.c_str()).c_str()).then([this] (uint64_t fsize) {
-                        _total_size += fsize;
-                    });
-                });
-            }
-        });
-    });
+    co_await lister::scan_dir(path, lister::dir_entry_types::of<directory_entry_type::regular>(),
+            coroutine::lambda([this, maybe_ep_key, &shard_manager] (fs::path dir, directory_entry de) -> future<> {
+        // Put the current end point ID to state.eps_with_pending_hints when we see the second hints file in its directory
+        if (maybe_ep_key && _files_count == 1) {
+            shard_manager.add_ep_with_pending_hints(*maybe_ep_key);
+        }
+        ++_files_count;
+
+        const auto filename = (std::move(dir) / std::move(de.name)).native();
+        _total_size += co_await io_check(file_size, filename);
+    }));
 }
 
 // Called from the context of a seastar::thread.
@@ -134,7 +134,7 @@ void space_watchdog::on_timer() {
     //    |  |- ...
     //
 
-    for (auto& per_device_limits : _per_device_limits_map | boost::adaptors::map_values) {
+    for (auto& per_device_limits : _per_device_limits_map | std::views::values) {
         _total_size = 0;
         for (manager& shard_manager : per_device_limits.managers) {
             shard_manager.clear_eps_with_pending_hints();
@@ -146,14 +146,43 @@ void space_watchdog::on_timer() {
                 // not hintable).
                 // If exists - let's take a file update lock so that files are not changed under our feet. Otherwise, simply
                 // continue to enumeration - there is no one to change them.
-                const internal::endpoint_id ep{de.name};
+                auto maybe_variant = std::invoke([&] () -> std::optional<std::variant<locator::host_id, gms::inet_address>> {
+                    try {
+                        const auto hid_or_ep = locator::host_id_or_endpoint{de.name};
 
-                if (shard_manager.have_ep_manager(ep)) {
-                    return shard_manager.with_file_update_mutex_for(ep, [this, &shard_manager, dir = std::move(dir), ep_name = std::move(de.name)] () mutable {
-                        return scan_one_ep_dir(dir / ep_name, shard_manager, ep_key_type(ep_name));
+                        // If hinted handoff is host-ID-based, hint directories representing IP addresses must've
+                        // been created by mistake and they're invalid. The same for pre-host-ID hinted handoff
+                        // -- hint directories representing host IDs are NOT valid.
+                        if (hid_or_ep.has_host_id() && shard_manager.uses_host_id()) {
+                            return std::variant<locator::host_id, gms::inet_address>(hid_or_ep.id());
+                        } else if (hid_or_ep.has_endpoint() && !shard_manager.uses_host_id()) {
+                            return std::variant<locator::host_id, gms::inet_address>(hid_or_ep.endpoint());
+                        } else {
+                            return std::nullopt;
+                        }
+                    } catch (...) {
+                        return std::nullopt;
+                    }
+                });
+
+                // Case 1: The directory is managed by an endpoint manager.
+                if (maybe_variant && shard_manager.have_ep_manager(*maybe_variant)) {
+                    const auto variant = *maybe_variant;
+                    return shard_manager.with_file_update_mutex_for(variant, [this, variant, &shard_manager, dir = std::move(dir), ep_name = std::move(de.name)] () mutable {
+                        return scan_one_ep_dir(dir / ep_name, shard_manager, variant);
                     });
-                } else {
-                    return scan_one_ep_dir(dir / de.name, shard_manager, ep_key_type(de.name));
+                }
+                // Case 2: The directory isn't managed by an endpoint manager, but it represents either an IP address,
+                //         or a host ID.
+                else if (maybe_variant) {
+                    return scan_one_ep_dir(dir / de.name, shard_manager, *maybe_variant);
+                }
+                // Case 3: The directory isn't managed by an endpoint manager, and it represents neither an IP address,
+                //         nor a host ID.
+                else {
+                    // We use trace here to prevent flooding logs with unnecessary information.
+                    resource_manager_logger.trace("Encountered a hint directory of invalid name while scanning: {}", de.name);
+                    return scan_one_ep_dir(dir / de.name, shard_manager, {});
                 }
             }).get();
         }
@@ -174,7 +203,7 @@ void space_watchdog::on_timer() {
     }
 }
 
-future<> resource_manager::start(shared_ptr<gms::gossiper> gossiper_ptr) {
+future<> resource_manager::start(shared_ptr<const gms::gossiper> gossiper_ptr) {
     _gossiper_ptr = std::move(gossiper_ptr);
 
     return with_semaphore(_operation_lock, 1, [this] () {

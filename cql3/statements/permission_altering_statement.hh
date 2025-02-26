@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -20,7 +20,7 @@ class role_name;
 
 namespace statements {
 
-class permission_altering_statement : public authorization_statement {
+class permission_altering_statement : public authorization_altering_statement {
 protected:
     auth::permission_set _permissions;
     mutable auth::resource _resource;

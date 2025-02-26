@@ -1,13 +1,16 @@
 #
 # Copyright (C) 2022-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 # This file configures pytest for all tests in this directory, and also
 # defines common test fixtures for all of them to use
-
+import pathlib
 import ssl
-from typing import List
+import platform
+import urllib.parse
+from functools import partial
+from typing import List, Optional, Dict
 from test.pylib.random_tables import RandomTables
 from test.pylib.util import unique_name
 from test.pylib.manager_client import ManagerClient, IPAddress
@@ -24,6 +27,7 @@ from cassandra.policies import TokenAwarePolicy                          # type:
 from cassandra.policies import WhiteListRoundRobinPolicy                 # type: ignore
 from cassandra.connection import DRIVER_NAME       # type: ignore # pylint: disable=no-name-in-module
 from cassandra.connection import DRIVER_VERSION    # type: ignore # pylint: disable=no-name-in-module
+from cassandra.connection import EndPoint          # type: ignore # pylint: disable=no-name-in-module
 
 
 Session.run_async = run_async     # patch Session for convenience
@@ -37,8 +41,6 @@ print(f"Driver name {DRIVER_NAME}, version {DRIVER_VERSION}")
 def pytest_addoption(parser):
     parser.addoption('--manager-api', action='store', required=True,
                      help='Manager unix socket path')
-    parser.addoption('--mode', action='store', required=True,
-                     help='Scylla build mode. Tests can use it to adjust their behavior.')
     parser.addoption('--host', action='store', default='localhost',
                      help='CQL server host to connect to')
     parser.addoption('--port', action='store', default='9042',
@@ -49,11 +51,14 @@ def pytest_addoption(parser):
                         help='username for authentication')
     parser.addoption('--auth_password', action='store', default=None,
                         help='password for authentication')
+    parser.addoption('--artifacts_dir_url', action='store', type=str, default=None, dest='artifacts_dir_url',
+                     help='Provide the URL to artifacts directory to generate the link to failed tests directory '
+                          'with logs')
 
 
-# This is a constant used in `pytest_runtest_makereport` below to store a flag
-# indicating test failure in a stash which can then be accessed from fixtures.
-FAILED_KEY = pytest.StashKey[bool]()
+# This is a constant used in `pytest_runtest_makereport` below to store the full report for the test case
+# in a stash which can then be accessed from fixtures to print the stacktrace for the failed test
+PHASE_REPORT_KEY = pytest.StashKey[Dict[str, pytest.CollectReport]]()
 
 
 @pytest.hookimpl(tryfirst=True, hookwrapper=True)
@@ -67,7 +72,8 @@ def pytest_runtest_makereport(item, call):
     """
     outcome = yield
     report = outcome.get_result()
-    item.stash[FAILED_KEY] = report.when == "call" and report.failed
+
+    item.stash[PHASE_REPORT_KEY] = report
 
 
 conn_logger = logging.getLogger("conn_messages")
@@ -84,12 +90,12 @@ class CustomConnection(Cluster.connection_class):
 
 
 # cluster_con helper: set up client object for communicating with the CQL API.
-def cluster_con(hosts: List[IPAddress], port: int, use_ssl: bool, auth_provider=None):
+def cluster_con(hosts: List[IPAddress | EndPoint], port: int, use_ssl: bool, auth_provider=None, load_balancing_policy=RoundRobinPolicy()):
     """Create a CQL Cluster connection object according to configuration.
        It does not .connect() yet."""
     assert len(hosts) > 0, "python driver connection needs at least one host to connect to"
     profile = ExecutionProfile(
-        load_balancing_policy=RoundRobinPolicy(),
+        load_balancing_policy=load_balancing_policy,
         consistency_level=ConsistencyLevel.LOCAL_QUORUM,
         serial_consistency_level=ConsistencyLevel.LOCAL_SERIAL,
         # The default timeouts should have been more than enough, but in some
@@ -148,7 +154,7 @@ def cluster_con(hosts: List[IPAddress], port: int, use_ssl: bool, auth_provider=
 
 @pytest.fixture(scope="session")
 async def manager_internal(event_loop, request):
-    """Session fixture to set up client object for communicating with the Cluster API.
+    """Session fixture to prepare client object for communicating with the Cluster API.
        Pass the Unix socket path where the Manager server API is listening.
        Pass a function to create driver connections.
        Test cases (functions) should not use this fixture.
@@ -161,52 +167,63 @@ async def manager_internal(event_loop, request):
         auth_provider = PlainTextAuthProvider(username=auth_username, password=auth_password)
     else:
         auth_provider = None
-    manager_int = ManagerClient(request.config.getoption('manager_api'), port, use_ssl, auth_provider, cluster_con)
+    manager_int = partial(ManagerClient, request.config.getoption('manager_api'), port, use_ssl, auth_provider, cluster_con)
     yield manager_int
-    await manager_int.stop()  # Stop client session and close driver after last test
+
 
 @pytest.fixture(scope="function")
-async def manager(request, manager_internal):
+async def manager(request, manager_internal, record_property, build_mode):
     """Per test fixture to notify Manager client object when tests begin so it can
     perform checks for cluster state.
     """
     test_case_name = request.node.name
-    await manager_internal.before_test(test_case_name)
-    yield manager_internal
-    # `request.node.stash` contains a flag stored in `pytest_runtest_makereport`
-    # that indicates test failure.
-    failed = request.node.stash[FAILED_KEY]
-    await manager_internal.after_test(test_case_name, not failed)
+    run_id = request.config.getoption('run_id')
+    tmp_dir = pathlib.Path(request.config.getoption('tmpdir'))
+    xml_path: pathlib.Path = pathlib.Path(request.config.getoption('xmlpath'))
+    suite_testpy_log = (tmp_dir /
+                        build_mode /
+                        f"{pathlib.Path(xml_path.stem).stem}.log"
+                        )
+    test_log = suite_testpy_log.parent / f"{suite_testpy_log.stem}.{test_case_name}.log"
+    # this should be consistent with scylla_cluster.py handler name in _before_test method
+    test_py_log_test = suite_testpy_log.parent / f"{suite_testpy_log.stem}_{test_case_name}_cluster.log"
+
+    manager_client = manager_internal()  # set up client object in fixture with scope function
+    await manager_client.before_test(test_case_name, test_log)
+    yield manager_client
+    # `request.node.stash` contains a report stored in `pytest_runtest_makereport` from where we can retrieve
+    # test failure.
+    report = request.node.stash[PHASE_REPORT_KEY]
+    failed = report.when == "call" and report.failed
+    if failed:
+        # Save scylladb logs for failed tests in a separate directory and copy XML report to the same directory to have
+        # all related logs in one dir.
+        # Then add property to the XML report with the path to the directory, so it can be visible in Jenkins
+        failed_test_dir_path = tmp_dir / build_mode / "failed_test" / f"{test_case_name}"
+        failed_test_dir_path.mkdir(parents=True, exist_ok=True)
+        await manager_client.gather_related_logs(
+            failed_test_dir_path,
+            {'pytest.log': test_log, 'test_py.log': test_py_log_test}
+        )
+        with open(failed_test_dir_path / f"stacktrace", 'w') as f:
+            f.write(report.longreprtext)
+        if request.config.getoption('artifacts_dir_url') is not None:
+            # get the relative path to the tmpdir for the failed directory
+            dir_path_relative = f"{failed_test_dir_path.as_posix()[failed_test_dir_path.as_posix().find('testlog'):]}"
+            full_url = urllib.parse.urljoin(request.config.getoption('artifacts_dir_url') + '/',
+                                            urllib.parse.quote(dir_path_relative))
+            record_property("TEST_LOGS", f"<a href={full_url}>failed_test_logs</a>")
+
+    cluster_status = await manager_client.after_test(test_case_name, not failed)
+    await manager_client.stop()  # Stop client session and close driver after each test
+    if cluster_status["server_broken"]:
+        pytest.fail(f"test case {test_case_name} leave unfinished tasks on Scylla server. Server marked as broken, server_broken_reason: {cluster_status["message"]}")
 
 # "cql" fixture: set up client object for communicating with the CQL API.
 # Since connection is managed by manager just return that object
 @pytest.fixture(scope="function")
 def cql(manager):
     yield manager.cql
-
-# Consistent schema change feature is optionally enabled and
-# some tests are expected to fail on Scylla without this
-# option enabled, and pass with it enabled (and also pass on Cassandra).
-# These tests should use the "fails_without_consistent_cluster_management"
-# fixture. When consistent mode becomes the default, this fixture can be removed.
-@pytest.fixture(scope="function")
-def check_pre_consistent_cluster_management(manager):
-    # If not running on Scylla, return false.
-    names = [row.table_name for row in manager.cql.execute(
-            "SELECT * FROM system_schema.tables WHERE keyspace_name = 'system'")]
-    if not any('scylla' in name for name in names):
-        return False
-    # In Scylla, we check Raft mode by inspecting the configuration via CQL.
-    consistent = list(manager.cql.execute("SELECT value FROM system.config WHERE name = 'consistent_cluster_management'"))
-    return len(consistent) == 0 or consistent[0].value == "false"
-
-
-@pytest.fixture(scope="function")
-def fails_without_consistent_cluster_management(request, check_pre_consistent_cluster_management):
-    if check_pre_consistent_cluster_management:
-        request.node.add_marker(pytest.mark.xfail(reason="Test expected to fail without consistent cluster management "
-                                                         "feature on"))
-
 
 # "random_tables" fixture: Creates and returns a temporary RandomTables object
 # used in tests to make schema changes. Tables are dropped after test finishes
@@ -215,7 +232,10 @@ def fails_without_consistent_cluster_management(request, check_pre_consistent_cl
 async def random_tables(request, manager):
     rf_marker = request.node.get_closest_marker("replication_factor")
     replication_factor = rf_marker.args[0] if rf_marker is not None else 3  # Default 3
-    tables = RandomTables(request.node.name, manager, unique_name(), replication_factor)
+    enable_tablets = request.node.get_closest_marker("enable_tablets")
+    enable_tablets = enable_tablets.args[0] if enable_tablets is not None else None
+    tables = RandomTables(request.node.name, manager, unique_name(),
+                          replication_factor, None, enable_tablets)
     yield tables
 
     # Don't drop tables at the end if we failed or the cluster is dirty - it may be impossible
@@ -224,23 +244,24 @@ async def random_tables(request, manager):
     # The cluster will be marked as dirty if the test failed, but that happens
     # at the end of `manager` fixture which we depend on (so these steps will be
     # executed after us) - so at this point, we need to check for failure ourselves too.
-    failed = request.node.stash[FAILED_KEY]
+    report = request.node.stash[PHASE_REPORT_KEY]
+    failed = report.when == "call" and report.failed
     if not failed and not await manager.is_dirty():
         tables.drop_all()
 
-@pytest.fixture(scope="function")
-def mode(request):
-    return request.config.getoption('mode')
-
 skipped_funcs = {}
-def skip_mode(mode: str, reason: str):
+# Can be used to mark a test to be skipped for a specific mode=[release, dev, debug]
+# The reason to skip a test should be specified, used as a comment only.
+# Additionally, platform_key can be specified to limit the scope of the attribute
+# to the specified platform. Example platform_key-s: [aarch64, x86_64]
+def skip_mode(mode: str, reason: str, platform_key: Optional[str]=None):
     def wrap(func):
-        skipped_funcs[(func, mode)] = reason
+        skipped_funcs.setdefault((func, mode), []).append((reason, platform_key))
         return func
     return wrap
 
 @pytest.fixture(scope="function", autouse=True)
-def skip_mode_fixture(request, mode):
-    skip_reason = skipped_funcs.get((request.function, mode))
-    if skip_reason is not None:
-        pytest.skip(f'{request.node.name} skipped, reason: {skip_reason}')
+def skip_mode_fixture(request, build_mode):
+    for reason, platform_key in skipped_funcs.get((request.function, build_mode), []):
+        if platform_key is None or platform_key in platform.platform():
+            pytest.skip(f'{request.node.name} skipped, reason: {reason}')

@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -13,24 +13,28 @@
 #include "locator/host_id.hh"
 #include "service/session.hh"
 #include "dht/i_partitioner_fwd.hh"
+#include "dht/token-sharding.hh"
+#include "dht/ring_position.hh"
 #include "schema/schema_fwd.hh"
 #include "utils/chunked_vector.hh"
 #include "utils/hash.hh"
+#include "utils/UUID.hh"
 
-#include <boost/range/adaptor/transformed.hpp>
+#include <ranges>
 #include <seastar/core/reactor.hh>
 #include <seastar/util/log.hh>
-#include <seastar/core/coroutine.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/util/noncopyable_function.hh>
-#include <seastar/coroutine/maybe_yield.hh>
-
-#include <vector>
 
 namespace locator {
+
+class topology;
 
 extern seastar::logger tablet_logger;
 
 using token = dht::token;
+
+using tablet_task_id = utils::tagged_uuid<struct tablet_task_id_tag>;
 
 // Identifies tablet within the scope of a single tablet_map,
 // which has a scope of (table_id, token metadata version).
@@ -43,7 +47,7 @@ struct tablet_id {
     explicit tablet_id(size_t id) : id(id) {}
     size_t value() const { return id; }
     explicit operator size_t() const { return id; }
-    bool operator<=>(const tablet_id&) const = default;
+    auto operator<=>(const tablet_id&) const = default;
 };
 
 /// Identifies tablet (not be confused with tablet replica) in the scope of the whole cluster.
@@ -51,18 +55,15 @@ struct global_tablet_id {
     table_id table;
     tablet_id tablet;
 
-    bool operator<=>(const global_tablet_id&) const = default;
+    auto operator<=>(const global_tablet_id&) const = default;
 };
 
 struct tablet_replica {
     host_id host;
     shard_id shard;
 
-    bool operator==(const tablet_replica&) const = default;
+    auto operator<=>(const tablet_replica&) const = default;
 };
-
-std::ostream& operator<<(std::ostream&, tablet_id);
-std::ostream& operator<<(std::ostream&, const tablet_replica&);
 
 using tablet_replica_set = utils::small_vector<tablet_replica, 3>;
 
@@ -115,6 +116,17 @@ tablet_replica_set replace_replica(const tablet_replica_set& rs, tablet_replica 
     return result;
 }
 
+/// Subtracts 'sub' from 'rs' and returns the result
+/// Replicas from 'sub' that are missing in 'rs' are ignored
+inline
+std::unordered_set<tablet_replica> substract_sets(const tablet_replica_set& rs, const tablet_replica_set& sub) {
+    std::unordered_set<tablet_replica> result(rs.begin(), rs.end());
+    for (auto&& r : sub) {
+        result.erase(r);
+    }
+    return result;
+}
+
 inline
 bool contains(const tablet_replica_set& rs, host_id host) {
     for (auto replica : rs) {
@@ -130,12 +142,62 @@ bool contains(const tablet_replica_set& rs, const tablet_replica& r) {
     return std::ranges::any_of(rs, [&] (auto&& r_) { return r_ == r; });
 }
 
+
+enum class tablet_task_type {
+    none,
+    user_repair,
+    auto_repair,
+    migration,
+    intranode_migration,
+    split,
+    merge
+};
+
+sstring tablet_task_type_to_string(tablet_task_type);
+tablet_task_type tablet_task_type_from_string(const sstring&);
+
+struct tablet_task_info {
+    tablet_task_type request_type = tablet_task_type::none;
+    locator::tablet_task_id tablet_task_id;
+    db_clock::time_point request_time;
+    int64_t sched_nr = 0;
+    db_clock::time_point sched_time;
+    std::unordered_set<locator::host_id> repair_hosts_filter;
+    std::unordered_set<sstring> repair_dcs_filter;
+    bool operator==(const tablet_task_info&) const = default;
+    bool is_valid() const;
+    bool is_user_repair_request() const;
+    static tablet_task_info make_user_repair_request(std::unordered_set<locator::host_id> hosts_filter = {}, std::unordered_set<sstring> dcs_filter = {});
+    static tablet_task_info make_auto_repair_request(std::unordered_set<locator::host_id> hosts_filter = {}, std::unordered_set<sstring> dcs_filter = {});
+    static tablet_task_info make_migration_request();
+    static tablet_task_info make_intranode_migration_request();
+    static tablet_task_info make_split_request();
+    static tablet_task_info make_merge_request();
+    static sstring serialize_repair_hosts_filter(std::unordered_set<locator::host_id> filter);
+    static sstring serialize_repair_dcs_filter(std::unordered_set<sstring> filter);
+    static std::unordered_set<locator::host_id> deserialize_repair_hosts_filter(sstring filter);
+    static std::unordered_set<sstring> deserialize_repair_dcs_filter(sstring filter);
+};
+
 /// Stores information about a single tablet.
 struct tablet_info {
     tablet_replica_set replicas;
+    db_clock::time_point repair_time;
+    locator::tablet_task_info repair_task_info;
+    locator::tablet_task_info migration_task_info;
+
+    tablet_info() = default;
+    tablet_info(tablet_replica_set, db_clock::time_point, tablet_task_info, tablet_task_info);
+    tablet_info(tablet_replica_set);
 
     bool operator==(const tablet_info&) const = default;
 };
+
+// Merges tablet_info b into a, but with following constraints:
+//  - they cannot have active repair task, since each task has a different id
+//  - their replicas must be all co-located.
+// If tablet infos are mergeable, merged info is returned. Otherwise, nullopt.
+std::optional<tablet_info> merge_tablet_info(tablet_info a, tablet_info b);
 
 /// Represents states of the tablet migration state machine.
 ///
@@ -157,15 +219,37 @@ enum class tablet_transition_stage {
     write_both_read_new,
     use_new,
     cleanup,
+    cleanup_target,
+    revert_migration,
     end_migration,
+    repair,
+    end_repair,
+};
+
+enum class tablet_transition_kind {
+    // Tablet replica is migrating from one shard to another.
+    // The new replica is (tablet_transition_info::next - tablet_info::replicas).
+    // The leaving replica is (tablet_info::replicas - tablet_transition_info::next).
+    migration,
+
+    // Like migration, but the new pending replica is on the same host as leaving replica.
+    intranode_migration,
+
+    // New tablet replica is replacing a dead one.
+    // The new replica is (tablet_transition_info::next - tablet_info::replicas).
+    // The leaving replica is (tablet_info::replicas - tablet_transition_info::next).
+    rebuild,
+
+    // Repair the tablet replicas
+    repair,
 };
 
 sstring tablet_transition_stage_to_string(tablet_transition_stage);
 tablet_transition_stage tablet_transition_stage_from_string(const sstring&);
+sstring tablet_transition_kind_to_string(tablet_transition_kind);
+tablet_transition_kind tablet_transition_kind_from_string(const sstring&);
 
-enum class write_replica_set_selector {
-    previous, both, next
-};
+using write_replica_set_selector = dht::write_replica_set_selector;
 
 enum class read_replica_set_selector {
     previous, next
@@ -175,28 +259,147 @@ enum class read_replica_set_selector {
 /// Describes transition of a single tablet.
 struct tablet_transition_info {
     tablet_transition_stage stage;
+    tablet_transition_kind transition;
     tablet_replica_set next;
-    tablet_replica pending_replica; // Optimization (next - tablet_info::replicas)
+    std::optional<tablet_replica> pending_replica; // Optimization (next - tablet_info::replicas)
     service::session_id session_id;
     write_replica_set_selector writes;
     read_replica_set_selector reads;
 
-    tablet_transition_info(tablet_transition_stage stage, tablet_replica_set next, tablet_replica pending_replica,
+    tablet_transition_info(tablet_transition_stage stage,
+                           tablet_transition_kind kind,
+                           tablet_replica_set next,
+                           std::optional<tablet_replica> pending_replica,
                            service::session_id session_id = {});
 
     bool operator==(const tablet_transition_info&) const = default;
 };
 
 // Returns the leaving replica for a given transition.
-tablet_replica get_leaving_replica(const tablet_info&, const tablet_transition_info&);
+std::optional<tablet_replica> get_leaving_replica(const tablet_info&, const tablet_transition_info&);
+
+/// Represents intention to move a single tablet replica from src to dst.
+struct tablet_migration_info {
+    locator::tablet_transition_kind kind;
+    locator::global_tablet_id tablet;
+    locator::tablet_replica src;
+    locator::tablet_replica dst;
+};
+
+/// Returns the replica set which will become the replica set of the tablet after executing a given tablet transition.
+tablet_replica_set get_new_replicas(const tablet_info&, const tablet_migration_info&);
+tablet_replica_set get_primary_replicas(const tablet_info&, const tablet_transition_info*);
+tablet_transition_info migration_to_transition_info(const tablet_info&, const tablet_migration_info&);
 
 /// Describes streaming required for a given tablet transition.
+constexpr int tablet_migration_stream_weight_default = 1;
+constexpr int tablet_migration_stream_weight_repair = 2;
 struct tablet_migration_streaming_info {
     std::unordered_set<tablet_replica> read_from;
     std::unordered_set<tablet_replica> written_to;
+    // The stream_weight for repair migration is set to 2, because it requires
+    // more work than just moving the tablet around. The stream_weight for all
+    // other migrations are set to 1.
+    int stream_weight = tablet_migration_stream_weight_default;
 };
 
-tablet_migration_streaming_info get_migration_streaming_info(const tablet_info&, const tablet_transition_info&);
+tablet_migration_streaming_info get_migration_streaming_info(const locator::topology&, const tablet_info&, const tablet_transition_info&);
+tablet_migration_streaming_info get_migration_streaming_info(const locator::topology&, const tablet_info&, const tablet_migration_info&);
+bool tablet_has_excluded_node(const locator::topology& topo, const tablet_info& tinfo);
+
+// Describes if a given token is located at either left or right side of a tablet's range
+enum tablet_range_side {
+    left = 0,
+    right = 1,
+};
+
+// The decision of whether tablets of a given should be split, merged, or none, is made
+// by the load balancer. This decision is recorded in the tablet_map and stored in group0.
+struct resize_decision {
+    struct none {
+        auto operator<=>(const none&) const = default;
+    };
+    struct split {
+        auto operator<=>(const split&) const = default;
+    };
+    struct merge {
+        auto operator<=>(const merge&) const = default;
+    };
+    using way_type = std::variant<none, split, merge>;
+
+    using seq_number_t = int64_t;
+
+    way_type way;
+
+    // The sequence number globally identifies a resize decision.
+    // It's monotonically increasing, globally.
+    // Needed to distinguish stale decision from latest one, in case coordinator
+    // revokes the current decision and signal it again later.
+    seq_number_t sequence_number = 0;
+
+    resize_decision() = default;
+    resize_decision(sstring decision, uint64_t seq_number);
+    bool is_none() const {
+        return std::holds_alternative<resize_decision::none>(way);
+    }
+    bool split_or_merge() const {
+        return !is_none();
+    }
+    bool is_split() const {
+        return std::holds_alternative<resize_decision::split>(way);
+    }
+    bool is_merge() const {
+        return std::holds_alternative<resize_decision::merge>(way);
+    }
+    bool operator==(const resize_decision&) const;
+    sstring type_name() const;
+    seq_number_t next_sequence_number() const;
+};
+
+using resize_decision_way = resize_decision::way_type;
+
+struct table_load_stats {
+    uint64_t size_in_bytes = 0;
+    // Stores the minimum seq number among all replicas, as coordinator wants to know if
+    // all replicas have completed splitting, which happens when they all store the
+    // seq number of the current split decision.
+    resize_decision::seq_number_t split_ready_seq_number = std::numeric_limits<resize_decision::seq_number_t>::max();
+
+    table_load_stats& operator+=(const table_load_stats& s) noexcept;
+    friend table_load_stats operator+(table_load_stats a, const table_load_stats& b) {
+        return a += b;
+    }
+};
+
+struct load_stats {
+    std::unordered_map<table_id, table_load_stats> tables;
+
+    load_stats& operator+=(const load_stats& s);
+    friend load_stats operator+(load_stats a, const load_stats& b) {
+        return a += b;
+    }
+};
+
+struct repair_scheduler_config {
+    bool auto_repair_enabled = false;
+    // If the time since last repair is bigger than auto_repair_threshold
+    // seconds, the tablet is eligible for auto repair.
+    std::chrono::seconds auto_repair_threshold{10 * 24 * 3600};
+    bool operator==(const repair_scheduler_config&) const = default;
+};
+
+using load_stats_ptr = lw_shared_ptr<const load_stats>;
+
+struct tablet_desc {
+    tablet_id tid;
+    const tablet_info* info; // cannot be null.
+    const tablet_transition_info* transition; // null if there's no transition.
+};
+
+class no_such_tablet_map : public std::runtime_error {
+public:
+    no_such_tablet_map(const table_id& id);
+};
 
 /// Stores information about tablets of a single table.
 ///
@@ -224,6 +427,16 @@ private:
     tablet_container _tablets;
     size_t _log2_tablets; // log_2(_tablets.size())
     std::unordered_map<tablet_id, tablet_transition_info> _transitions;
+    resize_decision _resize_decision;
+    tablet_task_info _resize_task_info;
+    repair_scheduler_config _repair_scheduler_config;
+
+    /// Returns the largest token owned by tablet_id when the tablet_count is `1 << log2_tablets`.
+    dht::token get_last_token(tablet_id id, size_t log2_tablets) const;
+
+    /// Returns token_range which contains all tokens owned by the specified tablet
+    /// when the tablet_count is `1 << log2_tablets`.
+    dht::token_range get_token_range(tablet_id id, size_t log2_tablets) const;
 public:
     /// Constructs a tablet map.
     ///
@@ -232,6 +445,9 @@ public:
 
     /// Returns tablet_id of a tablet which owns a given token.
     tablet_id get_tablet_id(token) const;
+
+    // Returns tablet_id and also the side of the tablet's range that a given token belongs to.
+    std::pair<tablet_id, tablet_range_side> get_tablet_id_and_range_side(token) const;
 
     /// Returns tablet_info associated with a given tablet.
     /// The given id must belong to this instance.
@@ -254,6 +470,13 @@ public:
     /// \throws std::logic_error If the given id does not belong to this instance.
     dht::token_range get_token_range(tablet_id id) const;
 
+    /// Returns the primary replica for the tablet
+    tablet_replica get_primary_replica(tablet_id id) const;
+    tablet_replica get_primary_replica_within_dc(tablet_id id, const topology& topo, sstring dc) const;
+
+    /// Returns a vector of sorted last tokens for tablets.
+    future<std::vector<token>> get_sorted_tokens() const;
+
     /// Returns the id of the first tablet.
     tablet_id first_tablet() const {
         return tablet_id(0);
@@ -273,26 +496,37 @@ public:
         return tablet_id(size_t(t) + 1);
     }
 
-    /// Returns shard id which is a replica for a given tablet on a given host.
-    /// If there is no replica on a given host, returns nullopt.
-    /// If the topology is transitional, also considers the new replica set.
-    /// The old replica set is preferred in case of ambiguity.
-    std::optional<shard_id> get_shard(tablet_id, host_id) const;
+    // Returns the pair of sibling tablets for a given tablet id.
+    // For example, if id 1 is provided, a pair of 0 and 1 is returned.
+    // Returns disengaged optional when sibling pair cannot be found.
+    std::optional<std::pair<tablet_id, tablet_id>> sibling_tablets(tablet_id t) const;
+
+    /// Returns true iff tablet has a given replica.
+    /// If tablet is in transition, considers both previous and next replica set.
+    bool has_replica(tablet_id, tablet_replica) const;
 
     const tablet_container& tablets() const {
         return _tablets;
     }
 
     /// Calls a given function for each tablet in the map in token ownership order.
-    future<> for_each_tablet(seastar::noncopyable_function<void(tablet_id, const tablet_info&)> func) const;
+    future<> for_each_tablet(seastar::noncopyable_function<future<>(tablet_id, const tablet_info&)> func) const;
+
+    /// Calls a given function for each sibling tablet in the map in token ownership order.
+    /// If tablet count == 1, then there will be only one call and 2nd tablet_desc is disengaged.
+    future<> for_each_sibling_tablets(seastar::noncopyable_function<future<>(tablet_desc, std::optional<tablet_desc>)> func) const;
 
     const auto& transitions() const {
         return _transitions;
     }
 
+    bool has_transitions() const {
+        return !_transitions.empty();
+    }
+
     /// Returns an iterable range over tablet_id:s which includes all tablets in token ring order.
     auto tablet_ids() const {
-        return boost::irange<size_t>(0, tablet_count()) | boost::adaptors::transformed([] (size_t i) {
+        return std::views::iota(0u, tablet_count()) | std::views::transform([] (size_t i) {
             return tablet_id(i);
         });
     }
@@ -309,15 +543,29 @@ public:
     size_t external_memory_usage() const;
 
     bool operator==(const tablet_map&) const = default;
+
+    bool needs_split() const;
+    bool needs_merge() const;
+
+    /// Returns the token_range in which the given token will belong to after a tablet split
+    dht::token_range get_token_range_after_split(const token& t) const noexcept;
+
+    const locator::resize_decision& resize_decision() const;
+    const tablet_task_info& resize_task_info() const;
+    const locator::repair_scheduler_config& repair_scheduler_config() const;
 public:
     void set_tablet(tablet_id, tablet_info);
     void set_tablet_transition_info(tablet_id, tablet_transition_info);
+    void set_resize_decision(locator::resize_decision);
+    void set_resize_task_info(tablet_task_info);
+    void set_repair_scheduler_config(locator::repair_scheduler_config config);
+    void clear_tablet_transition_info(tablet_id);
     void clear_transitions();
 
     // Destroys gently.
     // The tablet map is not usable after this call and should be destroyed.
     future<> clear_gently();
-    friend std::ostream& operator<<(std::ostream&, const tablet_map&);
+    friend fmt::formatter<tablet_map>;
 private:
     void check_tablet_id(tablet_id) const;
 };
@@ -331,16 +579,15 @@ private:
 /// Copy constructor can be invoked across shards.
 class tablet_metadata {
 public:
-    // FIXME: Make cheap to copy.
     // We want both immutability and cheap updates, so we should use
     // hierarchical data structure with shared pointers and copy-on-write.
-    // Currently we have immutability but updates require full copy.
     //
     // Also, currently the copy constructor is invoked across shards, which precludes
     // using shared pointers. We should change that and use a foreign_ptr<> to
     // hold immutable tablet_metadata which lives on shard 0 only.
     // See storage_service::replicate_to_all_cores().
-    using table_to_tablet_map = std::unordered_map<table_id, tablet_map>;
+    using tablet_map_ptr = foreign_ptr<lw_shared_ptr<const tablet_map>>;
+    using table_to_tablet_map = std::unordered_map<table_id, tablet_map_ptr>;
 private:
     table_to_tablet_map _tablets;
 
@@ -350,31 +597,146 @@ public:
     bool balancing_enabled() const { return _balancing_enabled; }
     const tablet_map& get_tablet_map(table_id id) const;
     const table_to_tablet_map& all_tables() const { return _tablets; }
-    table_to_tablet_map& all_tables() { return _tablets; }
     size_t external_memory_usage() const;
+    bool has_replica_on(host_id) const;
 public:
+    tablet_metadata() = default;
+    // No implicit copy, use copy()
+    tablet_metadata(tablet_metadata&) = delete;
+    tablet_metadata& operator=(tablet_metadata&) = delete;
+    future<tablet_metadata> copy() const;
+    // Move is supported.
+    tablet_metadata(tablet_metadata&&) = default;
+    tablet_metadata& operator=(tablet_metadata&&) = default;
+
     void set_balancing_enabled(bool value) { _balancing_enabled = value; }
     void set_tablet_map(table_id, tablet_map);
-    tablet_map& get_tablet_map(table_id id);
+    void drop_tablet_map(table_id);
+
+    // Allow mutating a tablet_map
+    // Uses the copy-modify-swap idiom.
+    // If func throws, no changes are done to the tablet map.
+    void mutate_tablet_map(table_id, noncopyable_function<void(tablet_map&)> func);
+    future<> mutate_tablet_map_async(table_id, noncopyable_function<future<>(tablet_map&)> func);
+
     future<> clear_gently();
 public:
-    bool operator==(const tablet_metadata&) const = default;
-    friend std::ostream& operator<<(std::ostream&, const tablet_metadata&);
+    bool operator==(const tablet_metadata&) const;
+    friend fmt::formatter<tablet_metadata>;
 };
+
+// Check that all tablets which have replicas on this host, have a valid replica shard (< smp::count).
+future<bool> check_tablet_replica_shards(const tablet_metadata& tm, host_id this_host);
 
 struct tablet_routing_info {
     tablet_replica_set tablet_replicas;
     std::pair<dht::token, dht::token> token_range;
 };
 
+/// Split a list of ranges, such that conceptually each input range is
+/// intersected with each tablet range.
+/// Tablets are pre-filtered, selecting only tablets that have a replica on the
+/// given host.
+/// Return the resulting intersections, in order.
+/// The ranges are generated lazily (one at a time).
+///
+/// Note: the caller is expected to pin tablets, by keeping an
+/// effective-replication-map alive.
+class tablet_range_splitter {
+public:
+    struct range_split_result {
+        shard_id shard; // shard where the tablet owning this range lives
+        dht::partition_range range;
+    };
+
+private:
+    schema_ptr _schema;
+    const dht::partition_range_vector& _ranges;
+    dht::partition_range_vector::const_iterator _ranges_it;
+    std::vector<range_split_result> _tablet_ranges;
+    std::vector<range_split_result>::iterator _tablet_ranges_it;
+
+public:
+    tablet_range_splitter(schema_ptr schema, const tablet_map& tablets, host_id host, const dht::partition_range_vector& ranges);
+    /// Returns nullopt when there are no more ranges.
+    std::optional<range_split_result> operator()();
+};
+
+struct tablet_metadata_change_hint {
+    struct table_hint {
+        table_id table_id;
+        std::vector<token> tokens;
+
+        bool operator==(const table_hint&) const = default;
+    };
+    std::unordered_map<table_id, table_hint> tables;
+
+    bool operator==(const tablet_metadata_change_hint&) const = default;
+    explicit operator bool() const noexcept { return !tables.empty(); }
+};
+
 }
 
 template <>
-struct fmt::formatter<locator::tablet_transition_stage> : fmt::formatter<std::string_view> {
+struct fmt::formatter<locator::resize_decision_way> : fmt::formatter<string_view> {
+    auto format(const locator::resize_decision_way&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <>
+struct fmt::formatter<locator::tablet_transition_stage> : fmt::formatter<string_view> {
     auto format(const locator::tablet_transition_stage&, fmt::format_context& ctx) const -> decltype(ctx.out());
 };
 
 template <>
-struct fmt::formatter<locator::global_tablet_id> : fmt::formatter<std::string_view> {
+struct fmt::formatter<locator::tablet_transition_kind> : fmt::formatter<string_view> {
+    auto format(const locator::tablet_transition_kind&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <>
+struct fmt::formatter<locator::global_tablet_id> : fmt::formatter<string_view> {
     auto format(const locator::global_tablet_id&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <>
+struct fmt::formatter<locator::tablet_id> : fmt::formatter<string_view> {
+    auto format(locator::tablet_id  id, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", id.value());
+    }
+};
+
+template <>
+struct fmt::formatter<locator::tablet_replica> : fmt::formatter<string_view> {
+    auto format(const locator::tablet_replica& r, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}:{}", r.host, r.shard);
+    }
+};
+
+template <>
+struct fmt::formatter<locator::tablet_map> : fmt::formatter<string_view> {
+    auto format(const locator::tablet_map&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <>
+struct fmt::formatter<locator::tablet_metadata> : fmt::formatter<string_view> {
+    auto format(const locator::tablet_metadata&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <>
+struct fmt::formatter<locator::tablet_metadata_change_hint> : fmt::formatter<string_view> {
+    auto format(const locator::tablet_metadata_change_hint&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <>
+struct fmt::formatter<locator::repair_scheduler_config> : fmt::formatter<string_view> {
+    auto format(const locator::repair_scheduler_config&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <>
+struct fmt::formatter<locator::tablet_task_info> : fmt::formatter<string_view> {
+    auto format(const locator::tablet_task_info&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <>
+struct fmt::formatter<locator::tablet_task_type> : fmt::formatter<string_view> {
+    auto format(const locator::tablet_task_type&, fmt::format_context& ctx) const -> decltype(ctx.out());
 };

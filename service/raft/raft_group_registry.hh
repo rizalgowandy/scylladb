@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #pragma once
 
@@ -14,13 +14,10 @@
 #include "message/messaging_service_fwd.hh"
 #include "raft/raft.hh"
 #include "raft/server.hh"
+#include "raft_timeout.hh"
 #include "utils/recent_entries_map.hh"
 #include "direct_failure_detector/failure_detector.hh"
 #include "service/raft/group0_fwd.hh"
-
-namespace gms {
-class gossiper;
-}
 
 namespace db {
 class system_keyspace;
@@ -45,6 +42,8 @@ struct raft_destination_id_not_correct: public raft::error {
     {}
 };
 
+class raft_group_registry;
+
 // An entry in the group registry
 struct raft_server_for_group {
     raft::group_id gid;
@@ -53,11 +52,50 @@ struct raft_server_for_group {
     raft_rpc& rpc;
     raft_sys_table_storage& persistence;
     std::optional<seastar::future<>> aborted;
+    std::optional<lowres_clock::duration> default_op_timeout;
+};
+
+class raft_operation_timeout_error : public std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+// A wrapper for raft::server that adds timeout support to the main raft methods.
+// If an operation doesn't finish in a specified amount of time, raft_operation_timeout_error
+// exception is thrown.
+// An instance can be obtained through raft_group_registry methods get_server_with_timeouts
+// and group0_with_timeouts.
+// Passing std::nullopt as a raft_timeout parameter to methods of this class is equivalent
+// to calling the original raft methods without timeout.
+// Passing raft_timeout{} means 'use default timeout for this group', which is taken
+// from raft_server_for_group::default_op_timeout. For group0 default_op_timeout
+// is set to 1 minute and can be overridden in tests through the group0-raft-op-timeout-in-ms injection.
+// A custom timeout can be passed via raft_timeout::value, it will take precedence over
+// the default timeout default_op_timeout.
+// If no default_op_timeout is configured for a group and raft_timeout{} is passed without
+// the value parameter set, on_internal_error will be triggered.
+//
+// Use methods of these class if the code is handling a client request
+// and the client expects a potential error. Don't use timeouts for background
+// fibers, such as topology coordinator, since they wouldn't add much value.
+// The only thing the background fiber can do with a timeout is to retry, and
+// this will have the same end effect as not having a timeout at all.
+class raft_server_with_timeouts {
+    raft_server_for_group& _group_server;
+    shared_ptr<raft::failure_detector> _fd;
+
+    template <std::invocable<abort_source*> Op>
+    std::invoke_result_t<Op, abort_source*>
+    run_with_timeout(Op&& op, const char* op_name, seastar::abort_source* as, std::optional<raft_timeout> timeout);
+public:
+    raft_server_with_timeouts(raft_server_for_group& group_server, shared_ptr<raft::failure_detector> fd);
+    future<> add_entry(raft::command command, raft::wait_type type, seastar::abort_source& as, std::optional<raft_timeout> timeout);
+    future<> modify_config(std::vector<raft::config_member> add, std::vector<raft::server_id> del, seastar::abort_source* as, std::optional<raft_timeout> timeout);
+    future<bool> trigger_snapshot(seastar::abort_source* as, std::optional<raft_timeout> timeout);
+    future<> read_barrier(seastar::abort_source* as, std::optional<raft_timeout> timeout);
 };
 
 class direct_fd_pinger;
 class direct_fd_proxy;
-class gossiper_state_change_subscriber_proxy;
 
 // This class is responsible for creating, storing and accessing raft servers.
 // It also manages the raft rpc verbs initialization.
@@ -66,19 +104,10 @@ class gossiper_state_change_subscriber_proxy;
 // to the owning shard for a given raft group_id.
 class raft_group_registry : public seastar::peering_sharded_service<raft_group_registry> {
 private:
-    // True if the feature is enabled
-    bool _is_enabled;
-
     netw::messaging_service& _ms;
-    gms::gossiper& _gossiper;
-    // A proxy class representing subscription to on_change
-    // events, and updating the address map on this events.
-    shared_ptr<gossiper_state_change_subscriber_proxy> _gossiper_proxy;
     // Raft servers along with the corresponding timers to tick each instance.
     // Currently ticking every 100ms.
     std::unordered_map<raft::group_id, raft_server_for_group> _servers;
-    // inet_address:es for remote raft servers known to us
-    raft_address_map& _address_map;
 
     direct_failure_detector::failure_detector& _direct_fd;
     // Listens to notifications from direct failure detector.
@@ -100,12 +129,10 @@ private:
     raft::server_id _my_id;
 
 public:
-    // `is_enabled` must be `true` iff the local RAFT feature is enabled.
-    raft_group_registry(bool is_enabled, raft::server_id my_id, raft_address_map&,
-            netw::messaging_service& ms, gms::gossiper& gs, direct_failure_detector::failure_detector& fd);
+    raft_group_registry(raft::server_id my_id, netw::messaging_service& ms,
+            direct_failure_detector::failure_detector& fd);
     ~raft_group_registry();
 
-    // If is_enabled(),
     // Called manually at start on every shard.
     seastar::future<> start();
     // Called by sharded<>::stop()
@@ -129,6 +156,10 @@ public:
     // there is no such group.
     raft::server& get_server(raft::group_id gid);
 
+    // Returns a server with timeouts support for group by group id.
+    // Throws exception if there is no such group.
+    raft_server_with_timeouts get_server_with_timeouts(raft::group_id gid);
+
     // Find server for the given group.
     // Returns `nullptr` if there is no such group.
     raft::server* find_server(raft::group_id);
@@ -140,32 +171,30 @@ public:
     // after boot/upgrade is complete
     raft::server& group0();
 
+    // Return an instance of group 0 server with timeouts support. Valid only on shard 0,
+    // after boot/upgrade is complete
+    raft_server_with_timeouts group0_with_timeouts();
+
     // Start raft server instance, store in the map of raft servers and
     // arm the associated timer to tick the server.
     future<> start_server_for_group(raft_server_for_group grp);
     void abort_server(raft::group_id gid, sstring reason = "");
     unsigned shard_for_group(const raft::group_id& gid) const;
     shared_ptr<raft::failure_detector> failure_detector();
-    raft_address_map& address_map() { return _address_map; }
     direct_failure_detector::failure_detector& direct_fd() { return _direct_fd; }
-
-    // Is the RAFT local feature enabled?
-    // Note: do not confuse with the SUPPORTS_RAFT cluster feature.
-    bool is_enabled() const { return _is_enabled; }
 };
 
 // Implementation of `direct_failure_detector::pinger` which uses DIRECT_FD_PING verb for pinging.
 // Translates `raft::server_id`s to `gms::inet_address`es before pinging.
 class direct_fd_pinger : public seastar::peering_sharded_service<direct_fd_pinger>, public direct_failure_detector::pinger {
     netw::messaging_service& _ms;
-    raft_address_map& _address_map;
 
     using rate_limits = utils::recent_entries_map<direct_failure_detector::pinger::endpoint_id, logger::rate_limit>;
     rate_limits _rate_limits;
 
 public:
-    direct_fd_pinger(netw::messaging_service& ms, raft_address_map& address_map)
-            : _ms(ms), _address_map(address_map) {}
+    direct_fd_pinger(netw::messaging_service& ms)
+            : _ms(ms) {}
 
     direct_fd_pinger(const direct_fd_pinger&) = delete;
     direct_fd_pinger(direct_fd_pinger&&) = delete;

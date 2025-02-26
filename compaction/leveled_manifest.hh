@@ -5,17 +5,18 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
+#include <algorithm>
+
+#include "utils/assert.hh"
 #include "sstables/sstables.hh"
 #include "size_tiered_compaction_strategy.hh"
-#include "range.hh"
-#include "log.hh"
-#include <boost/range/algorithm/sort.hpp>
-#include <boost/range/algorithm/partial_sort.hpp>
+#include "interval.hh"
+#include "utils/log.hh"
 
 class leveled_manifest {
     table_state& _table_s;
@@ -290,9 +291,9 @@ private:
             // uncompacting sstables and parallel compaction is also disabled for lcs.
             Set<SSTableReader> compacting = cfs.getDataTracker().getCompacting();
 #endif
-            auto boundaries = ::range<dht::decorated_key>::make(*min, *max);
+            auto boundaries = ::wrapping_interval<dht::decorated_key>::make(*min, *max);
             for (auto& sstable : get_level(i)) {
-                auto r = ::range<dht::decorated_key>::make(sstable->get_first_decorated_key(), sstable->get_last_decorated_key());
+                auto r = ::wrapping_interval<dht::decorated_key>::make(sstable->get_first_decorated_key(), sstable->get_last_decorated_key());
                 if (boundaries.contains(r, dht::ring_position_comparator(*_schema))) {
                     logger.info("Adding high-level (L{}) {} to candidates", sstable->get_sstable_level(), sstable->get_filename());
                     candidates.push_back(sstable);
@@ -311,7 +312,7 @@ public:
 
     template <typename T>
     static std::vector<sstables::shared_sstable> overlapping(const schema& s, const std::vector<sstables::shared_sstable>& candidates, const T& others) {
-        assert(!candidates.empty());
+        SCYLLA_ASSERT(!candidates.empty());
         /*
          * Picking each sstable from others that overlap one of the sstable of candidates is not enough
          * because you could have the following situation:
@@ -350,13 +351,13 @@ public:
      */
     template <typename T>
     static std::vector<sstables::shared_sstable> overlapping(const schema& s, dht::token start, dht::token end, const T& sstables) {
-        assert(start <= end);
+        SCYLLA_ASSERT(start <= end);
 
         std::vector<sstables::shared_sstable> overlapped;
-        auto range = ::range<dht::token>::make(start, end);
+        auto range = ::wrapping_interval<dht::token>::make(start, end);
 
         for (auto& candidate : sstables) {
-            auto candidate_range = ::range<dht::token>::make(candidate->get_first_decorated_key()._token, candidate->get_last_decorated_key()._token);
+            auto candidate_range = ::wrapping_interval<dht::token>::make(candidate->get_first_decorated_key()._token, candidate->get_last_decorated_key()._token);
 
             if (range.overlaps(candidate_range, dht::token_comparator())) {
                 overlapped.push_back(candidate);
@@ -386,7 +387,7 @@ private:
             candidates = get_level(0);
             if (candidates.size() > MAX_COMPACTING_L0) {
                 // limit to only the MAX_COMPACTING_L0 oldest candidates
-                boost::partial_sort(candidates, candidates.begin() + MAX_COMPACTING_L0, [] (auto& i, auto& j) {
+                std::ranges::partial_sort(candidates, candidates.begin() + MAX_COMPACTING_L0, [] (auto& i, auto& j) {
                     return i->compare_by_max_timestamp(*j) < 0;
                 });
                 candidates.resize(MAX_COMPACTING_L0);
@@ -429,7 +430,7 @@ private:
         const schema& s = *_schema;
         // for non-L0 compactions, pick up where we left off last time
         auto& sstables = get_level(level);
-        boost::sort(sstables, [] (auto& i, auto& j) {
+        std::ranges::sort(sstables, [] (auto& i, auto& j) {
             return i->compare_by_first_key(*j) < 0;
         });
 
@@ -459,7 +460,7 @@ private:
      * for prior failure), will return an empty list.  Never returns null.
      */
     candidates_info get_candidates_for(int level, const std::vector<std::optional<dht::decorated_key>>& last_compacted_keys) {
-        assert(!get_level(level).empty());
+        SCYLLA_ASSERT(!get_level(level).empty());
 
         logger.debug("Choosing candidates for L{}", level);
 
@@ -517,7 +518,7 @@ public:
             new_level = 0;
         } else {
             new_level = (minimum_level == maximum_level && can_promote) ? maximum_level + 1 : maximum_level;
-            assert(new_level > 0);
+            SCYLLA_ASSERT(new_level > 0);
         }
         return new_level;
     }

@@ -5,17 +5,16 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
-
-#include <functional>
 
 #include <seastar/core/abort_source.hh>
 
 #include "auth/authorizer.hh"
 #include "service/migration_manager.hh"
+#include "service/raft/raft_group0_client.hh"
 
 namespace cql3 {
 
@@ -35,7 +34,7 @@ class default_authorizer : public authorizer {
     future<> _finished{make_ready_future<>()};
 
 public:
-    default_authorizer(cql3::query_processor&, ::service::migration_manager&);
+    default_authorizer(cql3::query_processor&, ::service::raft_group0_client&, ::service::migration_manager&);
 
     ~default_authorizer();
 
@@ -47,26 +46,32 @@ public:
 
     virtual future<permission_set> authorize(const role_or_anonymous&, const resource&) const override;
 
-    virtual future<> grant(std::string_view, permission_set, const resource&) const override;
+    virtual future<> grant(std::string_view, permission_set, const resource&, ::service::group0_batch&) override;
 
-    virtual future<> revoke( std::string_view, permission_set, const resource&) const override;
+    virtual future<> revoke( std::string_view, permission_set, const resource&, ::service::group0_batch&) override;
 
     virtual future<std::vector<permission_details>> list_all() const override;
 
-    virtual future<> revoke_all(std::string_view) const override;
+    virtual future<> revoke_all(std::string_view, ::service::group0_batch&) override;
 
-    virtual future<> revoke_all(const resource&) const override;
+    virtual future<> revoke_all(const resource&, ::service::group0_batch&) override;
 
     virtual const resource_set& protected_resources() const override;
 
 private:
+    future<> start_legacy();
+
     bool legacy_metadata_exists() const;
 
-    future<bool> any_granted() const;
+    future<> revoke_all_legacy(const resource&);
 
-    future<> migrate_legacy_metadata() const;
+    future<bool> legacy_any_granted() const;
 
-    future<> modify(std::string_view, permission_set, const resource&, std::string_view) const;
+    future<> migrate_legacy_metadata();
+
+    future<> modify(std::string_view, permission_set, const resource&, std::string_view, ::service::group0_batch&);
+
+    void revoke_all_keyspace_resources(const resource& ks_resource, ::service::group0_batch& mc);
 };
 
 } /* namespace auth */

@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "db/hints/internal/hint_sender.hh"
@@ -17,11 +17,8 @@
 #include <seastar/core/file-types.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/sleep.hh>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <seastar/core/seastar.hh>
-
-// Boost features.
-#include <boost/range/algorithm/find.hpp>
 
 // Scylla includes.
 #include "db/hints/internal/common.hh"
@@ -76,38 +73,22 @@ future<timespec> hint_sender::get_last_file_modification(const sstring& fname) {
     });
 }
 
-future<> hint_sender::do_send_one_mutation(frozen_mutation_and_schema m, locator::effective_replication_map_ptr ermp, const inet_address_vector_replica_set& natural_endpoints) noexcept {
-    return futurize_invoke([this, m = std::move(m), ermp = std::move(ermp), &natural_endpoints] () mutable -> future<> {
-        // The fact that we send with CL::ALL in both cases below ensures that new hints are not going
-        // to be generated as a result of hints sending.
-        if (boost::range::find(natural_endpoints, end_point_key()) != natural_endpoints.end()) {
-            manager_logger.trace("Sending directly to {}", end_point_key());
-            return _proxy.send_hint_to_endpoint(std::move(m), std::move(ermp), end_point_key());
-        } else {
-            manager_logger.trace("Endpoints set has changed and {} is no longer a replica. Mutating from scratch...", end_point_key());
-            return _proxy.send_hint_to_all_replicas(std::move(m));
-        }
-    });
-}
-
 bool hint_sender::can_send() noexcept {
     if (stopping() && !draining()) {
         return false;
     }
 
-    try {
-        if (_gossiper.is_alive(end_point_key())) {
-            _state.remove(state::ep_state_left_the_ring);
-            return true;
-        } else {
-            if (!_state.contains(state::ep_state_left_the_ring)) {
-                _state.set_if<state::ep_state_left_the_ring>(!_shard_manager.local_db().get_token_metadata().is_normal_token_owner(end_point_key()));
-            }
-            // send the hints out if the destination Node is part of the ring - we will send to all new replicas in this case
-            return _state.contains(state::ep_state_left_the_ring);
+    const auto tmptr = _shard_manager._proxy.get_token_metadata_ptr();
+
+    if (_gossiper.is_alive(_ep_key)) {
+        _state.remove(state::ep_state_left_the_ring);
+        return true;
+    } else {
+        if (!_state.contains(state::ep_state_left_the_ring)) {
+            _state.set_if<state::ep_state_left_the_ring>(!tmptr->is_normal_token_owner(_ep_key));
         }
-    } catch (...) {
-        return false;
+        // If the node is not part of the ring, we will send hints to all new replicas.
+        return _state.contains(state::ep_state_left_the_ring);
     }
 }
 
@@ -140,7 +121,7 @@ const column_mapping& hint_sender::get_column_mapping(lw_shared_ptr<send_one_fil
     return cm_it->second;
 }
 
-hint_sender::hint_sender(hint_endpoint_manager& parent, service::storage_proxy& local_storage_proxy,replica::database& local_db, gms::gossiper& local_gossiper) noexcept
+hint_sender::hint_sender(hint_endpoint_manager& parent, service::storage_proxy& local_storage_proxy,replica::database& local_db, const gms::gossiper& local_gossiper) noexcept
     : _stopped(make_ready_future<>())
     , _ep_key(parent.end_point_key())
     , _ep_manager(parent)
@@ -256,11 +237,30 @@ void hint_sender::start() {
 }
 
 future<> hint_sender::send_one_mutation(frozen_mutation_and_schema m) {
-    auto erm = _db.find_column_family(m.s).get_effective_replication_map();
+    auto ermp = _db.find_column_family(m.s).get_effective_replication_map();
     auto token = dht::get_token(*m.s, m.fm.key());
-    inet_address_vector_replica_set natural_endpoints = erm->get_natural_endpoints(std::move(token));
+    host_id_vector_replica_set natural_endpoints = ermp->get_natural_replicas(std::move(token));
 
-    return do_send_one_mutation(std::move(m), std::move(erm), std::move(natural_endpoints));
+    return futurize_invoke([this, m = std::move(m), ermp = std::move(ermp), &natural_endpoints] () mutable -> future<> {
+        // The fact that we send with CL::ALL in both cases below ensures that new hints are not going
+        // to be generated as a result of hints sending.
+        const auto& tm = ermp->get_token_metadata();
+        const auto dst = end_point_key();
+
+        if (std::ranges::contains(natural_endpoints, dst) && !tm.is_leaving(dst)) {
+            manager_logger.trace("Sending directly to {}", dst);
+            return _proxy.send_hint_to_endpoint(std::move(m), std::move(ermp), dst);
+        } else {
+            if (manager_logger.is_enabled(log_level::trace)) {
+                if (tm.is_leaving(end_point_key())) {
+                    manager_logger.trace("The original target endpoint {} is leaving. Mutating from scratch...", dst);
+                } else {
+                    manager_logger.trace("Endpoints set has changed and {} is no longer a replica. Mutating from scratch...", dst);
+                }
+            }
+            return _proxy.send_hint_to_all_replicas(std::move(m));
+        }
+    });
 }
 
 future<> hint_sender::send_one_hint(lw_shared_ptr<send_one_file_ctx> ctx_ptr, fragmented_temporary_buffer buf, db::replay_position rp, gc_clock::duration secs_since_file_mod, const sstring& fname) {
@@ -285,8 +285,10 @@ future<> hint_sender::send_one_hint(lw_shared_ptr<send_one_file_ctx> ctx_ptr, fr
                     return make_ready_future<>();
                 }
 
-                return this->send_one_mutation(std::move(m)).then([this, ctx_ptr] {
-                    ++this->shard_stats().sent;
+                const auto mutation_size = m.fm.representation().size();
+                return this->send_one_mutation(std::move(m)).then([this, ctx_ptr, mutation_size] {
+                    ++this->shard_stats().sent_total;
+                    this->shard_stats().sent_hints_bytes_total += mutation_size;
                 }).handle_exception([this, ctx_ptr] (auto eptr) {
                     manager_logger.trace("send_one_hint(): failed to send to {}: {}", end_point_key(), eptr);
                     ++this->shard_stats().send_errors;
@@ -440,7 +442,7 @@ void hint_sender::rewind_sent_replay_position_to(db::replay_position rp) {
 
 // runs in a seastar::async context
 bool hint_sender::send_one_file(const sstring& fname) {
-    timespec last_mod = get_last_file_modification(fname).get0();
+    timespec last_mod = get_last_file_modification(fname).get();
     gc_clock::duration secs_since_file_mod = std::chrono::seconds(last_mod.tv_sec);
     lw_shared_ptr<send_one_file_ctx> ctx_ptr = make_lw_shared<send_one_file_ctx>(_last_schema_ver_to_column_mapping);
 
@@ -512,7 +514,7 @@ bool hint_sender::send_one_file(const sstring& fname) {
 
     // If we got here we are done with the current segment and we can remove it.
     with_shared(_file_update_mutex, [&fname, this] {
-        auto p = _ep_manager.get_or_load().get0();
+        auto p = _ep_manager.get_or_load().get();
         return p->delete_segments({ fname });
     }).get();
 

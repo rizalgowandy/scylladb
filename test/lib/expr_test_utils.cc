@@ -3,10 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "expr_test_utils.hh"
+#include <fmt/ranges.h>
 
 namespace cql3 {
 namespace expr {
@@ -52,7 +53,7 @@ raw_value make_bigint_raw(int64_t val) {
     return make_raw(val);
 }
 
-raw_value make_text_raw(const sstring_view& text) {
+raw_value make_text_raw(const std::string_view& text) {
     return raw_value::make_value(utf8_type->decompose(text));
 }
 
@@ -94,7 +95,7 @@ constant make_bigint_const(int64_t val) {
     return make_const(val);
 }
 
-constant make_text_const(const sstring_view& text) {
+constant make_text_const(const std::string_view& text) {
     return constant(make_text_raw(text), utf8_type);
 }
 
@@ -210,6 +211,27 @@ raw_value make_tuple_raw(const std::vector<raw_value>& values) {
     return raw_value::make_value(std::move(ret));
 }
 
+// This function implements custom serialization of vectors.
+// Some tests require the vector to contain an empty value,
+// which is impossible to express using the existing code.
+// It only supports vectors of fixed-length elements.
+raw_value make_vector_raw(const std::vector<raw_value>& values) {
+    size_t serialized_len = 0;
+    for (const raw_value& val : values) {
+        if (val.is_value()) {
+            serialized_len += val.view().size_bytes();
+        }
+    }
+    managed_bytes ret(managed_bytes::initialized_later(), serialized_len);
+    managed_bytes_mutable_view out(ret);
+    for (const raw_value& val : values) {
+        val.view().with_value([&](const FragmentedView auto& bytes_view) {
+            write_fragmented(out, bytes_view);
+        });
+    }
+    return raw_value::make_value(std::move(ret));
+}
+
 template <class T>
 raw_value to_raw_value(const T& t) {
     if constexpr (std::same_as<T, raw_value>) {
@@ -292,6 +314,16 @@ constant make_tuple_const(const std::vector<constant>& vals, const std::vector<d
     return test_utils::make_tuple_const(to_raw_values(vals), element_types);
 }
 
+constant make_vector_const(const std::vector<raw_value>& vals, data_type elements_type) {
+    raw_value raw_vector = make_vector_raw(vals);
+    data_type vector_type = vector_type_impl::get_instance(elements_type, vals.size());
+    return constant(std::move(raw_vector), std::move(vector_type));
+}
+
+constant make_vector_const(const std::vector<constant>& vals, data_type elements_type) {
+    return make_vector_const(to_raw_values(vals), elements_type);
+}
+
 raw_value make_int_list_raw(const std::vector<std::optional<int32_t>>& values) {
     return make_list_raw(to_raw_values(values));
 }
@@ -302,6 +334,10 @@ raw_value make_int_set_raw(const std::vector<int32_t>& values) {
 
 raw_value make_int_int_map_raw(const std::vector<std::pair<int32_t, int32_t>>& values) {
     return make_map_raw(to_raw_value_pairs(values));
+}
+
+raw_value make_int_vector_raw(const std::vector<int32_t>& values) {
+    return make_vector_raw(to_raw_values(values));
 }
 
 constant make_int_list_const(const std::vector<std::optional<int32_t>>& values) {
@@ -316,8 +352,12 @@ constant make_int_int_map_const(const std::vector<std::pair<int32_t, int32_t>>& 
     return constant(make_int_int_map_raw(values), map_type_impl::get_instance(int32_type, int32_type, true));
 }
 
+constant make_int_vector_const(const std::vector<int32_t>& values) {
+    return constant(make_int_vector_raw(values), vector_type_impl::get_instance(int32_type, values.size()));
+}
+
 collection_constructor make_list_constructor(std::vector<expression> elements, data_type elements_type) {
-    return collection_constructor{.style = collection_constructor::style_type::list,
+    return collection_constructor{.style = collection_constructor::style_type::list_or_vector,
                                   .elements = std::move(elements),
                                   .type = list_type_impl::get_instance(elements_type, true)};
 }
@@ -352,7 +392,13 @@ tuple_constructor make_tuple_constructor(std::vector<expression> elements, std::
                              .type = tuple_type_impl::get_instance(std::move(element_types))};
 }
 
-usertype_constructor make_usertype_constructor(std::vector<std::pair<sstring_view, constant>> field_values) {
+collection_constructor make_vector_constructor(std::vector<expression> elements, data_type elements_type, size_t dimension) {
+    return collection_constructor{.style = collection_constructor::style_type::vector,
+                                  .elements = std::move(elements),
+                                  .type = vector_type_impl::get_instance(elements_type, dimension)};
+}
+
+usertype_constructor make_usertype_constructor(std::vector<std::pair<std::string_view, constant>> field_values) {
     usertype_constructor::elements_map_type elements_map;
     std::vector<bytes> field_names;
     std::vector<data_type> field_types;
@@ -375,9 +421,9 @@ std::pair<evaluation_inputs, std::unique_ptr<evaluation_inputs_data>> make_evalu
     const schema_ptr& table_schema,
     const column_values& column_vals,
     const std::vector<raw_value>& bind_marker_values) {
-    auto throw_error = [&](const auto&... fmt_args) -> sstring {
-        sstring error_msg = format(fmt_args...);
-        sstring final_msg = format("make_evaluation_inputs error: {}. (table_schema: {}, column_vals: {})", error_msg,
+    auto throw_error = [&]<typename... Args>(fmt::format_string<Args...> fmt, Args&&... args) -> sstring {
+        sstring error_msg = seastar::format(fmt, std::forward<Args>(args)...);
+        sstring final_msg = seastar::format("make_evaluation_inputs error: {}. (table_schema: {}, column_vals: {})", error_msg,
                                    *table_schema, column_vals);
         throw std::runtime_error(final_msg);
     };
@@ -497,11 +543,12 @@ class mock_database_impl : public data_dictionary::impl {
 public:
     explicit mock_database_impl(schema_ptr table_schema)
         : _table_schema(table_schema),
-          _keyspace_metadata(data_dictionary::keyspace_metadata::new_keyspace(_table_schema->ks_name(),
+          _keyspace_metadata(make_lw_shared<data_dictionary::keyspace_metadata>(_table_schema->ks_name(),
                                                                               "MockReplicationStrategy",
-                                                                              {},
+                                                                              locator::replication_strategy_config_options{},
+                                                                              std::nullopt,
                                                                               false,
-                                                                              {_table_schema})) {}
+                                                                              std::vector<schema_ptr>({_table_schema}))) {}
 
     static std::pair<data_dictionary::database, std::unique_ptr<mock_database_impl>> make(schema_ptr table_schema) {
         std::unique_ptr<mock_database_impl> mock_db = std::make_unique<mock_database_impl>(table_schema);
@@ -593,6 +640,9 @@ public:
     }
     virtual replica::database& real_database(data_dictionary::database db) const override {
         throw std::bad_function_call();
+    }
+    virtual replica::database* real_database_ptr(data_dictionary::database db) const override {
+        return nullptr;
     }
 
     virtual ~mock_database_impl() = default;

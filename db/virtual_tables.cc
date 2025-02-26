@@ -3,11 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <boost/algorithm/cxx11/any_of.hpp>
-#include <boost/range/algorithm.hpp>
+#include <algorithm>
+
+#include <boost/algorithm/string.hpp>
+#include <boost/lexical_cast.hpp>
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/json/json_elements.hh>
@@ -21,17 +23,17 @@
 #include "db/view/build_progress_virtual_reader.hh"
 #include "index/built_indexes_virtual_reader.hh"
 #include "gms/gossiper.hh"
+#include "mutation/frozen_mutation.hh"
 #include "protocol_server.hh"
 #include "release.hh"
 #include "replica/database.hh"
 #include "schema/schema_builder.hh"
-#include "schema/schema_registry.hh"
 #include "service/raft/raft_group_registry.hh"
 #include "service/storage_service.hh"
 #include "types/list.hh"
 #include "types/types.hh"
 #include "utils/build_id.hh"
-#include "log.hh"
+#include "utils/log.hh"
 
 namespace db {
 
@@ -41,12 +43,13 @@ logging::logger vtlog("virtual_tables");
 
 class cluster_status_table : public memtable_filling_virtual_table {
 private:
-    service::storage_service& _ss;
-    gms::gossiper& _gossiper;
+    distributed<service::storage_service>& _dist_ss;
+    distributed<gms::gossiper>& _dist_gossiper;
+
 public:
-    cluster_status_table(service::storage_service& ss, gms::gossiper& g)
+    cluster_status_table(distributed<service::storage_service>& ss, distributed<gms::gossiper>& g)
             : memtable_filling_virtual_table(build_schema())
-            , _ss(ss), _gossiper(g) {}
+            , _dist_ss(ss), _dist_gossiper(g) {}
 
     static schema_ptr build_schema() {
         auto id = generate_legacy_id(system_keyspace::NAME, "cluster_status");
@@ -59,29 +62,39 @@ public:
             .with_column("tokens", int32_type)
             .with_column("owns", float_type)
             .with_column("host_id", uuid_type)
-            .with_version(system_keyspace::generate_schema_version(id))
+            .with_hash_version()
             .build();
     }
 
     future<> execute(std::function<void(mutation)> mutation_sink) override {
-        return _ss.get_ownership().then([&, mutation_sink] (std::map<gms::inet_address, float> ownership) {
-            const locator::token_metadata& tm = _ss.get_token_metadata();
+        auto muts = co_await _dist_ss.invoke_on(0, [this] (service::storage_service& ss) -> future<std::vector<frozen_mutation>> {
+            auto& gossiper = _dist_gossiper.local();
+            auto ownership = co_await ss.get_ownership();
+            const locator::token_metadata& tm = ss.get_token_metadata();
 
-            _gossiper.for_each_endpoint_state([&] (const gms::inet_address& endpoint, const gms::endpoint_state&) {
-                mutation m(schema(), partition_key::from_single_value(*schema(), data_value(endpoint).serialize_nonnull()));
+            std::vector<frozen_mutation> muts;
+            muts.reserve(gossiper.num_endpoints());
+
+            gossiper.for_each_endpoint_state([&] (const gms::inet_address& endpoint, const gms::endpoint_state& eps) {
+                static thread_local auto s = build_schema();
+                mutation m(s, partition_key::from_single_value(*s, data_value(endpoint).serialize_nonnull()));
                 row& cr = m.partition().clustered_row(*schema(), clustering_key::make_empty()).cells();
 
-                set_cell(cr, "up", _gossiper.is_alive(endpoint));
-                set_cell(cr, "status", _gossiper.get_gossip_status(endpoint));
-                set_cell(cr, "load", _gossiper.get_application_state_value(endpoint, gms::application_state::LOAD));
-
-                auto hostid = tm.get_host_id_if_known(endpoint);
-                if (hostid) {
-                    set_cell(cr, "host_id", hostid->uuid());
+                set_cell(cr, "up", gossiper.is_alive(endpoint));
+                if (!ss.raft_topology_change_enabled() || gossiper.is_shutdown(endpoint)) {
+                    set_cell(cr, "status", gossiper.get_gossip_status(endpoint));
                 }
+                set_cell(cr, "load", gossiper.get_application_state_value(endpoint, gms::application_state::LOAD));
 
-                if (tm.is_normal_token_owner(endpoint)) {
-                    sstring dc = tm.get_topology().get_location(endpoint).dc;
+                auto hostid = eps.get_host_id();
+                if (ss.raft_topology_change_enabled() && !gossiper.is_shutdown(endpoint)) {
+                    set_cell(cr, "status", boost::to_upper_copy<std::string>(fmt::format("{}", ss.get_node_state(hostid))));
+                }
+                set_cell(cr, "host_id", hostid.uuid());
+
+                if (tm.get_topology().has_node(hostid)) {
+                    // Not all entries in gossiper are present in the topology
+                    sstring dc = tm.get_topology().get_location(hostid).dc;
                     set_cell(cr, "dc", dc);
                 }
 
@@ -89,11 +102,17 @@ public:
                     set_cell(cr, "owns", ownership[endpoint]);
                 }
 
-                set_cell(cr, "tokens", int32_t(tm.get_tokens(endpoint).size()));
+                set_cell(cr, "tokens", int32_t(tm.get_tokens(hostid).size()));
 
-                mutation_sink(std::move(m));
+                muts.push_back(freeze(std::move(m)));
             });
+
+            co_return muts;
         });
+
+        for (auto& m : muts) {
+            mutation_sink(m.unfreeze(schema()));
+        }
     }
 };
 
@@ -114,12 +133,13 @@ public:
         auto id = generate_legacy_id(system_keyspace::NAME, "token_ring");
         return schema_builder(system_keyspace::NAME, "token_ring", std::make_optional(id))
             .with_column("keyspace_name", utf8_type, column_kind::partition_key)
+            .with_column("table_name", utf8_type, column_kind::clustering_key)
             .with_column("start_token", utf8_type, column_kind::clustering_key)
             .with_column("endpoint", inet_addr_type, column_kind::clustering_key)
             .with_column("end_token", utf8_type)
             .with_column("dc", utf8_type)
             .with_column("rack", utf8_type)
-            .with_version(system_keyspace::generate_schema_version(id))
+            .with_hash_version()
             .build();
     }
 
@@ -127,11 +147,32 @@ public:
         return dht::decorate_key(*_s, partition_key::from_single_value(*_s, data_value(name).serialize_nonnull()));
     }
 
-    clustering_key make_clustering_key(sstring start_token, gms::inet_address host) {
+    clustering_key make_clustering_key(const sstring& table_name, sstring start_token, gms::inet_address host) {
         return clustering_key::from_exploded(*_s, {
+            data_value(table_name).serialize_nonnull(),
             data_value(start_token).serialize_nonnull(),
             data_value(host).serialize_nonnull()
         });
+    }
+
+    future<> emit_ring(result_collector& result, const dht::decorated_key& dk, const sstring& table_name, std::vector<dht::token_range_endpoints> ranges) {
+
+        co_await result.emit_partition_start(dk);
+        std::ranges::sort(ranges, std::ranges::less(), std::mem_fn(&dht::token_range_endpoints::_start_token));
+
+        for (dht::token_range_endpoints& range : ranges) {
+            std::ranges::sort(range._endpoint_details, endpoint_details_cmp());
+
+            for (const dht::endpoint_details& detail : range._endpoint_details) {
+                clustering_row cr(make_clustering_key(table_name, range._start_token, detail._host));
+                set_cell(cr.cells(), "end_token", sstring(range._end_token));
+                set_cell(cr.cells(), "dc", sstring(detail._datacenter));
+                set_cell(cr.cells(), "rack", sstring(detail._rack));
+                co_await result.emit_row(std::move(cr));
+            }
+        }
+
+        co_await result.emit_partition_end();
     }
 
     struct endpoint_details_cmp {
@@ -148,20 +189,13 @@ public:
             dht::decorated_key key;
         };
 
-        auto keyspace_names = boost::copy_range<std::vector<decorated_keyspace_name>>(
-            _db.get_keyspaces()
-                | boost::adaptors::filtered([] (auto&& e) {
-                      auto&& rs = e.second.get_replication_strategy();
-                      return rs.is_vnode_based();
+        auto keyspace_names = _db.get_non_local_strategy_keyspaces()
+                | std::views::transform([this] (auto&& ks) {
+                    return decorated_keyspace_name{ks, make_partition_key(ks)};
                   })
-                | boost::adaptors::transformed([this] (auto&& e) {
-                    return decorated_keyspace_name{e.first, make_partition_key(e.first)};
-        }));
+                | std::ranges::to<std::vector>();
 
-        boost::sort(keyspace_names, [less = dht::ring_position_less_comparator(*_s)]
-                (const decorated_keyspace_name& l, const decorated_keyspace_name& r) {
-            return less(l.key, r.key);
-        });
+        std::ranges::sort(keyspace_names, dht::ring_position_less_comparator(*_s), std::mem_fn(&decorated_keyspace_name::key));
 
         for (const decorated_keyspace_name& e : keyspace_names) {
             auto&& dk = e.key;
@@ -169,26 +203,19 @@ public:
                 continue;
             }
 
-            std::vector<dht::token_range_endpoints> ranges = co_await _ss.describe_ring(e.name);
-
-            co_await result.emit_partition_start(dk);
-            boost::sort(ranges, [] (const dht::token_range_endpoints& l, const dht::token_range_endpoints& r) {
-                return l._start_token < r._start_token;
-            });
-
-            for (dht::token_range_endpoints& range : ranges) {
-                boost::sort(range._endpoint_details, endpoint_details_cmp());
-
-                for (const dht::endpoint_details& detail : range._endpoint_details) {
-                    clustering_row cr(make_clustering_key(range._start_token, detail._host));
-                    set_cell(cr.cells(), "end_token", sstring(range._end_token));
-                    set_cell(cr.cells(), "dc", sstring(detail._datacenter));
-                    set_cell(cr.cells(), "rack", sstring(detail._rack));
-                    co_await result.emit_row(std::move(cr));
-                }
+            if (_db.find_keyspace(e.name).get_replication_strategy().uses_tablets()) {
+                co_await _db.get_tables_metadata().for_each_table_gently([&, this] (table_id, lw_shared_ptr<replica::table> table) -> future<> {
+                    if (table->schema()->ks_name() != e.name) {
+                        co_return;
+                    }
+                    const auto& table_name = table->schema()->cf_name();
+                    std::vector<dht::token_range_endpoints> ranges = co_await _ss.describe_ring_for_table(e.name, table_name);
+                    co_await emit_ring(result, e.key, table_name, std::move(ranges));
+                });
+            } else {
+                std::vector<dht::token_range_endpoints> ranges = co_await _ss.describe_ring(e.name);
+                co_await emit_ring(result, e.key, "<ALL>", std::move(ranges));
             }
-
-            co_await result.emit_partition_end();
         }
     }
 };
@@ -212,7 +239,7 @@ public:
             .with_column("live", long_type)
             .with_column("total", long_type)
             .set_comment("Lists all the snapshots along with their size, dropped tables are not part of the listing.")
-            .with_version(system_keyspace::generate_schema_version(id))
+            .with_hash_version()
             .build();
     }
 
@@ -229,67 +256,31 @@ public:
 
     future<> execute(reader_permit permit, result_collector& result, const query_restrictions& qr) override {
         struct decorated_keyspace_name {
-            sstring name;
+            schema_ptr s;
             dht::decorated_key key;
-        };
-        std::vector<decorated_keyspace_name> keyspace_names;
 
-        for (const auto& [name, _] : _db.local().get_keyspaces()) {
-            auto dk = make_partition_key(name);
-            if (!this_shard_owns(dk) || !contains_key(qr.partition_range(), dk)) {
-                continue;
+            auto operator<=>(const decorated_keyspace_name& o) const {
+                return key.tri_compare(*o.s, o.key);
             }
-            keyspace_names.push_back({std::move(name), std::move(dk)});
-        }
-
-        boost::sort(keyspace_names, [less = dht::ring_position_less_comparator(*_s)]
-                (const decorated_keyspace_name& l, const decorated_keyspace_name& r) {
-            return less(l.key, r.key);
-        });
+        };
 
         using snapshots_by_tables_map = std::map<sstring, std::map<sstring, replica::table::snapshot_details>>;
+        using snapshots_by_keyspace_map = std::map<decorated_keyspace_name, snapshots_by_tables_map>;
 
-        class snapshot_reducer {
-        private:
-            snapshots_by_tables_map _result;
-        public:
-            future<> operator()(const snapshots_by_tables_map& value) {
-                for (auto& [table_name, snapshots] : value) {
-                    if (auto [_, added] = _result.try_emplace(table_name, std::move(snapshots)); added) {
-                        continue;
-                    }
-                    auto& rp = _result.at(table_name);
-                    for (auto&& [snapshot_name, snapshot_detail]: snapshots) {
-                        if (auto [_, added] = rp.try_emplace(snapshot_name, std::move(snapshot_detail)); added) {
-                            continue;
-                        }
-                        auto& detail = rp.at(snapshot_name);
-                        detail.live += snapshot_detail.live;
-                        detail.total += snapshot_detail.total;
-                    }
+        snapshots_by_keyspace_map keyspace_snapshots;
+        auto snapshot_details = co_await _db.local().get_snapshot_details();
+
+        for (const auto& [snapshot_name, details] : snapshot_details) {
+            for (const auto& d : details) {
+                auto dk = make_partition_key(d.ks);
+                if (!this_shard_owns(dk) || !contains_key(qr.partition_range(), dk)) {
+                    continue;
                 }
-                return make_ready_future<>();
+                keyspace_snapshots[decorated_keyspace_name(_s, dk)][d.cf][snapshot_name] = d.details;
             }
-            snapshots_by_tables_map get() && {
-                return std::move(_result);
-            }
-        };
-
-        for (auto& ks_data : keyspace_names) {
+        }
+        for (const auto& [ks_data, snapshots_by_tables] : keyspace_snapshots) {
             co_await result.emit_partition_start(ks_data.key);
-
-            const auto snapshots_by_tables = co_await _db.map_reduce(snapshot_reducer(), [ks_name_ = ks_data.name] (replica::database& db) mutable -> future<snapshots_by_tables_map> {
-                auto ks_name = std::move(ks_name_);
-                snapshots_by_tables_map snapshots_by_tables;
-                co_await db.get_tables_metadata().for_each_table_gently(coroutine::lambda([&] (table_id, lw_shared_ptr<replica::table> table) -> future<> {
-                    if (table->schema()->ks_name() != ks_name) {
-                        co_return;
-                    }
-                    const auto unordered_snapshots = co_await table->get_snapshot_details();
-                    snapshots_by_tables.emplace(table->schema()->cf_name(), std::map<sstring, replica::table::snapshot_details>(unordered_snapshots.begin(), unordered_snapshots.end()));
-                }));
-                co_return snapshots_by_tables;
-            });
 
             for (const auto& [table_name, snapshots] : snapshots_by_tables) {
                 for (auto& [snapshot_name, details] : snapshots) {
@@ -340,15 +331,16 @@ public:
             .with_column("protocol_version", utf8_type)
             .with_column("listen_addresses", list_type_impl::get_instance(utf8_type, false))
             .set_comment("Lists all client protocol servers and their status.")
-            .with_version(system_keyspace::generate_schema_version(id))
+            .with_hash_version()
             .build();
     }
 
     future<> execute(std::function<void(mutation)> mutation_sink) override {
         // Servers are registered on shard 0 only
         const auto server_infos = co_await smp::submit_to(0ul, [&ss = _ss.container()] {
-            return boost::copy_range<std::vector<protocol_server_info>>(ss.local().protocol_servers()
-                    | boost::adaptors::transformed([] (protocol_server* s) { return protocol_server_info(*s); }));
+            return ss.local().protocol_servers()
+                    | std::views::transform([] (protocol_server* s) { return protocol_server_info(*s); })
+                    | std::ranges::to<std::vector>();
         });
         for (auto server : server_infos) {
             auto dk = dht::decorate_key(*_s, partition_key::from_single_value(*schema(), data_value(server.name).serialize_nonnull()));
@@ -440,7 +432,7 @@ private:
     template <typename T>
     future<T> map_reduce_shards(std::function<T()> map, std::function<T(T, T)> reduce = std::plus<T>{}, T initial = {}) {
         co_return co_await map_reduce(
-                boost::irange(0u, smp::count),
+                std::views::iota(0u, smp::count),
                 [map] (shard_id shard) {
                     return smp::submit_to(shard, [map] {
                         return map();
@@ -466,7 +458,7 @@ public:
             .with_column("item", utf8_type, column_kind::clustering_key)
             .with_column("value", utf8_type)
             .set_comment("Runtime system information.")
-            .with_version(system_keyspace::generate_schema_version(id))
+            .with_hash_version()
             .build();
     }
 
@@ -519,10 +511,10 @@ public:
             return map_reduce_tables<stats>([] (replica::table& t) {
                 logalloc::occupancy_stats s;
                 uint64_t partition_count = 0;
-                for (replica::memtable* active_memtable : t.active_memtables()) {
-                    s += active_memtable->region().occupancy();
-                    partition_count += active_memtable->partition_count();
-                }
+                t.for_each_active_memtable([&] (replica::memtable& active_memtable) {
+                    s += active_memtable.region().occupancy();
+                    partition_count += active_memtable.partition_count();
+                });
                 return stats{s.total_space(), s.free_space(), partition_count};
             }, stats::reduce).then([] (stats s) {
                 return std::vector<std::pair<sstring, sstring>>{
@@ -582,7 +574,7 @@ public:
         });
         co_await add_partition(mutation_sink, "incremental_backup_enabled", [this] () {
             return _db.map_reduce0([] (replica::database& db) {
-                return boost::algorithm::any_of(db.get_keyspaces(), [] (const auto& id_and_ks) {
+                return std::ranges::any_of(db.get_keyspaces(), [] (const auto& id_and_ks) {
                     return id_and_ks.second.incremental_backups_enabled();
                 });
             }, false, std::logical_or{}).then([] (bool res) -> sstring {
@@ -607,7 +599,7 @@ public:
             .with_column("build_mode", utf8_type)
             .with_column("build_id", utf8_type)
             .set_comment("Version information.")
-            .with_version(system_keyspace::generate_schema_version(id))
+            .with_hash_version()
             .build();
     }
 
@@ -632,14 +624,14 @@ class db_config_table final : public streaming_virtual_table {
             .with_column("type", utf8_type)
             .with_column("source", utf8_type)
             .with_column("value", utf8_type)
-            .with_version(system_keyspace::generate_schema_version(id))
+            .with_hash_version()
             .build();
     }
 
     future<> execute(reader_permit permit, result_collector& result, const query_restrictions& qr) override {
         struct config_entry {
             dht::decorated_key key;
-            sstring_view type;
+            std::string_view type;
             sstring source;
             sstring value;
         };
@@ -653,10 +645,7 @@ class db_config_table final : public streaming_virtual_table {
             }
         }
 
-        boost::sort(cfg, [less = dht::ring_position_less_comparator(*_s)]
-                (const config_entry& l, const config_entry& r) {
-            return less(l.key, r.key);
-        });
+        std::ranges::sort(cfg, dht::ring_position_less_comparator(*_s), std::mem_fn(&config_entry::key));
 
         for (auto&& c : cfg) {
             co_await result.emit_partition_start(c.key);
@@ -746,7 +735,8 @@ class clients_table : public streaming_virtual_table {
             .with_column("ssl_enabled", boolean_type)
             .with_column("ssl_protocol", utf8_type)
             .with_column("username", utf8_type)
-            .with_version(system_keyspace::generate_schema_version(id))
+            .with_column("scheduling_group", utf8_type)
+            .with_hash_version()
             .build();
     }
 
@@ -822,7 +812,7 @@ class clients_table : public streaming_virtual_table {
             co_await result.emit_partition_start(dip.key);
             auto& clients = cd_map[dip.ip];
 
-            boost::sort(clients, [] (const client_data& a, const client_data& b) {
+            std::ranges::sort(clients, [] (const client_data& a, const client_data& b) {
                 return a.port < b.port || a.client_type_str() < b.client_type_str();
             });
 
@@ -852,6 +842,9 @@ class clients_table : public streaming_virtual_table {
                     set_cell(cr.cells(), "ssl_protocol", *cd.ssl_protocol);
                 }
                 set_cell(cr.cells(), "username", cd.username ? *cd.username : sstring("anonymous"));
+                if (cd.scheduling_group_name) {
+                    set_cell(cr.cells(), "scheduling_group", *cd.scheduling_group_name);
+                }
                 co_await result.emit_row(std::move(cr));
             }
             co_await result.emit_partition_end();
@@ -948,7 +941,7 @@ private:
             .with_column("server_id", uuid_type, column_kind::clustering_key)
             .with_column("can_vote", boolean_type)
             .set_comment("Currently operating RAFT configuration")
-            .with_version(system_keyspace::generate_schema_version(id))
+            .with_hash_version()
             .build();
     }
 
@@ -982,56 +975,46 @@ private:
 
 }
 
-// Map from table's schema ID to table itself. Helps avoiding accidental duplication.
-static thread_local std::map<table_id, std::unique_ptr<virtual_table>> virtual_tables;
-
-static void register_virtual_tables(distributed<replica::database>& dist_db, distributed<service::storage_service>& dist_ss, sharded<gms::gossiper>& dist_gossiper, sharded<service::raft_group_registry>& dist_raft_gr, db::config& cfg) {
-    auto add_table = [] (std::unique_ptr<virtual_table>&& tbl) {
-        virtual_tables[tbl->schema()->id()] = std::move(tbl);
-    };
-
-    auto& db = dist_db.local();
-    auto& ss = dist_ss.local();
-    auto& gossiper = dist_gossiper.local();
-
-    // Add built-in virtual tables here.
-    add_table(std::make_unique<cluster_status_table>(ss, gossiper));
-    add_table(std::make_unique<token_ring_table>(db, ss));
-    add_table(std::make_unique<snapshots_table>(dist_db));
-    add_table(std::make_unique<protocol_servers_table>(ss));
-    add_table(std::make_unique<runtime_info_table>(dist_db, ss));
-    add_table(std::make_unique<versions_table>());
-    add_table(std::make_unique<db_config_table>(cfg));
-    add_table(std::make_unique<clients_table>(ss));
-    add_table(std::make_unique<raft_state_table>(dist_raft_gr));
-}
-
-static void install_virtual_readers_and_writers(db::system_keyspace& sys_ks, replica::database& db) {
-    db.find_column_family(system_keyspace::size_estimates()).set_virtual_reader(mutation_source(db::size_estimates::virtual_reader(db, sys_ks)));
-    db.find_column_family(system_keyspace::v3::views_builds_in_progress()).set_virtual_reader(mutation_source(db::view::build_progress_virtual_reader(db)));
-    db.find_column_family(system_keyspace::built_indexes()).set_virtual_reader(mutation_source(db::index::built_indexes_virtual_reader(db)));
-
-    for (auto&& [id, vt] : virtual_tables) {
-        auto&& cf = db.find_column_family(vt->schema());
-        cf.set_virtual_reader(vt->as_mutation_source());
-        cf.set_virtual_writer([&vt = *vt] (const frozen_mutation& m) { return vt.apply(m); });
-    }
-}
-
 future<> initialize_virtual_tables(
         distributed<replica::database>& dist_db, distributed<service::storage_service>& dist_ss,
         sharded<gms::gossiper>& dist_gossiper, distributed<service::raft_group_registry>& dist_raft_gr,
         sharded<db::system_keyspace>& sys_ks,
         db::config& cfg) {
-    register_virtual_tables(dist_db, dist_ss, dist_gossiper, dist_raft_gr, cfg);
-
+    auto& virtual_tables_registry = sys_ks.local().get_virtual_tables_registry();
+    auto& virtual_tables = *virtual_tables_registry;
     auto& db = dist_db.local();
-    for (auto&& [id, vt] : virtual_tables) {
-        co_await db.create_local_system_table(vt->schema(), false, dist_ss.local().get_erm_factory());
-        db.find_column_family(vt->schema()).mark_ready_for_writes(nullptr);
-    }
+    auto& ss = dist_ss.local();
 
-    install_virtual_readers_and_writers(sys_ks.local(), db);
+    auto add_table = [&] (std::unique_ptr<virtual_table>&& tbl) -> future<> {
+        auto schema = tbl->schema();
+        virtual_tables[schema->id()] = std::move(tbl);
+        co_await db.create_local_system_table(schema, false, ss.get_erm_factory());
+        auto& cf = db.find_column_family(schema);
+        cf.mark_ready_for_writes(nullptr);
+        auto& vt = virtual_tables[schema->id()];
+        cf.set_virtual_reader(vt->as_mutation_source());
+        cf.set_virtual_writer([&vt = *vt] (const frozen_mutation& m) { return vt.apply(m); });
+    };
+
+    // Add built-in virtual tables here.
+    co_await add_table(std::make_unique<cluster_status_table>(dist_ss, dist_gossiper));
+    co_await add_table(std::make_unique<token_ring_table>(db, ss));
+    co_await add_table(std::make_unique<snapshots_table>(dist_db));
+    co_await add_table(std::make_unique<protocol_servers_table>(ss));
+    co_await add_table(std::make_unique<runtime_info_table>(dist_db, ss));
+    co_await add_table(std::make_unique<versions_table>());
+    co_await add_table(std::make_unique<db_config_table>(cfg));
+    co_await add_table(std::make_unique<clients_table>(ss));
+    co_await add_table(std::make_unique<raft_state_table>(dist_raft_gr));
+
+    db.find_column_family(system_keyspace::size_estimates()).set_virtual_reader(mutation_source(db::size_estimates::virtual_reader(db, sys_ks.local())));
+    db.find_column_family(system_keyspace::v3::views_builds_in_progress()).set_virtual_reader(mutation_source(db::view::build_progress_virtual_reader(db)));
+    db.find_column_family(system_keyspace::built_indexes()).set_virtual_reader(mutation_source(db::index::built_indexes_virtual_reader(db)));
 }
+
+virtual_tables_registry::virtual_tables_registry() : unique_ptr(std::make_unique<virtual_tables_registry_impl>()) {
+}
+
+virtual_tables_registry::~virtual_tables_registry() = default;
 
 } // namespace db

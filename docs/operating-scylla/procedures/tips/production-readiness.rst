@@ -14,13 +14,24 @@ Before You Begin
 Pre-Deployment Requirements
 ===========================
 
-* :doc:`Scylla System Requirements</getting-started/system-requirements/>` - verify your instances, system, OS, etc are supported by Scylla for production machines.
-* :doc:`Scylla Getting Started </getting-started/index>`
+* :doc:`ScyllaDB System Requirements</getting-started/system-requirements/>` - verify your instances, system, OS, etc are supported by ScyllaDB for production machines.
+* :doc:`ScyllaDB Getting Started </getting-started/index>`
 
 Choose a Compaction Strategy
 ============================
 
 Each workload may require a specific strategy. Refer to :doc:`Choose a Compaction Strategy </architecture/compaction/compaction-strategies>` for details.
+
+Incremental Compaction Strategy (ICS)
+.....................................
+
+We highly recommend using ICS (the default setting) for any table that you have.
+You will have much less Space Amplification with ICS as it only requires 25% additional storage, as opposed to STCS which requires 50% more.
+
+.. note:: ICS is the default compaction strategy.
+
+* Refer to :ref:`Incremental Compaction Strategy <ICS1>` for an overview of the benefits.
+* Refer to :ref:`Incremental Compaction Strategy Overview <incremental-compaction-strategy-ics>` for a description of how it works.
 
 Resiliency
 ----------
@@ -38,8 +49,8 @@ If you have a multi-datacenter architecture we recommend to have ``RF=3`` on eac
 
 For additional information:
 
-* Read more about :doc:`Scylla Fault Tolerance </architecture/architecture-fault-tolerance/>`
-* Take a course at `Scylla University on RF <https://university.scylladb.com/courses/scylla-essentials-overview/lessons/high-availability/topic/fault-tolerance-replication-factor/>`_.
+* Read more about :doc:`ScyllaDB Fault Tolerance </architecture/architecture-fault-tolerance/>`
+* Take a course at `ScyllaDB University on RF <https://university.scylladb.com/courses/scylla-essentials-overview/lessons/high-availability/topic/fault-tolerance-replication-factor/>`_.
 
 Consistency Levels
 ==================
@@ -50,9 +61,9 @@ We recommend using :code:`LOCAL_QUORUM` across **the cluster and DCs**
 
 For additional information:
 
-* Refer to :doc:`Scylla Fault Tolerance </architecture/architecture-fault-tolerance/>`
+* Refer to :doc:`ScyllaDB Fault Tolerance </architecture/architecture-fault-tolerance/>`
 * Watch a :doc:`Demo </architecture/console-CL-full-demo/>`
-* Take a course at `Scylla University on CL <https://university.scylladb.com/courses/scylla-essentials-overview/lessons/high-availability/topic/consistency-level/>`_
+* Take a course at `ScyllaDB University on CL <https://university.scylladb.com/courses/scylla-essentials-overview/lessons/high-availability/topic/consistency-level/>`_
 
 Gossip Configuration
 ====================
@@ -64,24 +75,13 @@ Gossip Configuration
 
    For additional information:
 
-   * Refer to :doc:`Gossip in Scylla </kb/gossip/>`
+   * Refer to :doc:`Gossip in ScyllaDB </kb/gossip/>`
    * Follow the :doc:`How to Switch Snitches </operating-scylla/procedures/config-change/switch-snitch/>` procedure if required.
-   * Take a course at `Scylla University on Gossip <https://university.scylladb.com/courses/scylla-essentials-overview/lessons/architecture/topic/gossip/>`_
+   * Take a course at `ScyllaDB University on Gossip <https://university.scylladb.com/courses/scylla-essentials-overview/lessons/architecture/topic/gossip/>`_
 
 #. Use the correct Data Replication strategy.
 
    Use :code:`NetworkTopologyStrategy` replication-strategy as it supports multi-DC for your keyspaces.
-
-Seed Node Redundancy
-====================
-Scylla Open Source 4.3 and later and Scylla Enterprise 2021.1 and later are seedless. See `Seedless NoSQL: Getting Rid of Seed Nodes in ScyllaDB <https://www.scylladb.com/2020/09/22/seedless-nosql-getting-rid-of-seed-nodes-in-scylla/>`_.
-
-If you are using an earlier Scylla version:
-
-* Each DC needs to have multiple seed nodes.
-* We recommend having **2-3 seed nodes per DC**.
-
-See :doc:`Scylla Seed Nodes </kb/seed-nodes/>` for details.
 
 Performance
 -----------
@@ -110,7 +110,7 @@ Compression
 Inter-node Compression
 ======================
 
-Enable Inter-node Compression by editing the Scylla Configuration file (/etc/scylla.yaml).
+Enable Inter-node Compression by editing the ScyllaDB Configuration file (/etc/scylla.yaml).
 
 :code:`internode_compression: all`
 
@@ -119,9 +119,9 @@ For additional information, see the Admin Guide :ref:`Inter-node Compression <in
 Driver Compression
 ==================
 
-This refers to compressing traffic between the client and Scylla.
-Verify your client driver is using compressed traffic when connected to Scylla.
-As compression is driver settings dependent, please check your client driver manual or :doc:`Scylla Drivers </using-scylla/drivers/index>`.
+This refers to compressing traffic between the client and ScyllaDB.
+Verify your client driver is using compressed traffic when connected to ScyllaDB.
+As compression is driver settings dependent, please check your client driver manual or :doc:`ScyllaDB Drivers </using-scylla/drivers/index>`.
 
 
 Connectivity
@@ -130,24 +130,24 @@ Connectivity
 Drivers Settings
 ================
 
-* Use shard aware drivers wherever possible. :doc:`Scylla Drivers </using-scylla/drivers/index>` (not third-party drivers) are shard aware.
+* Use shard aware drivers wherever possible. :doc:`ScyllaDB Drivers </using-scylla/drivers/index>` (not third-party drivers) are shard aware.
 * Configure connection pool - open more connections (>3 per shard) and/Or more clients. See `this blog <https://www.scylladb.com/2019/11/20/maximizing-performance-via-concurrency-while-minimizing-timeouts-in-distributed-databases/>`_.
 
 Management
 ----------
 
-You must use both Scylla Manager and Scylla Monitor.
+You must use both ScyllaDB Manager and ScyllaDB Monitor.
 
-Scylla Manager
-==============
+ScyllaDB Manager
+================
 
-Scylla Manager enables centralized cluster administration and database
+ScyllaDB Manager enables centralized cluster administration and database
 automation such as repair, backup, and health-check.
 
 Repair
 ......
 
-Run repairs preferably once a week and run them exclusively from Scylla Manager.
+Run repairs preferably once a week and run them exclusively from ScyllaDB Manager.
 Refer to `Repair a Cluster <https://manager.docs.scylladb.com/branch-2.2/repair/index.html>`_
 
 Backup and Restore
@@ -155,10 +155,10 @@ Backup and Restore
 
 We recommend the following:
 
-* Run a full weekly backup from Scylla Manager
-* Run a daily backup from Scylla Manager
+* Run a full weekly backup from ScyllaDB Manager
+* Run a daily backup from ScyllaDB Manager
 * Check the bucket used for restore. This can be done by performing a `restore <https://manager.docs.scylladb.com/branch-2.2/restore/index.html>`_ and making sure the data is valid. This action should be done once a month, or more frequently if needed. Ask our Support team to help you with this.
-* Save backup to a bucket supported by Scylla Manager.
+* Save backup to a bucket supported by ScyllaDB Manager.
 
 For additional information:
 
@@ -212,4 +212,4 @@ Additional Topics
 * :doc:`Add a Node </operating-scylla/procedures/cluster-management/add-node-to-cluster/>`
 * `Repair <https://manager.docs.scylladb.com/branch-2.2/repair/index.html>`_
 * :doc:`Cleanup </operating-scylla/nodetool-commands/cleanup/>`
-* Tech Talk: `How to be successful with Scylla <https://www.scylladb.com/tech-talk/how-to-be-successful-with-scylla/>`_
+* Tech Talk: `How to be successful with ScyllaDB <https://www.scylladb.com/tech-talk/how-to-be-successful-with-scylla/>`_

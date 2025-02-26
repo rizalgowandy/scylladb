@@ -3,16 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "collectd.hh"
 #include "api/api-doc/collectd.json.hh"
 #include <seastar/core/scollectd.hh>
 #include <seastar/core/scollectd_api.hh>
-#include "endian.h"
-#include <boost/range/irange.hpp>
+#include <ranges>
 #include <regex>
+#include "api/api_init.hh"
 
 namespace api {
 
@@ -54,14 +54,14 @@ static const char* str_to_regex(const sstring& v) {
 void set_collectd(http_context& ctx, routes& r) {
     cd::get_collectd.set(r, [](std::unique_ptr<request> req) {
 
-        auto id = ::make_shared<scollectd::type_instance_id>(req->param["pluginid"],
+        auto id = ::make_shared<scollectd::type_instance_id>(req->get_path_param("pluginid"),
                 req->get_query_param("instance"), req->get_query_param("type"),
                 req->get_query_param("type_instance"));
 
 
         return do_with(std::vector<cd::collectd_value>(), [id] (auto& vec) {
             vec.resize(smp::count);
-            return parallel_for_each(boost::irange(0u, smp::count), [&vec, id] (auto cpu) {
+            return parallel_for_each(std::views::iota(0u, smp::count), [&vec, id] (auto cpu) {
                 return smp::submit_to(cpu, [id = *id] {
                     return scollectd::get_collectd_value(id);
                 }).then([&vec, cpu] (auto res) {
@@ -91,7 +91,7 @@ void set_collectd(http_context& ctx, routes& r) {
     });
 
     cd::enable_collectd.set(r, [](std::unique_ptr<request> req) -> future<json::json_return_type> {
-        std::regex plugin(req->param["pluginid"].c_str());
+        std::regex plugin(req->get_path_param("pluginid").c_str());
         std::regex instance(str_to_regex(req->get_query_param("instance")));
         std::regex type(str_to_regex(req->get_query_param("type")));
         std::regex type_instance(str_to_regex(req->get_query_param("type_instance")));

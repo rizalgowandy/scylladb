@@ -3,12 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
-
-#include "mutation_consumer_concepts.hh"
 
 enum class consume_in_reverse {
     no = 0,

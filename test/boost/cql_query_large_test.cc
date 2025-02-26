@@ -3,33 +3,32 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
-#include <boost/range/irange.hpp>
-#include <boost/range/adaptors.hpp>
-#include <boost/range/algorithm.hpp>
 #include <boost/test/unit_test.hpp>
 #include <boost/multiprecision/cpp_int.hpp>
-#include <source_location>
 
-#include "test/lib/scylla_test_case.hh"
+#include <fmt/ranges.h>
+
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
+#include "test/lib/test_utils.hh"
 
 #include <seastar/core/future-util.hh>
 #include "transport/messages/result_message.hh"
-#include "utils/big_decimal.hh"
-#include "types/user.hh"
 #include "types/map.hh"
 #include "types/list.hh"
 #include "types/set.hh"
 #include "db/config.hh"
 #include "compaction/compaction_manager.hh"
-#include "test/lib/exception_utils.hh"
 #include "schema/schema_builder.hh"
+
+BOOST_AUTO_TEST_SUITE(cql_query_large_test)
 
 using namespace std::literals::chrono_literals;
 
@@ -63,7 +62,7 @@ SEASTAR_THREAD_TEST_CASE(test_large_collection) {
         }
 
         flush(e);
-        assert_that(e.execute_cql("select partition_key, column_name from system.large_cells where table_name = 'tbl' allow filtering;").get0())
+        assert_that(e.execute_cql("select partition_key, column_name from system.large_cells where table_name = 'tbl' allow filtering;").get())
             .is_rows()
             .with_size(1)
             .with_row({"42", "b", "tbl"});
@@ -76,6 +75,7 @@ SEASTAR_THREAD_TEST_CASE(test_large_data) {
     auto cfg = make_shared<db::config>();
     cfg->compaction_large_row_warning_threshold_mb(1);
     cfg->compaction_large_cell_warning_threshold_mb(1);
+    cfg->compaction_large_partition_warning_threshold_mb(1);
     do_with_cql_env_thread([](cql_test_env& e) {
         e.execute_cql("create table tbl (a int, b text, primary key (a))").get();
         sstring blob(1024*1024, 'x');
@@ -83,7 +83,7 @@ SEASTAR_THREAD_TEST_CASE(test_large_data) {
         e.execute_cql("insert into tbl (a, b) values (44, '" + blob + "');").get();
         flush(e);
 
-        shared_ptr<cql_transport::messages::result_message> msg = e.execute_cql("select partition_key, row_size from system.large_rows where table_name = 'tbl' allow filtering;").get0();
+        shared_ptr<cql_transport::messages::result_message> msg = e.execute_cql("select partition_key, row_size from system.large_rows where table_name = 'tbl' allow filtering;").get();
         auto res = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(msg);
         auto rows = res->rs().result_set().rows();
 
@@ -103,30 +103,63 @@ SEASTAR_THREAD_TEST_CASE(test_large_data) {
         BOOST_REQUIRE(row_size > 1024*1024 && row_size < 1025*1024);
 
         // Check that it was added to system.large_cells too
-        assert_that(e.execute_cql("select partition_key, column_name from system.large_cells where table_name = 'tbl' allow filtering;").get0())
+        assert_that(e.execute_cql("select partition_key, column_name from system.large_cells where table_name = 'tbl' allow filtering;").get())
             .is_rows()
             .with_size(1)
             .with_row({"44", "b", "tbl"});
 
+        // Check that it was added to system.large_partitions too
+        assert_that(e.execute_cql("select partition_key, rows from system.large_partitions where table_name = 'tbl' allow filtering;").get())
+            .is_rows()
+            .with_size(1)
+            .with_row({ { utf8_type->decompose("44") },
+                        { long_type->decompose(1L) },
+                        { utf8_type->decompose("tbl") } });
+
         e.execute_cql("delete from tbl where a = 44;").get();
 
-        // In order to guarantee that system.large_rows has been updated, we have to
+        // In order to guarantee that system.large_rows, system.large_cells and system.large_partitions have been updated, we have to
         // * flush, so that a tombstone for the above delete is created.
         // * do a major compaction, so that the tombstone is combined with the old entry,
         //   and the old sstable is deleted.
         flush(e);
         e.db().invoke_on_all([] (replica::database& dbi) {
             return dbi.get_tables_metadata().parallel_for_each_table([&dbi] (table_id, lw_shared_ptr<replica::table> t) {
-                return dbi.get_compaction_manager().perform_major_compaction(t->as_table_state());
+                return dbi.get_compaction_manager().perform_major_compaction(t->try_get_table_state_with_static_sharding(), tasks::task_info{});
             });
         }).get();
 
-        assert_that(e.execute_cql("select partition_key from system.large_rows where table_name = 'tbl' allow filtering;").get0())
+        assert_that(e.execute_cql("select partition_key from system.large_rows where table_name = 'tbl' allow filtering;").get())
             .is_rows()
             .is_empty();
-        assert_that(e.execute_cql("select partition_key from system.large_cells where table_name = 'tbl' allow filtering;").get0())
+        assert_that(e.execute_cql("select partition_key from system.large_cells where table_name = 'tbl' allow filtering;").get())
             .is_rows()
             .is_empty();
+        assert_that(e.execute_cql("select partition_key from system.large_partitions where table_name = 'tbl' allow filtering;").get())
+            .is_rows()
+            .is_empty();
+
+        return make_ready_future<>();
+    }, cfg).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_large_row_count_warning) {
+    auto cfg = make_shared<db::config>();
+    cfg->compaction_rows_count_warning_threshold(10);
+    do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("create table tbl (a int, b text, primary key (a, b))").get();
+        for (int i = 0; i < 11; ++i) {
+            e.execute_cql(format("insert into tbl (a, b) values (42, 'foo{}');", i)).get();
+        }
+        flush(e);
+
+        // Check that the warning was added to system.large_partitions
+        assert_that(e.execute_cql("select partition_key, rows from system.large_partitions where table_name = 'tbl' allow filtering;").get())
+            .is_rows()
+            .with_size(1)
+            .with_row({ { utf8_type->decompose("42") },
+                        { long_type->decompose(11L) },
+                        { utf8_type->decompose("tbl") } });
 
         return make_ready_future<>();
     }, cfg).get();
@@ -149,13 +182,13 @@ SEASTAR_TEST_CASE(test_insert_large_collection_values) {
             }).get();
             sstring long_value(std::numeric_limits<uint16_t>::max() + 10, 'x');
             e.execute_cql(format("INSERT INTO tbl (pk, l) VALUES ('Zamyatin', ['{}']);", long_value)).get();
-            assert_that(e.execute_cql("SELECT l FROM tbl WHERE pk ='Zamyatin';").get0())
+            assert_that(e.execute_cql("SELECT l FROM tbl WHERE pk ='Zamyatin';").get())
                     .is_rows().with_rows({
                             { make_list_value(list_type, list_type_impl::native_type({{long_value}})).serialize() }
                     });
             BOOST_REQUIRE_THROW(e.execute_cql(format("INSERT INTO tbl (pk, s) VALUES ('Orwell', {{'{}'}});", long_value)).get(), std::exception);
             e.execute_cql(format("INSERT INTO tbl (pk, m) VALUES ('Haksli', {{'key': '{}'}});", long_value)).get();
-            assert_that(e.execute_cql("SELECT m FROM tbl WHERE pk ='Haksli';").get0())
+            assert_that(e.execute_cql("SELECT m FROM tbl WHERE pk ='Haksli';").get())
                     .is_rows().with_rows({
                             { make_map_value(map_type, map_type_impl::native_type({{sstring("key"), long_value}})).serialize() }
                     });
@@ -163,3 +196,5 @@ SEASTAR_TEST_CASE(test_insert_large_collection_values) {
         });
     });
 }
+
+BOOST_AUTO_TEST_SUITE_END()

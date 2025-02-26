@@ -56,7 +56,7 @@ The keys and values are:
     is connected to (for example, `3`).
   - `SCYLLA_NR_SHARDS` is an integer containing the number of shards on this
     node (for example, `12`). All shard numbers are smaller than this number.
-  - `SCYLLA_PARTITIONER` is a the fully-qualified name of the partitioner in use (i.e.
+  - `SCYLLA_PARTITIONER` is the fully-qualified name of the partitioner in use (i.e.
     `org.apache.cassandra.partitioners.Murmur3Partitioner`).
   - `SCYLLA_SHARDING_ALGORITHM` is the name of an algorithm used to select how
     partitions are mapped into shards (described below)
@@ -197,5 +197,30 @@ use that information for every subsequent query.
 If we send the query to the wrong node/shard, we want to send the RESULT 
 message with additional information about the tablet in `custom_payload`:
 
-  - `tablet_replicas` - information about tablet replicas, for every replica there is information about the host and shard.
-  - `token_range` - information about token range for that tablet in format `(first_token, last_token]`.
+  - `tablets-routing-v1` - tablets routing information, which contains info about token
+    range (in format `(first_token, last_token]`) and tablet replicas, for every replica
+    there is information about the host and shard.
+
+The driver has to be able to receive `custom_payload` and deserialise its field
+from `bytes` to:
+
+  - for `tablets-routing-v1` - `TupleType(LongType, LongType, ListType(TupleType(UUIDType, Int32Type)))`,
+    two `LongType` represent first and last token, `ListType(TupleType(UUIDType, Int32Type))`
+    contains information about replicas (for every replica there is a tuple with two elements
+    `UUIDType` and `Int32Type` representing host and shard ids).
+
+When the driver receives information about the tablet, it has to check if any of
+the previously received tablets has an overlapping token range.
+The group of tablets that meets this criterion has to be deleted, and the new
+tablet should replace them.
+
+## Negotiate sending tablets info to the drivers
+
+This extension allows the driver to inform the database that it is aware of
+tablets and is able to interpret the tablet information sent in `custom_payload`.
+
+Having a designated flag gives the ability to skip tablet metadata generation
+(which is quite expensive) if driver is not aware of tablets. 
+
+The feature is identified by the `TABLETS_ROUTING_V1` key, which is meant to be sent
+in the SUPPORTED message.

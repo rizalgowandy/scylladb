@@ -30,12 +30,18 @@ Procedure
 
 ``cqlsh -e "SOURCE 'centos/db_schema.cql'"``
 
+| **Only** a superuser should perform it.
+
 Repeat the following steps for each node in the cluster:
 --------------------------------------------------------
 
 .. note::
 
-      Best practise is **not** to restore :doc:`Materialized Views (MV) </using-scylla/materialized-views>` and :doc:`Secondary Indexes (SI) </using-scylla/secondary-indexes>` SSTables.
+   If you are restoring :doc:`encrypted backup files </operating-scylla/security/encryption-at-rest>`, make sure Scylla Enterprise has the same keys used by Scylla to encrypt the data before starting the restore process.
+
+.. note::
+
+      Best practise is **not** to restore :doc:`Materialized Views (MV) </features/materialized-views>` and :doc:`Secondary Indexes (SI) </features/secondary-indexes>` SSTables.
       It is recommended to:
 
       - Drop the MV and SI using `DROP MATERIALIZED VIEW` or `DROP INDEX`
@@ -53,7 +59,7 @@ Repeat the following steps for each node in the cluster:
 
    ``sudo rm -rf /var/lib/scylla/commitlog/*``
 
-#. Delete all the files in the keyspace_name_table. Note that by default the snapshots are created under Scylla data directory ``/var/lib/scylla/data/keyspace_name/table_name-UUID/``.
+#. Delete all the files in the keyspace_name_table. Note that by default the snapshots are created under ScyllaDB data directory ``/var/lib/scylla/data/keyspace_name/table_name-UUID/``.
 
    Make sure NOT to delete the existing snapshots in the process.
 
@@ -68,7 +74,7 @@ Repeat the following steps for each node in the cluster:
       -rw-r--r-- 4 scylla   scylla     10 Mar  5 08:46 nba-team_players-ka-1-Digest.sha1
       -rw-r--r-- 1 scylla   scylla     24 Mar  5 09:19 nba-team_players-ka-1-Filter.db
       -rw-r--r-- 1 scylla   scylla    218 Mar  5 09:19 nba-team_players-ka-1-Index.db
-      -rw-r--r-- 1 scylla   scylla     38 Mar  5 09:19 nba-team_players-ka-1-Scylla.db
+      -rw-r--r-- 1 scylla   scylla     38 Mar  5 09:19 nba-team_players-ka-1-ScyllaDB.db
       -rw-r--r-- 1 scylla   scylla   4446 Mar  5 09:19 nba-team_players-ka-1-Statistics.db
       -rw-r--r-- 1 scylla   scylla     89 Mar  5 09:19 nba-team_players-ka-1-Summary.db
       -rw-r--r-- 4 scylla   scylla    101 Mar  5 08:46 nba-team_players-ka-1-TOC.txt

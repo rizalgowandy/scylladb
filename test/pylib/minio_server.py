@@ -2,7 +2,7 @@
 #
 # Copyright (C) 2022-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 """Minio server for testing.
    Provides helpers to setup and manage minio server for testing.
@@ -50,9 +50,10 @@ class MinioServer:
         self.default_user = 'minioadmin'
         self.default_pass = 'minioadmin'
         self.bucket_name = 'testbucket'
-        self.access_key = ''.join(random.choice(string.hexdigits) for i in range(16))
-        self.secret_key = ''.join(random.choice(string.hexdigits) for i in range(32))
+        self.access_key = os.environ.get(self.ENV_ACCESS_KEY, ''.join(random.choice(string.hexdigits) for i in range(16)))
+        self.secret_key = os.environ.get(self.ENV_SECRET_KEY, ''.join(random.choice(string.hexdigits) for i in range(32)))
         self.log_filename = (self.tempdir / 'minio').with_suffix(".log")
+        self.old_env = dict()
 
     def __repr__(self):
         return f"[minio] {self.address}:{self.port}/{self.bucket_name}@{self.config_file}"
@@ -155,8 +156,11 @@ class MinioServer:
         with open(path, 'w', encoding='ascii') as config_file:
             endpoint = {'name': address,
                         'port': port,
-                        'aws_access_key_id': acc_key,
-                        'aws_secret_access_key': secret_key,
+                        # don't put credentials here. We're exporing env vars, which should
+                        # be picked up properly by scylla.
+                        # https://github.com/scylladb/scylla-pkg/issues/3845
+                        #'aws_access_key_id': acc_key,
+                        #'aws_secret_access_key': secret_key,
                         'aws_region': region,
                         }
             yaml.dump({'endpoints': [endpoint]}, config_file)
@@ -186,6 +190,7 @@ class MinioServer:
         return cmd
 
     def _set_environ(self):
+        self.old_env = dict(os.environ)
         os.environ[self.ENV_CONFFILE] = f'{self.config_file}'
         os.environ[self.ENV_ADDRESS] = f'{self.address}'
         os.environ[self.ENV_PORT] = f'{self.port}'
@@ -201,9 +206,15 @@ class MinioServer:
                 self.ENV_ACCESS_KEY,
                 self.ENV_SECRET_KEY]
 
+    def get_envs_settings(self):
+        return {key: os.environ[key] for key in self._get_environs()}
+
     def _unset_environ(self):
         for env in self._get_environs():
-            del os.environ[env]
+            if value := self.old_env.get(env):
+                os.environ[env] = value
+            else:
+                del os.environ[env]
 
     def print_environ(self):
         msgs = []
@@ -214,7 +225,7 @@ class MinioServer:
 
     async def start(self):
         if self.srv_exe is None:
-            self.logger.info("Minio not installed, get it from https://dl.minio.io/server/minio/release/linux-amd64/minio and put into PATH")
+            self.logger.error("Minio not installed, get it from https://dl.minio.io/server/minio/release/linux-amd64/minio and put into PATH")
             return
 
         self.log_file = self.log_filename.open("wb")
@@ -230,7 +241,7 @@ class MinioServer:
             else:
                 break
         else:
-            self.logger.info("Failed to start Minio server")
+            self.logger.error("Failed to start Minio server")
             return
 
         self.create_conf_file(self.address, self.port, self.access_key, self.secret_key, self.DEFAULT_REGION, self.config_file)
@@ -253,7 +264,7 @@ class MinioServer:
             await self.mc('admin', 'policy', 'attach', alias, 'test-policy', '--user', self.access_key)
 
         except Exception as e:
-            self.logger.info(f'MC failed: {e}')
+            self.logger.error(f'MC failed: {e}')
             await self.stop()
 
     async def stop(self):
@@ -296,5 +307,4 @@ async def main():
             await server.stop()
 
 if __name__ == '__main__':
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    asyncio.run(main())

@@ -3,18 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <unordered_set>
 #include <filesystem>
-#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/file.hh>
-#include <seastar/core/enum.hh>
 #include <seastar/core/queue.hh>
-#include <seastar/core/pipe.hh>
 #include <seastar/util/bool_class.hh>
 #include "enum_set.hh"
 #include "seastarx.hh"
@@ -142,7 +138,53 @@ private:
     future<directory_entry> guarantee_type(directory_entry de);
 };
 
-class directory_lister {
+class abstract_lister {
+public:
+    class impl {
+    public:
+        // Get the next directory_entry from the lister,
+        // if available.  When the directory listing is done,
+        // a disengaged optional is returned.
+        //
+        // Caller should either drain all entries using get()
+        // until it gets a disengaged result or an error, or
+        // close() can be called to terminate the listing prematurely,
+        // and wait on any background work to complete.
+        //
+        // Calling get() after the listing is done and a disengaged
+        // result has been returned results in a broken_pipe_exception.
+        virtual future<std::optional<directory_entry>> get() = 0;
+
+        // Close the directory_lister, ignoring any errors.
+        // Must be called after get() if not all entries were retrieved.
+        //
+        // Close aborts the lister, waking up get() if any is waiting,
+        // and waits for all background work to complete.
+        virtual future<> close() noexcept = 0;
+        virtual ~impl() = default;
+    };
+
+private:
+    std::unique_ptr<impl> _impl;
+    abstract_lister(std::unique_ptr<impl> i) noexcept : _impl(std::move(i)) {}
+
+public:
+    future<std::optional<directory_entry>> get() {
+        return _impl->get();
+    }
+    future<> close() noexcept {
+        return _impl->close();
+    }
+
+    abstract_lister(abstract_lister&&) noexcept = default;
+
+    template <typename L, typename... Args>
+    static abstract_lister make(Args&&... args) {
+        return abstract_lister(std::make_unique<L>(std::forward<Args>(args)...));
+    }
+};
+
+class directory_lister final : public abstract_lister::impl {
     fs::path _dir;
     lister::dir_entry_types _type;
     lister::filter_type _filter;
@@ -162,41 +204,26 @@ public:
         , _queue(512 / sizeof(std::optional<directory_entry>))
     { }
 
+    directory_lister(directory_lister&&) noexcept = default;
+
     ~directory_lister();
 
-    // Get the next directory_entry from the lister,
-    // if available.  When the directory listing is done,
-    // a disengaged optional is returned.
-    //
-    // Caller should either drain all entries using get()
-    // until it gets a disengaged result or an error, or
-    // close() can be called to terminate the listing prematurely,
-    // and wait on any background work to complete.
-    //
-    // Calling get() after the listing is done and a disengaged
-    // result has been returned results in a broken_pipe_exception.
-    future<std::optional<directory_entry>> get();
-
-    // Close the directory_lister, ignoring any errors.
-    // Must be called after get() if not all entries were retrieved.
-    //
-    // Close aborts the lister, waking up get() if any is waiting,
-    // and waits for all background work to complete.
-    future<> close() noexcept;
+    future<std::optional<directory_entry>> get() override;
+    future<> close() noexcept override;
 };
 
-static inline fs::path operator/(const fs::path& lhs, const char* rhs) {
+inline fs::path operator/(const fs::path& lhs, const char* rhs) {
     return lhs / fs::path(rhs);
 }
 
-static inline fs::path operator/(const fs::path& lhs, const sstring& rhs) {
+inline fs::path operator/(const fs::path& lhs, const sstring& rhs) {
     return lhs / fs::path(rhs);
 }
 
-static inline fs::path operator/(const fs::path& lhs, std::string_view rhs) {
+inline fs::path operator/(const fs::path& lhs, std::string_view rhs) {
     return lhs / fs::path(rhs);
 }
 
-static inline fs::path operator/(const fs::path& lhs, const std::string& rhs) {
+inline fs::path operator/(const fs::path& lhs, const std::string& rhs) {
     return lhs / fs::path(rhs);
 }

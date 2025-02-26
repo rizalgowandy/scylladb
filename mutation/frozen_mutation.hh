@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -18,7 +18,7 @@
 #include "schema/schema.hh"
 
 class mutation;
-class flat_mutation_reader_v2;
+class mutation_reader;
 
 namespace ser {
 class mutation_view;
@@ -163,6 +163,7 @@ private:
     partition_key deserialize_key() const;
     ser::mutation_view mutation_view() const;
 public:
+    explicit frozen_mutation(const partition_key& key) : _pk(key) {}
     explicit frozen_mutation(const mutation& m);
     explicit frozen_mutation(bytes_ostream&& b);
     frozen_mutation(bytes_ostream&& b, partition_key key);
@@ -170,6 +171,7 @@ public:
     frozen_mutation(const frozen_mutation& m) = default;
     frozen_mutation& operator=(frozen_mutation&&) = default;
     frozen_mutation& operator=(const frozen_mutation&) = default;
+    bytes_ostream& representation() { return _bytes; }
     const bytes_ostream& representation() const { return _bytes; }
     table_id column_family_id() const;
     table_schema_version schema_version() const; // FIXME: Should replace column_family_id()
@@ -180,7 +182,6 @@ public:
     // the mutation which was used to create this instance.
     // throws schema_mismatch_error otherwise.
     mutation unfreeze(schema_ptr s) const;
-    future<mutation> unfreeze_gently(schema_ptr s) const;
 
     // Automatically upgrades the stored mutation to the supplied schema with custom column mapping.
     mutation unfreeze_upgrading(schema_ptr schema, const column_mapping& cm) const;
@@ -222,7 +223,6 @@ public:
     struct printer {
         const frozen_mutation& self;
         schema_ptr schema;
-        friend std::ostream& operator<<(std::ostream&, const printer&);
     };
 
     // Same requirements about the schema as unfreeze().
@@ -238,19 +238,17 @@ struct frozen_mutation_and_schema {
     schema_ptr s;
 };
 
-// Can receive streamed_mutation in reversed order.
 class streamed_mutation_freezer {
     const schema& _schema;
     partition_key _key;
-    bool _reversed;
 
     tombstone _partition_tombstone;
     std::optional<static_row> _sr;
     std::deque<clustering_row> _crs;
     range_tombstone_list _rts;
 public:
-    streamed_mutation_freezer(const schema& s, const partition_key& key, bool reversed = false)
-        : _schema(s), _key(key), _reversed(reversed), _rts(s) { }
+    streamed_mutation_freezer(const schema& s, const partition_key& key)
+        : _schema(s), _key(key), _rts(s) { }
 
     stop_iteration consume(tombstone pt);
 
@@ -265,7 +263,7 @@ public:
 static constexpr size_t default_frozen_fragment_size = 128 * 1024;
 
 using frozen_mutation_consumer_fn = std::function<future<stop_iteration>(frozen_mutation, bool)>;
-future<> fragment_and_freeze(flat_mutation_reader_v2 mr, frozen_mutation_consumer_fn c,
+future<> fragment_and_freeze(mutation_reader mr, frozen_mutation_consumer_fn c,
                              size_t fragment_size = default_frozen_fragment_size);
 
 class reader_permit;
@@ -323,3 +321,9 @@ auto frozen_mutation::consume_gently(schema_ptr s, Consumer& consumer) const -> 
     frozen_mutation_consumer_adaptor adaptor(s, consumer);
     co_return co_await consume_gently(s, adaptor);
 }
+
+template <> struct fmt::formatter<frozen_mutation::printer> : fmt::formatter<string_view> {
+    auto format(const frozen_mutation::printer& pr, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", pr.self.unfreeze(pr.schema));
+    }
+};

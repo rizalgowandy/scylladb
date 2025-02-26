@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2022-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 """
 Test consistency of schema changes with topology changes.
@@ -112,9 +112,6 @@ async def test_remove_node_with_concurrent_ddl(manager: ManagerClient, random_ta
             await manager.wait_for_host_known(initiator_info.ip_addr, target_host_id)
             logger.info(f'do_remove_node [{i}], stopping target server [{target_info.ip_addr}], host_id [{target_host_id}]')
             await manager.server_stop_gracefully(target_info.server_id)
-            logger.info(f'do_remove_node [{i}], target server [{target_info.ip_addr}] stopped, '
-                        f'waiting for it to be down on [{initiator_info.ip_addr}]')
-            await manager.wait_for_host_down(initiator_info.ip_addr, target_info.ip_addr)
             logger.info(f'do_remove_node [{i}], invoking remove_node')
             await manager.remove_node(initiator_info.server_id, target_info.server_id, [target_info.ip_addr])
             # TODO: check that group 0 no longer contains the removed node (#12153)
@@ -138,3 +135,19 @@ async def test_rebuild_node(manager: ManagerClient, random_tables: RandomTables)
     servers = await manager.running_servers()
     await manager.rebuild_node(servers[0].server_id)
     await check_token_ring_and_group0_consistency(manager)
+
+@pytest.mark.asyncio
+async def test_concurrent_removenode(manager: ManagerClient):
+    servers = await manager.running_servers()
+    assert len(servers) >= 3
+
+    await manager.server_stop_gracefully(servers[2].server_id)
+
+    try:
+        await asyncio.gather(*[manager.remove_node(servers[0].server_id, servers[2].server_id),
+                manager.remove_node(servers[1].server_id, servers[2].server_id)])
+    except Exception as e: 
+        logger.info(f"exception raised due to concurrent remove node requests: {e}")
+    else:
+        raise Exception("concurrent removenode request should result in a failure, but unexpectedly succeeded")
+

@@ -1,6 +1,9 @@
 add_library(tools STATIC)
 target_sources(tools
   PRIVATE
+    scylla-local-file-key-generator.cc
+    load_system_tablets.cc
+    read_mutation.cc
     scylla-types.cc
     scylla-sstable.cc
     scylla-nodetool.cc
@@ -21,11 +24,8 @@ target_link_libraries(tools
     db)
 
 include(build_submodule)
-build_submodule(cqlsh cqlsh
-  NOARCH)
+build_submodule(cqlsh cqlsh)
 build_submodule(tools java
-  NOARCH)
-build_submodule(jmx jmx
   NOARCH)
 
 execute_process(
@@ -50,3 +50,7 @@ build_submodule(python3 python3
 
 check_headers(check-headers tools
   GLOB_RECURSE ${CMAKE_CURRENT_SOURCE_DIR}/*.hh)
+
+if(Scylla_DIST)
+  add_subdirectory(testing/dist-check)
+endif()

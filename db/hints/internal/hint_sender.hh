@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #pragma once
 
@@ -22,7 +22,6 @@
 #include "db/commitlog/replay_position.hh"
 #include "db/hints/internal/common.hh"
 #include "db/hints/internal/hint_storage.hh"
-#include "gms/inet_address.hh"
 #include "locator/abstract_replication_strategy.hh"
 #include "mutation/frozen_mutation.hh"
 #include "schema/schema.hh"
@@ -112,13 +111,13 @@ private:
     service::storage_proxy& _proxy;
     replica::database& _db;
     seastar::scheduling_group _hints_cpu_sched_group;
-    gms::gossiper& _gossiper;
+    const gms::gossiper& _gossiper;
     seastar::shared_mutex& _file_update_mutex;
 
     std::multimap<db::replay_position, lw_shared_ptr<std::optional<promise<>>>> _replay_waiters;
 
 public:
-    hint_sender(hint_endpoint_manager& parent, service::storage_proxy& local_storage_proxy, replica::database& local_db, gms::gossiper& local_gossiper) noexcept;
+    hint_sender(hint_endpoint_manager& parent, service::storage_proxy& local_storage_proxy, replica::database& local_db, const gms::gossiper& local_gossiper) noexcept;
     ~hint_sender();
 
     /// \brief A constructor that should be called from the copy/move-constructor of hint_endpoint_manager.
@@ -233,18 +232,14 @@ private:
     /// \return
     const column_mapping& get_column_mapping(lw_shared_ptr<send_one_file_ctx> ctx_ptr, const frozen_mutation& fm, const hint_entry_reader& hr);
 
-    /// \brief Perform a single mutation send attempt.
+    /// \brief Send one mutation out.
     ///
     /// If the original destination end point is still a replica for the given mutation - send the mutation directly
     /// to it, otherwise execute the mutation "from scratch" with CL=ALL.
     ///
-    /// \param m mutation to send
-    /// \param ermp points to the effective_replication_map used to obtain \c natural_endpoints
-    /// \param natural_endpoints current replicas for the given mutation
-    /// \return future that resolves when the operation is complete
-    future<> do_send_one_mutation(frozen_mutation_and_schema m, locator::effective_replication_map_ptr ermp, const inet_address_vector_replica_set& natural_endpoints) noexcept;
-
-    /// \brief Send one mutation out.
+    /// The mutation will be sent with CL=ALL semantics to all current replicas also in case if the original destination
+    /// is leaving the cluster - otherwise the hint might be applied only on the leaving node and streaming might
+    /// miss it.
     ///
     /// \param m mutation to send
     /// \return future that resolves when the mutation sending processing is complete.

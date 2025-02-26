@@ -3,17 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <boost/range/iterator_range.hpp>
+#include <ranges>
 
 template <typename Container>
-boost::iterator_range<typename Container::iterator>
-unconst(Container& c, boost::iterator_range<typename Container::const_iterator> r) {
-    return boost::make_iterator_range(
+std::ranges::range auto
+unconst(Container& c, std::ranges::range auto&& r) {
+    return std::ranges::subrange(
             c.erase(r.begin(), r.begin()),
             c.erase(r.end(), r.end())
     );

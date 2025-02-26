@@ -1,11 +1,13 @@
-#!/bin/bash
+#!/bin/bash -e
 #
 # Copyright (C) 2023-present ScyllaDB
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
+
+trap 'echo "error $? in $0 line $LINENO"' ERR
 
 version_ge() {
     [  "$2" = "`echo -e "$1\n$2" | sort -V | head -n1`" ]

@@ -5,14 +5,14 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
+#include "bytes.hh"
 #include "cql3/error_listener.hh"
 #include "exceptions/exceptions.hh"
-#include "types/types.hh"
 
 namespace cql3 {
 
@@ -34,7 +34,7 @@ class error_collector : public error_listener<RecognizerType, ExceptionBaseType>
     /**
      * The CQL query.
      */
-    const sstring_view _query;
+    const std::string_view _query;
 
     /**
      * An empty bitset to be used as a workaround for AntLR null dereference
@@ -50,7 +50,7 @@ public:
      *
      * @param query the CQL query that will be parsed
      */
-    error_collector(const sstring_view& query) : _query(query) {}
+    error_collector(const std::string_view& query) : _query(query) {}
 
     /**
      * Format and throw a new \c exceptions::syntax_exception.

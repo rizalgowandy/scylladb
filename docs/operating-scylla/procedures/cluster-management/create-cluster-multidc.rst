@@ -55,42 +55,37 @@ When working with production environments, you must choose one of the snitches b
 Procedure
 ---------
 
-These steps need to be done for each of the nodes in the new cluster.
-
-1. Install Scylla on a node, see :doc:`Getting Started</getting-started/index>` for further instructions, create as many nodes that you need.
-Follow the Scylla install procedure up to scylla.yaml configuration phase.
+1. Install ScyllaDB on the nodes you want to add to the cluster. See :doc:`Getting Started</getting-started/index>` for further instructions, create as many nodes that you need.
+Follow the ScyllaDB install procedure up to scylla.yaml configuration phase.
 
 In case that your node starts during the process follow :doc:`these instructions </operating-scylla/procedures/cluster-management/clear-data>` 
 
-2. In the ``scylla.yaml`` file edit the parameters listed below,
-the file can be found under ``/etc/scylla/``
+2. On each node, edit the ``scylla.yaml`` file to configure the parameters listed below.
+The file can be found under ``/etc/scylla/``.
 
 - **cluster_name** - Set the selected cluster_name
-- **seeds** - Specify the IP of the first node and **only the first node**. New nodes will use the IP of this seed node to connect to the cluster and learn the cluster topology and state.
-- **listen_address** - IP address that the Scylla use to connect to other Scylla nodes in the cluster
+- **seeds** - Specify the IP of the node you chose to be a seed node. New nodes will use the IP of this seed node to connect to the cluster and learn the cluster topology and state.
+- **listen_address** - IP address that the ScyllaDB use to connect to other ScyllaDB nodes in the cluster
 - **endpoint_snitch** - Set the selected snitch
-- **rpc_address** - Address for client connection (Thrift, CQLSH)
-- **consistent_cluster_management** - ``true`` by default, can be set to ``false`` if you don't want to use Raft for consistent schema management in this cluster (will be mandatory in later versions). Check the :doc:`Raft in ScyllaDB document</architecture/raft/>` to learn more.
+- **rpc_address** - Address for CQL client connection
 
 3. In the ``cassandra-rackdc.properties`` file, edit the rack and data center information. 
 The file can be found under ``/etc/scylla/``.
 
-To save bandwidth, add the ``prefer_local=true`` parameter. Scylla will use the node private (local) IP address when the nodes are in the same data center.
+To save bandwidth, add the ``prefer_local=true`` parameter. ScyllaDB will use the node private (local) IP address when the nodes are in the same data center.
 
-4. After you have installed and configured Scylla and edit ``scylla.yaml`` on all nodes, using one node as a seed. Start the seed node, and once it is in **UN** state, repeat for all the other nodes, each after the previous is in **UN** state.
+4. Start the nodes.
 
 .. include:: /rst_include/scylla-commands-start-index.rst
 
-5. Verify that the node added to the cluster
-``nodetool status``
-
-6. If you are running a Scylla version earlier than Scylla Open Source 4.3 or Scylla Enterprise 2021.1, you need to update the seeds parameter in each node's scylla.yaml file to include the IP of at least one more seed node. See :ref:`Older Version Of Scylla <seeds-older-versions>` for details. You should specify at least two seed nodes per DC. Remember to use public IPs.
+5. Verify that the nodes have been added to the cluster using  
+``nodetool status``.
 
 **For Example:**
 
 In this example, we will show how to install a nine nodes cluster.
 
-1. Installing nine Scylla nodes, three nodes in each data center (U.S, ASIA, EUROPE). The IP's are:
+1. Install nine ScyllaDB nodes, three nodes in each data center (U.S, ASIA, EUROPE). The IP's are:
 
 .. code-block:: shell
 
@@ -112,7 +107,7 @@ In this example, we will show how to install a nine nodes cluster.
    Node8 192.168.1.208 54.235.9.159
    Node9 192.168.1.209 54.146.228.25
  
-2. In each Scylla node, edit the ``scylla.yaml`` file. See :ref:`Single Multi Data Centers Configuration Table <create-cluster-multi-config-table>` for reference.
+2. In each ScyllaDB node, edit the ``scylla.yaml`` file. See :ref:`Single Multi Data Centers Configuration Table <create-cluster-multi-config-table>` for reference.
 
 **U.S Data-center - 192.168.1.201**
 
@@ -153,7 +148,7 @@ In this example, we will show how to install a nine nodes cluster.
    broadcast_rpc_address: "54.160.174.243"
    listen_on_broadcast_address: true (optional)
 
-3. In each Scylla node, edit the ``cassandra-rackdc.properties`` file with the relevant rack and data center information 
+3. In each ScyllaDB node, edit the ``cassandra-rackdc.properties`` file with the relevant rack and data center information 
 
 **Nodes 1-3**
 
@@ -177,11 +172,11 @@ In this example, we will show how to install a nine nodes cluster.
    dc=EUROPE-DC
    rack=RACK1
 
-4. Starting Scylla nodes, starting with the seed node, wait until it is in **UN** state, and repeat for the other nodes.
+4. Start the nodes. 
 
 .. include:: /rst_include/scylla-commands-start-index.rst
 
-5. Verify that the node added to the cluster by using the ``nodetool status`` command
+5. Verify that the nodes have been added to the cluster by using the ``nodetool status`` command.
 
 .. code-block:: shell
 
@@ -216,4 +211,4 @@ In this example, we will show how to install a nine nodes cluster.
 
 See also:
 
-:doc:`Create a Scylla Cluster - Single Data Center (DC) </operating-scylla/procedures/cluster-management/create-cluster>`
+:doc:`Create a ScyllaDB Cluster - Single Data Center (DC) </operating-scylla/procedures/cluster-management/create-cluster>`

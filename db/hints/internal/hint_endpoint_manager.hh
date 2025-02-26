@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #pragma once
 
@@ -13,7 +13,6 @@
 #include <seastar/core/gate.hh>
 #include <seastar/core/shared_mutex.hh>
 #include <seastar/core/shared_ptr.hh>
-#include <seastar/core/smp.hh>
 #include <seastar/util/noncopyable_function.hh>
 
 // Scylla includes.
@@ -22,15 +21,11 @@
 #include "db/hints/internal/hint_sender.hh"
 #include "db/hints/internal/hint_storage.hh"
 #include "db/hints/resource_manager.hh"
-#include "utils/runtime.hh"
 #include "enum_set.hh"
 
 // STD.
 #include <cassert>
-#include <chrono>
 #include <filesystem>
-#include <memory>
-#include <unordered_map>
 
 namespace db::hints {
 
@@ -68,7 +63,7 @@ private:
     hint_sender _sender;
 
 public:
-    hint_endpoint_manager(const endpoint_id& key, manager& shard_manager);
+    hint_endpoint_manager(const endpoint_id& key, std::filesystem::path hint_directory, manager& shard_manager);
     hint_endpoint_manager(hint_endpoint_manager&&);
     ~hint_endpoint_manager();
 
@@ -175,6 +170,8 @@ public:
     }
 
 private:
+    future<> do_store_hint(schema_ptr s, lw_shared_ptr<const frozen_mutation> fm, tracing::trace_state_ptr tr_state);
+
     seastar::shared_mutex& file_update_mutex() noexcept {
         return _file_update_mutex;
     }

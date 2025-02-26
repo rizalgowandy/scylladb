@@ -5,8 +5,8 @@
 #include "dht/sharder.hh"
 #include "reader_permit.hh"
 #include "utils/phased_barrier.hh"
-#include "mutation/mutation_fragment.hh"
 #include "readers/mutation_fragment_v1_stream.hh"
+#include <fmt/core.h>
 
 class repair_reader {
 public:
@@ -16,17 +16,6 @@ public:
         multishard_filter
     };
 
-    friend std::ostream& operator<<(std::ostream& out, read_strategy s) {
-        switch (s) {
-            case read_strategy::local:
-                return out << "local";
-            case read_strategy::multishard_split:
-                return out << "multishard_split";
-            case read_strategy::multishard_filter:
-                return out << "multishard_filter";
-        };
-        return out << "unknown";
-    }
 private:
     schema_ptr _schema;
     reader_permit _permit;
@@ -47,7 +36,7 @@ private:
     uint64_t _reads_issued = 0;
     uint64_t _reads_finished = 0;
 
-    flat_mutation_reader_v2 make_reader(
+    mutation_reader make_reader(
         seastar::sharded<replica::database>& db,
         replica::column_family& cf,
         read_strategy strategy,
@@ -62,7 +51,7 @@ public:
         schema_ptr s,
         reader_permit permit,
         dht::token_range range,
-        const dht::sharder& remote_sharder,
+        const dht::static_sharder& remote_sharder,
         unsigned remote_shard,
         uint64_t seed,
         read_strategy strategy,
@@ -86,4 +75,23 @@ public:
     void check_current_dk();
 
     void pause();
+};
+
+template <> struct fmt::formatter<repair_reader::read_strategy>  : fmt::formatter<string_view> {
+    auto format(repair_reader::read_strategy s, fmt::format_context& ctx) const {
+        using enum repair_reader::read_strategy;
+        std::string_view name = "unknown";
+        switch (s) {
+            case local:
+                name = "local";
+                break;
+            case multishard_split:
+                name = "multishard_split";
+                break;
+            case multishard_filter:
+                name = "multishard_filter";
+                break;
+        };
+        return formatter<string_view>::format(name, ctx);
+    }
 };

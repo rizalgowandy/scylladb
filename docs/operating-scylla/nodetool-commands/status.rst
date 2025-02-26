@@ -2,11 +2,14 @@ Nodetool status
 ===============
 **status** - This command prints the cluster information for a single keyspace or all keyspaces.
 
+The keyspace argument is required to calculate effective ownership information (``Owns`` column).
+For tablet keyspaces, a table is also required for effective ownership.
+
 For example:
 
 ::
 
-    nodetool status
+    nodetool status my_keyspace
 
 Example output:
 
@@ -51,8 +54,8 @@ Example output:
 |Address   |The IP address of the node.            |
 |          |                                       |
 +----------+---------------------------------------+
-|Load      |The size on disk the Scylla data takes |
-|          |up (updates every 60 seconds).         |
+|Load      |The size on disk the ScyllaDB data     |
+|          | takes up (updates every 60 seconds).  |
 |          |                                       |
 |          |                                       |
 |          |                                       |

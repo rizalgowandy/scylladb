@@ -3,9 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include "mutation_writer/multishard_writer.hh"
 #include "mutation/mutation_fragment_v2.hh"
 #include "schema/schema_registry.hh"
@@ -23,19 +24,19 @@ class shard_writer {
 private:
     schema_ptr _s;
     std::unique_ptr<reader_concurrency_semaphore> _semaphore;
-    flat_mutation_reader_v2 _reader;
-    std::function<future<> (flat_mutation_reader_v2 reader)> _consumer;
+    mutation_reader _reader;
+    reader_consumer_v2 _consumer;
 public:
     shard_writer(schema_ptr s,
         std::unique_ptr<reader_concurrency_semaphore> semaphore,
-        flat_mutation_reader_v2 reader,
-        std::function<future<> (flat_mutation_reader_v2 reader)> consumer);
+        mutation_reader reader,
+        reader_consumer_v2 consumer);
     future<> consume();
     future<> close() noexcept;
 };
 
 // The multishard_writer class gets mutation_fragments generated from
-// flat_mutation_reader and consumes the mutation_fragments with
+// mutation_reader and consumes the mutation_fragments with
 // multishard_writer::_consumer. If the mutation_fragment does not belong to
 // the shard multishard_writer is on, it will forward the mutation_fragment to
 // the correct shard. Future returned by multishard_writer() becomes
@@ -47,13 +48,14 @@ private:
     std::vector<foreign_ptr<std::unique_ptr<shard_writer>>> _shard_writers;
     std::vector<future<>> _pending_consumers;
     std::vector<std::optional<queue_reader_handle_v2>> _queue_reader_handles;
-    unsigned _current_shard = -1;
+    dht::shard_replica_set _current_shards;
     uint64_t _consumed_partitions = 0;
-    flat_mutation_reader_v2 _producer;
-    std::function<future<> (flat_mutation_reader_v2)> _consumer;
+    mutation_reader _producer;
+    reader_consumer_v2 _consumer;
 private:
-    unsigned shard_for_mf(const mutation_fragment_v2& mf) {
-        return _sharder.shard_of(mf.as_partition_start().key().token());
+    dht::shard_replica_set shard_for_mf(const mutation_fragment_v2& mf) {
+        auto token = mf.as_partition_start().key().token();
+        return _sharder.shard_for_writes(token);
     }
     future<> make_shard_writer(unsigned shard);
     future<stop_iteration> handle_mutation_fragment(mutation_fragment_v2 mf);
@@ -65,16 +67,16 @@ public:
     multishard_writer(
         schema_ptr s,
         const dht::sharder& sharder,
-        flat_mutation_reader_v2 producer,
-        std::function<future<> (flat_mutation_reader_v2)> consumer);
+        mutation_reader producer,
+        reader_consumer_v2 consumer);
     future<uint64_t> operator()();
     future<> close() noexcept;
 };
 
 shard_writer::shard_writer(schema_ptr s,
     std::unique_ptr<reader_concurrency_semaphore> semaphore,
-    flat_mutation_reader_v2 reader,
-    std::function<future<> (flat_mutation_reader_v2 reader)> consumer)
+    mutation_reader reader,
+    reader_consumer_v2 consumer)
     : _s(s)
     , _semaphore(std::move(semaphore))
     , _reader(std::move(reader))
@@ -99,8 +101,8 @@ future<> shard_writer::close() noexcept {
 multishard_writer::multishard_writer(
     schema_ptr s,
     const dht::sharder& sharder,
-    flat_mutation_reader_v2 producer,
-    std::function<future<> (flat_mutation_reader_v2)> consumer)
+    mutation_reader producer,
+    reader_consumer_v2 consumer)
     : _s(std::move(s))
     , _sharder(sharder)
     , _queue_reader_handles(_sharder.shard_count())
@@ -114,10 +116,11 @@ future<> multishard_writer::make_shard_writer(unsigned shard) {
     _queue_reader_handles[shard] = std::move(handle);
     return smp::submit_to(shard, [gs = global_schema_ptr(_s),
             consumer = _consumer,
-            reader = make_foreign(std::make_unique<flat_mutation_reader_v2>(std::move(reader)))] () mutable {
+            reader = make_foreign(std::make_unique<mutation_reader>(std::move(reader)))] () mutable {
         auto s = gs.get();
-        auto semaphore = std::make_unique<reader_concurrency_semaphore>(reader_concurrency_semaphore::no_limits{}, "shard_writer");
-        auto permit = semaphore->make_tracking_only_permit(s.get(), "multishard-writer", db::no_timeout, {});
+        auto semaphore = std::make_unique<reader_concurrency_semaphore>(reader_concurrency_semaphore::no_limits{}, "shard_writer",
+                reader_concurrency_semaphore::register_metrics::no);
+        auto permit = semaphore->make_tracking_only_permit(s, "multishard-writer", db::no_timeout, {});
         auto this_shard_reader = make_foreign_reader(s, std::move(permit), std::move(reader));
         return make_foreign(std::make_unique<shard_writer>(gs.get(), std::move(semaphore), std::move(this_shard_reader), consumer));
     }).then([this, shard] (foreign_ptr<std::unique_ptr<shard_writer>> writer) {
@@ -130,23 +133,38 @@ future<stop_iteration> multishard_writer::handle_mutation_fragment(mutation_frag
     auto f = make_ready_future<>();
     if (mf.is_partition_start()) {
         _consumed_partitions++;
-        if (unsigned shard = shard_for_mf(mf); shard != _current_shard) {
-            _current_shard = shard;
-            if (!bool(_shard_writers[shard])) {
-                f = make_shard_writer(shard);
+        auto shards = shard_for_mf(mf);
+        if (shards.empty()) [[unlikely]] {
+            return make_exception_future<stop_iteration>(std::runtime_error(
+                    format("multishard_writer: No shards for token {} of {}.{}",
+                           mf.as_partition_start().key().token(), _s->ks_name(), _s->cf_name())));
+        }
+        if (shards != _current_shards) {
+            _current_shards = shards;
+            for (auto shard : shards) {
+                if (!bool(_shard_writers[shard])) {
+                    f = f.then([this, shard] {
+                        return make_shard_writer(shard);
+                    });
+                }
             }
         }
     }
     return f.then([this, mf = std::move(mf)] () mutable {
-        assert(_current_shard != -1u);
-        return _queue_reader_handles[_current_shard]->push(std::move(mf));
+        SCYLLA_ASSERT(!_current_shards.empty());
+        if (_current_shards.size() == 1) [[likely]] {
+            return _queue_reader_handles[_current_shards[0]]->push(std::move(mf));
+        }
+        return seastar::parallel_for_each(_current_shards, [this, mf = std::move(mf)] (unsigned shard) {
+            return _queue_reader_handles[shard]->push(mutation_fragment_v2(*_s, mf.permit(), mf));
+        });
     }).then([] {
         return stop_iteration::no;
     });
 }
 
 future<stop_iteration> multishard_writer::handle_end_of_stream() {
-    return parallel_for_each(boost::irange(0u, _sharder.shard_count()), [this] (unsigned shard) {
+    return parallel_for_each(std::views::iota(0u, _sharder.shard_count()), [this] (unsigned shard) {
         if (_queue_reader_handles[shard]) {
             _queue_reader_handles[shard]->push_end_of_stream();
         }
@@ -202,11 +220,11 @@ future<uint64_t> multishard_writer::operator()() {
 
 future<uint64_t> distribute_reader_and_consume_on_shards(schema_ptr s,
     const dht::sharder& sharder,
-    flat_mutation_reader_v2 producer,
-    std::function<future<> (flat_mutation_reader_v2)> consumer,
+    mutation_reader producer,
+    reader_consumer_v2 consumer,
     utils::phased_barrier::operation&& op) {
     return do_with(multishard_writer(std::move(s), sharder, std::move(producer), std::move(consumer)), std::move(op), [] (multishard_writer& writer, utils::phased_barrier::operation&) {
-        return writer().finally([&writer] {
+        return seastar::futurize_invoke(writer).finally([&writer] {
             return writer.close();
         });
     });
@@ -214,7 +232,7 @@ future<uint64_t> distribute_reader_and_consume_on_shards(schema_ptr s,
 
 future<> multishard_writer::close() noexcept {
     return _producer.close().then([this] {
-        return parallel_for_each(boost::irange(size_t(0), _shard_writers.size()), [this] (auto shard) {
+        return parallel_for_each(std::views::iota(0u, _shard_writers.size()), [this] (auto shard) {
             if (auto w = std::move(_shard_writers[shard])) {
                 return smp::submit_to(shard, [w = std::move(w)] () mutable {
                     return w->close();

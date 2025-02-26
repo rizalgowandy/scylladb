@@ -4,10 +4,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
+
+#include <seastar/core/weak_ptr.hh>
 
 #include "compress.hh"
 #include "sstables/types.hh"
@@ -22,6 +24,8 @@ struct shareable_components {
     sstables::summary summary;
     sstables::statistics statistics;
     std::optional<sstables::scylla_metadata> scylla_metadata;
+    weak_ptr<sstables::checksum> checksum;
+    std::optional<uint32_t> digest;
 };
 
 }   // namespace sstables

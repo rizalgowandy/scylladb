@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -13,6 +13,20 @@
 #include "raft/raft.hh"
 
 namespace service {
+
+struct join_node_query_params {};
+
+struct join_node_query_result {
+    enum class topology_mode : uint8_t {
+        // The cluster uses legacy, gossiper-based topology operations
+        legacy = 0,
+
+        // The cluster uses raft-based topology operations
+        raft = 1,
+    };
+
+    topology_mode topo_mode;
+};
 
 struct join_node_request_params {
     raft::server_id host_id;
@@ -24,9 +38,11 @@ struct join_node_request_params {
     sstring rack;
     sstring release_version;
     uint32_t num_tokens;
+    sstring tokens_string;
     uint32_t shard_count;
     uint32_t ignore_msb;
     std::vector<sstring> supported_features;
+    utils::UUID request_id;
 };
 
 struct join_node_request_result {

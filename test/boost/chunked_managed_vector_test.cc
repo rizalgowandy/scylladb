@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <boost/test/unit_test.hpp>
@@ -11,14 +11,15 @@
 
 #include <deque>
 #include <random>
+#include <ranges>
+#include <algorithm>
+
 #include "utils/lsa/chunked_managed_vector.hh"
 #include "utils/managed_ref.hh"
 #include "test/lib/log.hh"
 
-#include <boost/range/algorithm/sort.hpp>
 #include <boost/range/algorithm/equal.hpp>
 #include <boost/range/algorithm/reverse.hpp>
-#include <boost/range/irange.hpp>
 
 using namespace logalloc;
 
@@ -50,7 +51,7 @@ SEASTAR_TEST_CASE(test_random_walk) {
             }
             case 1: {
                 auto nr_pushes = nr_dist(rand);
-                for (auto i : boost::irange(size_t(0), nr_pushes)) {
+                for (auto i : std::views::iota(size_t(0), nr_pushes)) {
                     (void)i;
                     auto n = rand();
                     c.push_back(n);
@@ -73,8 +74,8 @@ SEASTAR_TEST_CASE(test_random_walk) {
                 break;
             }
             case 4: {
-                boost::sort(c);
-                boost::sort(d);
+                std::ranges::sort(c);
+                std::ranges::sort(d);
                 break;
             }
             case 5: {
@@ -190,16 +191,18 @@ SEASTAR_TEST_CASE(tests_reserve_partial) {
   with_allocator(region.allocator(), [&] {
    as(region, [&] {
     auto rand = std::default_random_engine();
-    auto size_dist = std::uniform_int_distribution<unsigned>(1, 1 << 12);
+    // use twice the max_chunk_capacity() as upper limit to test if
+    // reserve_partial() can reserve capacity across multiple chunks.
+    auto max_test_size = lsa::chunked_managed_vector<uint8_t>::max_chunk_capacity() * 2;
+    auto size_dist = std::uniform_int_distribution<unsigned>(1, max_test_size);
 
     for (int i = 0; i < 100; ++i) {
         lsa::chunked_managed_vector<uint8_t> v;
-        const auto orig_size = size_dist(rand);
-        auto size = orig_size;
-        while (size) {
-            size = v.reserve_partial(size);
+        const auto size = size_dist(rand);
+        while (v.capacity() != size) {
+            v.reserve_partial(size);
         }
-        BOOST_REQUIRE_EQUAL(v.capacity(), orig_size);
+        BOOST_REQUIRE_EQUAL(v.capacity(), size);
     }
    });
   });
@@ -329,3 +332,38 @@ SEASTAR_TEST_CASE(test_shrinking_and_expansion_involving_chunk_boundary) {
     return make_ready_future<>();
 }
 
+struct push_back_item {
+    std::unique_ptr<int> p;
+    push_back_item() = default;
+    push_back_item(int v) : p(std::make_unique<int>(v)) {}
+    push_back_item(const push_back_item& x) : push_back_item(x.value() + 1) {}
+    push_back_item(push_back_item&& x) noexcept : p(std::exchange(x.p, nullptr)) {}
+
+    int value() const noexcept { return *p; }
+};
+
+template <class VectorType>
+static void do_test_push_back_using_existing_element(std::function<void (VectorType&, const managed_ref<push_back_item>&)> do_push_back) {
+    region region;
+    allocating_section as;
+
+    with_allocator(region.allocator(), [&] {
+        VectorType v;
+        as(region, [&] {
+            v.push_back(make_managed<push_back_item>(0));
+            for (int i = 0; i < 1000; i++) {
+                do_push_back(v, v.back());
+            }
+        });
+        for (int i = 0; i < 1000; i++) {
+            BOOST_REQUIRE_EQUAL(v[i]->value(), i);
+        }
+    });
+}
+
+SEASTAR_TEST_CASE(test_push_back_using_existing_element) {
+    using chunked_managed_vector_type = lsa::chunked_managed_vector<managed_ref<push_back_item>>;
+    do_test_push_back_using_existing_element<chunked_managed_vector_type>([] (chunked_managed_vector_type& v, const managed_ref<push_back_item>& x) { v.push_back(make_managed<push_back_item>(*x)); });
+    do_test_push_back_using_existing_element<chunked_managed_vector_type>([] (chunked_managed_vector_type& v, const managed_ref<push_back_item>& x) { v.emplace_back(make_managed<push_back_item>(*x)); });
+    return make_ready_future<>();
+}

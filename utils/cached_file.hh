@@ -3,24 +3,23 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "reader_permit.hh"
+#include "utils/assert.hh"
 #include "utils/div_ceil.hh"
 #include "utils/bptree.hh"
+#include "utils/logalloc.hh"
 #include "utils/lru.hh"
 #include "utils/error_injection.hh"
 #include "tracing/trace_state.hh"
 #include "utils/cached_file_stats.hh"
 
 #include <seastar/core/file.hh>
-#include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/maybe_yield.hh>
-
-#include <map>
 
 using namespace seastar;
 
@@ -79,6 +78,10 @@ private:
             }
             return std::unique_ptr<cached_page, cached_page_del>(this);
         }
+
+        bool only_ref() const {
+            return _use_count <= 1;
+        }
     public:
         explicit cached_page(cached_file* parent, page_idx_type idx, temporary_buffer<char> buf)
             : parent(parent)
@@ -98,7 +101,7 @@ private:
         }
 
         ~cached_page() {
-            assert(!_use_count);
+            SCYLLA_ASSERT(!_use_count);
         }
 
         void on_evicted() noexcept override;
@@ -115,11 +118,10 @@ private:
             return temporary_buffer<char>(_buf.get_write(), _buf.size(), make_deleter([self = std::move(self)] {}));
         }
 
-        // Returns a buffer which reflects contents of this page.
-        // The buffer will not prevent eviction.
+        // Returns a pointer to the contents of the page.
         // The buffer is invalidated when the page is evicted or when the owning LSA region invalidates references.
-        temporary_buffer<char> get_buf_weak() {
-            return temporary_buffer<char>(_lsa_buf.get(), _lsa_buf.size(), deleter());
+        char* begin() {
+            return _lsa_buf.get();
         }
 
         size_t size_in_allocator() {
@@ -151,43 +153,52 @@ private:
     offset_type _last_page_size;
     page_idx_type _last_page;
 private:
-    future<cached_page::ptr_type> get_page_ptr(page_idx_type idx,
+    // Returns (page, true) if the page was cached, and (page, false) if the page was uncached.
+    future<std::pair<cached_page::ptr_type, bool>> get_page_ptr(page_idx_type idx,
             page_count_type read_ahead,
-            tracing::trace_state_ptr trace_state) {
+            tracing::trace_state_ptr trace_state,
+            std::optional<reader_permit> permit = {}) {
         auto i = _cache.lower_bound(idx);
         if (i != _cache.end() && i->idx == idx) {
             ++_metrics.page_hits;
             tracing::trace(trace_state, "page cache hit: file={}, page={}", _file_name, idx);
             cached_page& cp = *i;
-            return make_ready_future<cached_page::ptr_type>(cp.share());
+            return make_ready_future<std::pair<cached_page::ptr_type, bool>>(cp.share(), true);
         }
         tracing::trace(trace_state, "page cache miss: file={}, page={}, readahead={}", _file_name, idx, read_ahead);
         ++_metrics.page_misses;
         size_t size = (idx + read_ahead) > _last_page
                 ? (_last_page_size + (_last_page - idx) * page_size)
                 : read_ahead * page_size;
+
+        std::optional<reader_permit::resource_units> units;
+        std::optional<reader_permit::awaits_guard> await_guard;
+        if (permit) {
+            units = permit->consume_memory(size);
+            await_guard.emplace(*permit);
+        }
+
         return _file.dma_read_exactly<char>(idx * page_size, size)
-            .then([this, idx] (temporary_buffer<char>&& buf) mutable {
+            .then([this, ag = std::move(await_guard), units = std::move(units), idx] (temporary_buffer<char>&& buf) mutable {
                 cached_page::ptr_type first_page;
                 while (buf.size()) {
                     auto this_size = std::min(page_size, buf.size());
                     // _cache.emplace() needs to run under allocating section even though it lives in the std space
                     // because bplus::tree operations are not reentrant, so we need to prevent memory reclamation.
-                    auto it_and_flag = _as(_region, [&] {
+                    auto [cp, missed] = _as(_region, [&] {
                         auto this_buf = buf.share();
                         this_buf.trim(this_size);
                         return _cache.emplace(idx, this, idx, std::move(this_buf));
                     });
                     buf.trim_front(this_size);
                     ++idx;
-                    cached_page &cp = *it_and_flag.first;
-                    if (it_and_flag.second) {
+                    if (missed) {
                         ++_metrics.page_populations;
-                        _metrics.cached_bytes += cp.size_in_allocator();
-                        _cached_bytes += cp.size_in_allocator();
+                        _metrics.cached_bytes += cp->size_in_allocator();
+                        _cached_bytes += cp->size_in_allocator();
                     }
                     // pages read ahead will be placed into LRU, as there's no guarantee they will be fetched later.
-                    cached_page::ptr_type ptr = cp.share();
+                    cached_page::ptr_type ptr = cp->share();
                     if (!first_page) {
                         first_page = std::move(ptr);
                     }
@@ -195,24 +206,33 @@ private:
                 utils::get_local_injector().inject("cached_file_get_first_page", []() {
                     throw std::bad_alloc();
                 });
-                return first_page;
+                return std::pair<cached_page::ptr_type, bool>(std::move(first_page), false);
             });
     }
-    future<temporary_buffer<char>> get_page(page_idx_type idx,
+    // Returns (page, true) if the page was cached, and (page, false) if the page was uncached.
+    future<std::pair<temporary_buffer<char>, bool>> get_page(page_idx_type idx,
                                             page_count_type count,
-                                            tracing::trace_state_ptr trace_state) {
-        return get_page_ptr(idx, count, std::move(trace_state)).then([] (cached_page::ptr_type cp) {
-            return cp->get_buf();
+                                            tracing::trace_state_ptr trace_state,
+                                            std::optional<reader_permit> permit = {}) {
+        return get_page_ptr(idx, count, std::move(trace_state), permit).then([permit] (std::pair<cached_page::ptr_type, bool> cp) mutable {
+            auto buf = cp.first->get_buf();
+            if (permit) {
+                auto units = permit->consume_memory(buf.size());
+                buf = temporary_buffer<char>(buf.get_write(), buf.size(),
+                                             make_object_deleter(buf.release(), std::move(units)));
+            }
+            return std::make_pair(std::move(buf), cp.second);
         });
     }
 public:
     class page_view {
         cached_page::ptr_type _page;
         size_t _offset;
-        size_t _size;
+        size_t _size = 0;
         std::optional<reader_permit::resource_units> _units;
     public:
         page_view() = default;
+
         page_view(size_t offset, size_t size, cached_page::ptr_type page, std::optional<reader_permit::resource_units> units)
                 : _page(std::move(page))
                 , _offset(offset)
@@ -220,15 +240,64 @@ public:
                 , _units(std::move(units))
         {}
 
-        // The returned buffer is valid only until the LSA region associated with cached_file invalidates references.
-        temporary_buffer<char> get_buf() {
-            auto buf = _page->get_buf_weak();
-            buf.trim(_size);
-            buf.trim_front(_offset);
-            return buf;
+        page_view(page_view&& o) noexcept
+            : _page(std::move(o._page))
+            , _offset(std::exchange(o._offset, 0))
+            , _size(std::exchange(o._size, 0))
+            , _units(std::move(o._units))
+        {}
+
+        page_view& operator=(page_view&& o) noexcept {
+            _page = std::move(o._page);
+            _offset = std::exchange(o._offset, 0);
+            _size = std::exchange(o._size, 0);
+            _units = std::move(o._units);
+            return *this;
         }
 
-        operator bool() const { return bool(_page); }
+        // Fills the page with garbage, releases the pointer and evicts the page so that it's no longer in cache.
+        // For testing use-after-free on the buffer space.
+        // After the call, the object is the same state as after being moved-from.
+        void release_and_scramble() noexcept {
+            if (_page->only_ref()) {
+                std::memset(_page->_lsa_buf.get(), 0xfe, _page->_lsa_buf.size());
+                cached_page& cp = *_page;
+                _page = nullptr;
+                cp.parent->_lru.remove(cp);
+                cp.on_evicted();
+            } else {
+                _page = nullptr;
+            }
+            _size = 0;
+            _offset = 0;
+            _units = std::nullopt;
+        }
+
+        operator bool() const { return bool(_page) && _size; }
+    public: // ContiguousSharedBuffer concept
+        const char* begin() const { return _page ? _page->begin() + _offset : nullptr; }
+        const char* get() const { return begin(); }
+        const char* end() const { return begin() + _size; }
+        size_t size() const { return _size; }
+        bool empty() const { return !_size; }
+        char* get_write() { return const_cast<char*>(begin()); }
+
+        void trim(size_t pos) {
+            _size = pos;
+        }
+
+        void trim_front(size_t n) {
+            _offset += n;
+            _size -= n;
+        }
+
+        page_view share() {
+            return share(0, _size);
+        }
+
+        page_view share(size_t pos, size_t len) {
+            return page_view(_offset + pos, len, _page->share(), {});
+        }
     };
 
     // Generator of subsequent pages of data reflecting the contents of the file.
@@ -245,6 +314,27 @@ public:
             return _permit
                 ? std::make_optional(_permit->consume_memory(size))
                 : std::nullopt;
+        }
+        void shrink_size_hint(bool page_was_cached) {
+            if (page_was_cached) {
+                // If the page was cached, shrink the _size_hint by page_size,
+                // but don't reduce it below page_size.
+                _size_hint = std::max(_size_hint, 2 * page_size) - page_size;
+            } else {
+                // If the page was uncached, then get_page read the entire _size_hint bytes from disk,
+                // (in one I/O operation) and inserted the read pages into the cache.
+                // We will most likely serve the remainder of the stream from them.
+                //
+                // But if some of those pages happen to be evicted before we complete the read
+                // (this shouldn't really happen in practice, because in practice stay in cache
+                // for much, much longer than any read takes, but still), we don't want to read
+                // something on the order of _size_hint again, as that could result, in theory,
+                // in a quadratic amount of work.
+                //
+                // So in the very unlikely chance that we will have to re-read something from disk,
+                // let's do it page-by-page.
+                _size_hint = page_size;
+            }
         }
     public:
         // Creates an empty stream.
@@ -270,22 +360,17 @@ public:
             if (!_cached_file || _page_idx > _cached_file->_last_page) {
                 return make_ready_future<temporary_buffer<char>>(temporary_buffer<char>());
             }
-            auto units = get_page_units(_size_hint);
             page_count_type readahead = div_ceil(_size_hint, page_size);
-            _size_hint = page_size;
-            return _cached_file->get_page(_page_idx, readahead, _trace_state).then(
-                    [units = std::move(units), this] (temporary_buffer<char> page) mutable {
+            return _cached_file->get_page(_page_idx, readahead, _trace_state, _permit).then(
+                    [this] (std::pair<temporary_buffer<char>, bool> read_result) mutable {
+                auto page = std::move(read_result.first);
                 if (_page_idx == _cached_file->_last_page) {
                     page.trim(_cached_file->_last_page_size);
-                }
-                if (units) {
-                    units = get_page_units();
-                    page = temporary_buffer<char>(page.get_write(), page.size(),
-                                                  make_object_deleter(page.release(), std::move(*units)));
                 }
                 page.trim_front(_offset_in_page);
                 _offset_in_page = 0;
                 ++_page_idx;
+                shrink_size_hint(read_result.second);
                 return page;
             });
         }
@@ -298,18 +383,17 @@ public:
             if (!_cached_file || _page_idx > _cached_file->_last_page) {
                 return make_ready_future<page_view>(page_view());
             }
-            auto units = get_page_units(_size_hint);
             page_count_type readahead = div_ceil(_size_hint, page_size);
-            _size_hint = page_size;
-            return _cached_file->get_page_ptr(_page_idx, readahead, _trace_state).then(
-                    [this, units = std::move(units)] (cached_page::ptr_type page) mutable {
+            return _cached_file->get_page_ptr(_page_idx, readahead, _trace_state, _permit).then(
+                    [this] (std::pair<cached_page::ptr_type, bool> read_result) mutable {
+                auto page = std::move(read_result.first);
                 size_t size = _page_idx == _cached_file->_last_page
                         ? _cached_file->_last_page_size
                         : page_size;
-                units = get_page_units(page_size);
-                page_view buf(_offset_in_page, size, std::move(page), std::move(units));
+                page_view buf(_offset_in_page, size - _offset_in_page, std::move(page), get_page_units());
                 _offset_in_page = 0;
                 ++_page_idx;
+                shrink_size_hint(read_result.second);
                 return buf;
             });
         }
@@ -365,7 +449,7 @@ public:
 
     ~cached_file() {
         evict_range(_cache.begin(), _cache.end());
-        assert(_cache.empty());
+        SCYLLA_ASSERT(_cache.empty());
     }
 
     /// \brief Invalidates [start, end) or less.

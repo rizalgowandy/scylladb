@@ -5,44 +5,35 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
-#include "unimplemented.hh"
-#include <seastar/core/distributed.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/gate.hh>
-#include <seastar/core/print.hh>
 #include <seastar/rpc/rpc_types.hh>
-#include <seastar/util/source_location-compat.hh>
+#include "locator/host_id.hh"
 #include "utils/atomic_vector.hh"
 #include "utils/UUID.hh"
 #include "gms/generation-number.hh"
 #include "gms/versioned_value.hh"
 #include "gms/application_state.hh"
 #include "gms/endpoint_state.hh"
-#include "gms/feature.hh"
 #include "gms/gossip_digest_syn.hh"
 #include "gms/gossip_digest.hh"
 #include "utils/loading_shared_values.hh"
 #include "utils/updateable_value.hh"
-#include "utils/in.hh"
 #include "message/messaging_service_fwd.hh"
 #include <optional>
-#include <algorithm>
 #include <chrono>
 #include <set>
-#include <seastar/core/condition-variable.hh>
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/scheduling.hh>
 #include "locator/token_metadata.hh"
-
-namespace db {
-class config;
-}
+#include "locator/types.hh"
+#include "gms/gossip_address_map.hh"
 
 namespace gms {
 
@@ -54,8 +45,6 @@ class inet_address;
 class i_endpoint_state_change_subscriber;
 class gossip_get_endpoint_states_request;
 class gossip_get_endpoint_states_response;
-
-using advertise_myself = bool_class<class advertise_myself_tag>;
 
 struct syn_msg_pending {
     bool pending = false;
@@ -70,6 +59,7 @@ struct ack_msg_pending {
 struct gossip_config {
     seastar::scheduling_group gossip_scheduling_group = seastar::scheduling_group();
     sstring cluster_name;
+    locator::host_id host_id;
     utils::UUID group0_id;
     std::set<inet_address> seeds;
     sstring partitioner;
@@ -77,6 +67,15 @@ struct gossip_config {
     uint32_t shadow_round_ms = 300 * 1000;
     uint32_t shutdown_announce_ms = 2 * 1000;
     uint32_t skip_wait_for_gossip_to_settle = -1;
+    utils::updateable_value<uint32_t> failure_detector_timeout_ms;
+    utils::updateable_value<int32_t> force_gossip_generation;
+};
+
+struct loaded_endpoint_state {
+    gms::inet_address endpoint;
+    std::unordered_set<dht::token> tokens;
+    std::optional<locator::endpoint_dc_rack> opt_dc_rack;
+    std::optional<gms::versioned_value> opt_status;
 };
 
 /**
@@ -95,7 +94,7 @@ class gossiper : public seastar::async_sharded_service<gossiper>, public seastar
 public:
     using clk = seastar::lowres_system_clock;
     using ignore_features_of_local_node = bool_class<class ignore_features_of_local_node_tag>;
-    using generation_for_nodes = std::unordered_map<gms::inet_address, generation_type>;
+    using generation_for_nodes = std::unordered_map<locator::host_id, generation_type>;
 private:
     using messaging_verb = netw::messaging_verb;
     using messaging_service = netw::messaging_service;
@@ -106,7 +105,7 @@ private:
     future<> handle_syn_msg(msg_addr from, gossip_digest_syn syn_msg);
     future<> handle_ack_msg(msg_addr from, gossip_digest_ack ack_msg);
     future<> handle_ack2_msg(msg_addr from, gossip_digest_ack2 msg);
-    future<> handle_echo_msg(inet_address from, std::optional<int64_t> generation_number_opt);
+    future<> handle_echo_msg(inet_address from, const locator::host_id* id, seastar::rpc::opt_time_point, std::optional<int64_t> generation_number_opt, bool notify_up);
     future<> handle_shutdown_msg(inet_address from, std::optional<int64_t> generation_number_opt);
     future<> do_send_ack_msg(msg_addr from, gossip_digest_syn syn_msg);
     future<> do_send_ack2_msg(msg_addr from, utils::chunked_vector<gossip_digest> ack_msg_digest);
@@ -121,17 +120,16 @@ private:
     seastar::gate _background_msg;
     std::unordered_map<gms::inet_address, syn_msg_pending> _syn_handlers;
     std::unordered_map<gms::inet_address, ack_msg_pending> _ack_handlers;
-    bool _advertise_myself = true;
     // Map ip address and generation number
     generation_for_nodes _advertise_to_nodes;
     future<> _failure_detector_loop_done{make_ready_future<>()} ;
 
-    rpc::no_wait_type background_msg(sstring type, noncopyable_function<future<>(gossiper&)> fn);
+    future<rpc::no_wait_type> background_msg(sstring type, noncopyable_function<future<>(gossiper&)> fn);
 
 public:
     // Get current generation number for the given nodes
     future<generation_for_nodes>
-    get_generation_for_nodes(std::unordered_set<gms::inet_address> nodes) const;
+    get_generation_for_nodes(std::unordered_set<locator::host_id> nodes) const;
     // Only respond echo message listed in nodes with the generation number
     future<> advertise_to_nodes(generation_for_nodes advertise_to_nodes = {});
     const sstring& get_cluster_name() const noexcept;
@@ -142,6 +140,9 @@ public:
         return _gcfg.partitioner;
     }
 
+    locator::host_id my_host_id() const noexcept {
+        return get_token_metadata_ptr()->get_topology().my_host_id();
+    }
     inet_address get_broadcast_address() const noexcept {
         return get_token_metadata_ptr()->get_topology().my_address();
     }
@@ -155,6 +156,10 @@ public:
         permit_id pid;
         semaphore_units<> units;
         size_t holders = 0;
+        std::optional<seastar::compat::source_location> first_holder;
+        // last_holder is the caller of endpoint_permit who last took this entry,
+        // it might not be a current holder (the permit might've been destroyed)
+        std::optional<seastar::compat::source_location> last_holder;
 
         endpoint_lock_entry() noexcept;
     };
@@ -163,9 +168,9 @@ public:
         endpoint_locks_map::entry_ptr _ptr;
         permit_id _permit_id;
         inet_address _addr;
-        std::string _caller;
+        seastar::compat::source_location _caller;
     public:
-        endpoint_permit(endpoint_locks_map::entry_ptr&& ptr, inet_address addr, std::string caller) noexcept;
+        endpoint_permit(endpoint_locks_map::entry_ptr&& ptr, inet_address addr, seastar::compat::source_location caller) noexcept;
         endpoint_permit(endpoint_permit&&) noexcept;
         ~endpoint_permit();
         bool release() noexcept;
@@ -188,11 +193,11 @@ private:
     endpoint_locks_map _endpoint_locks;
 
 public:
-    const std::vector<sstring> DEAD_STATES = {
+    static constexpr std::array DEAD_STATES{
         versioned_value::REMOVED_TOKEN,
         versioned_value::STATUS_LEFT,
     };
-    const std::vector<sstring> SILENT_SHUTDOWN_STATES = {
+    static constexpr std::array SILENT_SHUTDOWN_STATES{
         versioned_value::REMOVED_TOKEN,
         versioned_value::STATUS_LEFT,
         versioned_value::STATUS_BOOTSTRAPPING,
@@ -245,25 +250,29 @@ private:
 
     bool _in_shadow_round = false;
 
+    service::topology_state_machine* _topo_sm = nullptr;
+
     // Must be called on shard 0.
     future<semaphore_units<>> lock_endpoint_update_semaphore();
+
+    struct live_and_unreachable_endpoints {
+        std::unordered_set<inet_address> live;
+        std::unordered_map<inet_address, clk::time_point> unreachable;
+    };
 
     // Must be called on shard 0.
     // Update _live_endpoints and/or _unreachable_endpoints
     // on shard 0, after acquiring `lock_endpoint_update_semaphore`.
-    // replicate_live_endpoints_on_change is called to replicate the changes to
-    // all shards and _live_endpoints_version is bumped unconditionally.
     //
-    // FIXME: The function is not exception safe so some shards
-    // may be left with stale _live_endpoints or _unreachable_endpoints.
-    // In this case, the _live_endpoints_version on that shard will not be updated.
-    // That can be examined under the endpoint_update_semaphore to make sure
-    // they all shards are consistent with each other.
-    future<> mutate_live_and_unreachable_endpoints(std::function<void(gossiper&)>);
+    // The called function modifies a copy of live_and_unreachable_endpoints
+    // which is then copied to temporary copies for all shards
+    // and then applied atomcically on all shards.
+    //
+    future<> mutate_live_and_unreachable_endpoints(std::function<void(live_and_unreachable_endpoints&)> func);
 
     // replicate shard 0 live and unreachable endpoints sets across all other shards.
     // _endpoint_update_semaphore must be held for the whole duration
-    future<> replicate_live_endpoints_on_change();
+    future<> replicate_live_endpoints_on_change(foreign_ptr<std::unique_ptr<live_and_unreachable_endpoints>>, uint64_t new_live_endpoints_version);
 
     void run();
     // Replicates given endpoint_state to all other shards.
@@ -271,7 +280,7 @@ private:
     // Must be called under lock_endpoint.
     future<> replicate(inet_address, endpoint_state, permit_id);
 public:
-    explicit gossiper(abort_source& as, const locator::shared_token_metadata& stm, netw::messaging_service& ms, const db::config& cfg, gossip_config gcfg);
+    explicit gossiper(abort_source& as, const locator::shared_token_metadata& stm, netw::messaging_service& ms, gossip_config gcfg, gossip_address_map& address_map);
 
     /**
      * Register for interesting state changes.
@@ -287,19 +296,20 @@ public:
      */
     future<> unregister_(shared_ptr<i_endpoint_state_change_subscriber> subscriber);
 
-    std::set<inet_address> get_live_members() const;
+    std::set<locator::host_id> get_live_members() const;
 
-    std::set<inet_address> get_live_token_owners() const;
+    std::set<locator::host_id> get_live_token_owners() const;
 
     /**
      * @return a list of unreachable gossip participants, including fat clients
      */
     std::set<inet_address> get_unreachable_members() const;
+    std::set<locator::host_id> get_unreachable_host_ids() const;
 
     /**
-     * @return a list of unreachable token owners
+     * @return a list of unreachable nodes
      */
-    std::set<inet_address> get_unreachable_token_owners() const;
+    std::set<locator::host_id> get_unreachable_nodes() const;
 
     int64_t get_endpoint_downtime(inet_address ep) const noexcept;
 
@@ -311,6 +321,13 @@ public:
      */
     version_type get_max_endpoint_state_version(const endpoint_state& state) const noexcept;
 
+    void set_topology_state_machine(service::topology_state_machine* m) {
+        _topo_sm = m;
+        if (m) {
+            // In raft topology mode the coodinator maintains banned nodes list
+            _just_removed_endpoints.clear();
+        }
+    }
 
 private:
     /**
@@ -413,6 +430,7 @@ public:
     // The endpoint_state is immutable (except for its update_timestamp), guaranteed not to change while
     // the endpoint_state_ptr is held.
     endpoint_state_ptr get_endpoint_state_ptr(inet_address ep) const noexcept;
+    endpoint_state_ptr get_endpoint_state_ptr(locator::host_id ep) const noexcept;
 
     // Return this node's endpoint_state_ptr
     endpoint_state_ptr get_this_endpoint_state_ptr() const noexcept {
@@ -420,6 +438,7 @@ public:
     }
 
     const versioned_value* get_application_state_ptr(inet_address endpoint, application_state appstate) const noexcept;
+    const versioned_value* get_application_state_ptr(locator::host_id id, application_state appstate) const noexcept;
     sstring get_application_state_value(inet_address endpoint, application_state appstate) const;
 
     // removes ALL endpoint states; should only be called after shadow gossip.
@@ -455,7 +474,7 @@ public:
     /**
      * determine which endpoint started up earlier
      */
-    generation_type::value_type compare_endpoint_startup(inet_address addr1, inet_address addr2) const;
+    std::strong_ordering compare_endpoint_startup(inet_address addr1, inet_address addr2) const;
 
     /**
      * Return the rpc address associated with an endpoint as a string.
@@ -463,13 +482,10 @@ public:
      * @return the rpc address
      */
     sstring get_rpc_address(const inet_address& endpoint) const;
+
+    future<> real_mark_alive(inet_address addr);
 private:
-    // FIXME: for now, allow modifying the endpoint_state's heartbeat_state in place
-    // Gets or creates endpoint_state for this node
-    endpoint_state& get_or_create_endpoint_state(inet_address ep);
-    endpoint_state& my_endpoint_state() {
-        return get_or_create_endpoint_state(get_broadcast_address());
-    }
+    endpoint_state& my_endpoint_state();
 
     // Use with care, as the endpoint_state_ptr in the endpoint_state_map is considered
     // immutable, with one exception - the update_timestamp.
@@ -479,8 +495,6 @@ private:
     void update_timestamp_for_nodes(const std::map<inet_address, endpoint_state>& map);
 
     void mark_alive(inet_address addr);
-
-    future<> real_mark_alive(inet_address addr);
 
     // Must be called under lock_endpoint.
     future<> mark_dead(inet_address addr, endpoint_state_ptr local_state, permit_id);
@@ -496,13 +510,20 @@ private:
      *
      * Must be called under lock_endpoint.
      */
-    future<> handle_major_state_change(inet_address ep, endpoint_state eps, permit_id);
+    future<> handle_major_state_change(inet_address ep, endpoint_state eps, permit_id, bool shadow_round);
 
+    template<typename ID>
+    future<> wait_alive_helper(noncopyable_function<std::vector<ID>()> get_nodes, std::chrono::milliseconds timeout);
 public:
     bool is_alive(inet_address ep) const;
+    bool is_alive(locator::host_id id) const;
+
     bool is_dead_state(const endpoint_state& eps) const;
     // Wait for nodes to be alive on all shards
     future<> wait_alive(std::vector<gms::inet_address> nodes, std::chrono::milliseconds timeout);
+    future<> wait_alive(std::vector<locator::host_id> nodes, std::chrono::milliseconds timeout);
+    future<> wait_alive(noncopyable_function<std::vector<locator::host_id>()> get_nodes, std::chrono::milliseconds timeout);
+    std::set<inet_address> get_live_members_helper() const;
 
     // Wait for `n` live nodes to show up in gossip (including ourself).
     future<> wait_for_live_nodes_to_show_up(size_t n);
@@ -516,19 +537,15 @@ public:
     future<> apply_state_locally(std::map<inet_address, endpoint_state> map);
 
 private:
-    future<> do_apply_state_locally(gms::inet_address node, endpoint_state remote_state, bool listener_notification);
-    future<> apply_state_locally_without_listener_notification(std::unordered_map<inet_address, endpoint_state> map);
+    future<> do_apply_state_locally(gms::inet_address node, endpoint_state remote_state, bool shadow_round);
+    future<> apply_state_locally_in_shadow_round(std::unordered_map<inet_address, endpoint_state> map);
 
     // Must be called under lock_endpoint.
-    future<> apply_new_states(inet_address addr, endpoint_state local_state, const endpoint_state& remote_state, permit_id);
-
-    // notify that a local application state is going to change (doesn't get triggered for remote changes)
-    // Must be called under lock_endpoint.
-    future<> do_before_change_notifications(inet_address addr, endpoint_state_ptr ep_state, const application_state& ap_state, const versioned_value& new_value) const;
+    future<> apply_new_states(inet_address addr, endpoint_state local_state, const endpoint_state& remote_state, permit_id, bool shadow_round);
 
     // notify that an application state has changed
     // Must be called under lock_endpoint.
-    future<> do_on_change_notifications(inet_address addr, const application_state& state, const versioned_value& value, permit_id) const;
+    future<> do_on_change_notifications(inet_address addr, const application_state_map& states, permit_id) const;
 
     // notify that a node is DOWN (dead)
     // Must be called under lock_endpoint.
@@ -588,8 +605,7 @@ public:
      * existing nodes can talk to the replacing node. So the probability of
      * replacing node being talked to is pretty high.
      */
-    future<> start_gossiping(gms::generation_type generation_nbr, std::map<application_state, versioned_value> preload_local_states = {},
-            gms::advertise_myself advertise = gms::advertise_myself::yes);
+    future<> start_gossiping(gms::generation_type generation_nbr, application_state_map preload_local_states = {});
 
 public:
     using mandatory = bool_class<class mandatory_tag>;
@@ -607,7 +623,7 @@ public:
     /**
      * Add an endpoint we knew about previously, but whose state is unknown
      */
-    future<> add_saved_endpoint(inet_address ep);
+    future<> add_saved_endpoint(locator::host_id host_id, loaded_endpoint_state st, permit_id);
 
     future<> add_local_application_state(application_state state, versioned_value value);
 
@@ -615,12 +631,10 @@ public:
      * Applies all states in set "atomically", as in guaranteed monotonic versions and
      * inserted into endpoint state together (and assuming same grouping, overwritten together).
      */
-    future<> add_local_application_state(std::list<std::pair<application_state, versioned_value>>);
+    future<> add_local_application_state(application_state_map states);
 
-    /**
-     * Intentionally overenginered to avoid very rare string copies.
-     */
-    future<> add_local_application_state(std::initializer_list<std::pair<application_state, utils::in<versioned_value>>>);
+    // Add multiple application states
+    future<> add_local_application_state(std::convertible_to<std::pair<const application_state, versioned_value>> auto&&... states);
 
     future<> start();
     future<> shutdown();
@@ -630,12 +644,6 @@ public:
 public:
     bool is_enabled() const;
 
-    void finish_shadow_round();
-
-    bool is_in_shadow_round() const;
-
-    void goto_shadow_round();
-
 public:
     void add_expire_time_for_endpoint(inet_address endpoint, clk::time_point expire_time);
 
@@ -643,6 +651,7 @@ public:
 public:
     bool is_seed(const inet_address& endpoint) const;
     bool is_shutdown(const inet_address& endpoint) const;
+    bool is_shutdown(const endpoint_state& eps) const;
     bool is_normal(const inet_address& endpoint) const;
     bool is_left(const inet_address& endpoint) const;
     // Check if a node is in NORMAL or SHUTDOWN status which means the node is
@@ -669,8 +678,7 @@ private:
     abort_source& _abort_source;
     const locator::shared_token_metadata& _shared_token_metadata;
     netw::messaging_service& _messaging;
-    utils::updateable_value<uint32_t> _failure_detector_timeout_ms;
-    utils::updateable_value<int32_t> _force_gossip_generation;
+    gossip_address_map& _address_map;
     gossip_config _gcfg;
     // Get features supported by a particular node
     std::set<sstring> get_supported_features(inet_address endpoint) const;
@@ -687,6 +695,14 @@ public:
     void check_snitch_name_matches(sstring local_snitch_name) const;
     int get_down_endpoint_count() const noexcept;
     int get_up_endpoint_count() const noexcept;
+    // Send UP notification to all nodes in the set
+    future<> notify_nodes_on_up(std::unordered_set<locator::host_id>);
+    const gossip_address_map& get_address_map() const  {
+        return _address_map;
+    }
+    gossip_address_map& get_mutable_address_map() const {
+        return _address_map;
+    }
 private:
     future<> failure_detector_loop();
     future<> failure_detector_loop_for_node(gms::inet_address node, generation_type gossip_generation, uint64_t live_endpoints_version);
@@ -702,4 +718,18 @@ struct gossip_get_endpoint_states_response {
     std::unordered_map<gms::inet_address, gms::endpoint_state> endpoint_state_map;
 };
 
+future<>
+gossiper::add_local_application_state(std::convertible_to<std::pair<const application_state, versioned_value>> auto&&... states) {
+    application_state_map tmp;
+    (..., tmp.emplace(std::forward<decltype(states)>(states)));
+    return add_local_application_state(std::move(tmp));
+}
+
+
 } // namespace gms
+
+template <>
+struct fmt::formatter<gms::loaded_endpoint_state> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const gms::loaded_endpoint_state&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

@@ -5,14 +5,17 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
+
+trap 'echo "error $? in $0 line $LINENO"' ERR
 
 product="$(<build/SCYLLA-PRODUCT-FILE)"
 version="$(sed 's/-/~/' <build/SCYLLA-VERSION-FILE)"
 release="$(<build/SCYLLA-RELEASE-FILE)"
 
 mode="release"
+type="ubuntu"
 
 if uname -m | grep x86_64 ; then
   arch="amd64"
@@ -24,7 +27,7 @@ fi
 
 
 print_usage() {
-    echo "usage: $0 [--mode mode]"
+    echo "usage: $0 [--mode mode] [--type ubuntu|pro, default: ubuntu]"
     exit 1
 }
 
@@ -34,31 +37,60 @@ while [ $# -gt 0 ]; do
             mode="$2"
             shift 2
             ;;
+        --type)
+            type="$2"
+            shift 2
+            ;;
         *)
             print_usage
             ;;
     esac
 done
 
-container="$(buildah from docker.io/ubuntu:22.04)"
-
-packages=(
-    "build/dist/$mode/debian/${product}_$version-$release-1_$arch.deb"
-    "build/dist/$mode/debian/$product-server_$version-$release-1_$arch.deb"
-    "build/dist/$mode/debian/$product-conf_$version-$release-1_$arch.deb"
-    "build/dist/$mode/debian/$product-kernel-conf_$version-$release-1_$arch.deb"
-    "build/dist/$mode/debian/$product-node-exporter_$version-$release-1_$arch.deb"
-    "tools/java/build/debian/$product-tools_$version-$release-1_all.deb"
-    "tools/java/build/debian/$product-tools-core_$version-$release-1_all.deb"
-    "tools/jmx/build/debian/$product-jmx_$version-$release-1_all.deb"
-    "tools/cqlsh/build/debian/$product-cqlsh_$version-$release-1_all.deb"
-    "tools/python3/build/debian/$product-python3_$version-$release-1_$arch.deb"
-)
+# CMake puts deb packages in build/$<CONFIG>, so translate $mode
+# to $<CONFIG> if build.ninja is located under build/.
+config=$mode
+if [ -f build/build.ninja ]; then
+   case $mode in
+       release)
+           config=RelWithDebInfo
+           ;;
+       dev)
+           config=Dev
+           ;;
+       debug)
+           config=Debug
+           ;;
+       *)
+           echo "unsupported mode: ${mode}"
+           exit 1
+           ;;
+   esac
+fi
 
 bcp() { buildah copy "$container" "$@"; }
 run() { buildah run "$container" "$@"; }
 bconfig() { buildah config "$@" "$container"; }
 
+if [ "$type" == "pro" ]; then
+  container="$(buildah from docker.io/ubuntu:20.04)"
+  bcp dist/docker/pro-attach-config.yaml /pro-attach-config.yaml
+elif [ "$type" == "ubuntu" ]; then
+  container="$(buildah from docker.io/ubuntu:24.04)"
+else
+  echo "$type is not a valid option. supported values: ubuntu|pro"
+  exit 1
+fi
+
+packages=(
+    "build/dist/$config/debian/${product}_$version-$release-1_$arch.deb"
+    "build/dist/$config/debian/$product-server_$version-$release-1_$arch.deb"
+    "build/dist/$config/debian/$product-conf_$version-$release-1_$arch.deb"
+    "build/dist/$config/debian/$product-kernel-conf_$version-$release-1_$arch.deb"
+    "build/dist/$config/debian/$product-node-exporter_$version-$release-1_$arch.deb"
+    "tools/cqlsh/build/debian/$product-cqlsh_$version-$release-1_$arch.deb"
+    "tools/python3/build/debian/$product-python3_$version-$release-1_$arch.deb"
+)
 
 bcp "${packages[@]}" packages/
 
@@ -76,8 +108,7 @@ run apt-get -y update
 run apt-get -y upgrade
 run apt-get -y --no-install-suggests install dialog apt-utils
 run bash -ec "echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections"
-run bash -ec "rm -rf /etc/rsyslog.conf"
-run apt-get -y --no-install-suggests install hostname supervisor openjdk-11-jre-headless python2 python3 python3-yaml curl rsyslog sudo
+run apt-get -y --no-install-suggests install supervisor python3 python3-yaml curl sudo systemd
 run bash -ec "echo LANG=C.UTF-8 > /etc/default/locale"
 run bash -ec "dpkg -i packages/*.deb"
 run apt-get -y clean all
@@ -85,12 +116,11 @@ run bash -ec "cat /scylla_bashrc >> /etc/bash.bashrc"
 run mkdir -p /etc/supervisor.conf.d
 run mkdir -p /var/log/scylla
 run chown -R scylla:scylla /var/lib/scylla
-run sed -i -e 's/^SCYLLA_ARGS=".*"$/SCYLLA_ARGS="--log-to-syslog 0 --log-to-stdout 1 --default-log-level info --network-stack posix"/' /etc/default/scylla-server
+run sed -i -e 's/^SCYLLA_ARGS=".*"$/SCYLLA_ARGS="--log-to-syslog 0 --log-to-stdout 1 --network-stack posix"/' /etc/default/scylla-server
 
 run mkdir -p /opt/scylladb/supervisor
 run touch /opt/scylladb/SCYLLA-CONTAINER-FILE
 bcp dist/common/supervisor/scylla-server.sh /opt/scylladb/supervisor/scylla-server.sh
-bcp dist/common/supervisor/scylla-jmx.sh /opt/scylladb/supervisor/scylla-jmx.sh
 bcp dist/common/supervisor/scylla-node-exporter.sh /opt/scylladb/supervisor/scylla-node-exporter.sh
 bcp dist/common/supervisor/scylla_util.sh /opt/scylladb/supervisor/scylla_util.sh
 
@@ -102,9 +132,13 @@ bconfig --entrypoint  '["/docker-entrypoint.py"]'
 bconfig --cmd  ''
 bconfig --port 10000 --port 9042 --port 9160 --port 9180 --port 7000 --port 7001 --port 22
 bconfig --volume "/var/lib/scylla"
+bconfig --label org.opencontainers.image.ref.name="ScyllaDB"
+bconfig --label org.opencontainers.image.version="$version-$release"
+bconfig --label description="ScyllaDB Open Source"
+bconfig --label summary="NoSQL data store using the seastar framework, compatible with Apache Cassandra"
 
 mkdir -p build/$mode/dist/docker/
 image="oci-archive:build/$mode/dist/docker/$product-$version-$release"
-buildah commit "$container" "$image"
+buildah commit --rm "$container" "$image"
 
 echo "Image is now available in $image."

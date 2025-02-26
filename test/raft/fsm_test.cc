@@ -3,14 +3,24 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #define BOOST_TEST_MODULE raft
 
+#include "raft/tracker.hh"
 #include "test/raft/helpers.hh"
 
 using namespace raft;
+
+namespace raft {
+
+std::ostream& boost_test_print_type(std::ostream& os, const vote_result& v) {
+    fmt::print(os, "{}", v);
+    return os;
+}
+
+}
 
 BOOST_AUTO_TEST_CASE(test_votes) {
     auto id1 = id();
@@ -241,12 +251,12 @@ BOOST_AUTO_TEST_CASE(test_log_last_conf_idx) {
     server_id id1 = id();
     raft::configuration cfg = config_from_ids({id1});
     raft::log log{raft::snapshot_descriptor{.config = cfg}};
-    BOOST_CHECK_EQUAL(log.last_conf_idx(), 0);
+    BOOST_CHECK_EQUAL(log.last_conf_idx(), index_t{0});
     add_entry(log, cfg);
-    BOOST_CHECK_EQUAL(log.last_conf_idx(), 1);
+    BOOST_CHECK_EQUAL(log.last_conf_idx(), index_t{1});
     add_entry(log, log_entry::dummy{});
     add_entry(log, cfg);
-    BOOST_CHECK_EQUAL(log.last_conf_idx(), 3);
+    BOOST_CHECK_EQUAL(log.last_conf_idx(), index_t{3});
     // apply snapshot truncates the log and resets last_conf_idx()
     log.apply_snapshot(log_snapshot(log, log.last_idx()), 0, 0);
     BOOST_CHECK_EQUAL(log.last_conf_idx(), log.get_snapshot().idx);
@@ -304,7 +314,7 @@ void test_election_single_node_helper(raft::fsm_config fcfg) {
     server_id id1 = id();
     raft::configuration cfg = config_from_ids({id1});
     raft::log log{raft::snapshot_descriptor{.config = cfg}};
-    raft::fsm fsm(id1, term_t{}, server_id{}, std::move(log), trivial_failure_detector, fcfg);
+    fsm_debug fsm(id1, term_t{}, server_id{}, std::move(log), trivial_failure_detector, fcfg);
 
     election_timeout(fsm);
 
@@ -529,7 +539,7 @@ BOOST_AUTO_TEST_CASE(test_election_two_nodes_prevote) {
     raft::configuration cfg = config_from_ids({id1, id2});
     raft::log log{raft::snapshot_descriptor{.config = cfg}};
 
-    raft::fsm fsm(id1, term_t{}, server_id{}, std::move(log), trivial_failure_detector, fcfg);
+    fsm_debug fsm(id1, term_t{}, server_id{}, std::move(log), trivial_failure_detector, fcfg);
 
     // Initial state is follower
     BOOST_CHECK(fsm.is_follower());
@@ -595,7 +605,7 @@ BOOST_AUTO_TEST_CASE(test_election_four_nodes_prevote) {
     raft::configuration cfg = config_from_ids({id1, id2, id3, id4});
     raft::log log{raft::snapshot_descriptor{.config = cfg}};
 
-    raft::fsm fsm(id1, term_t{}, server_id{}, std::move(log), fd, fcfg);
+    fsm_debug fsm(id1, term_t{}, server_id{}, std::move(log), fd, fcfg);
 
     // Initial state is follower
     BOOST_CHECK(fsm.is_follower());
@@ -652,7 +662,7 @@ BOOST_AUTO_TEST_CASE(test_log_matching_rule) {
     log.emplace_back(seastar::make_lw_shared<raft::log_entry>(raft::log_entry{term_t{10}, index_t{1000}}));
     log.stable_to(log.last_idx());
 
-    raft::fsm fsm(id1, term_t{10}, server_id{}, std::move(log), trivial_failure_detector, fsm_cfg);
+    fsm_debug fsm(id1, term_t{10}, server_id{}, std::move(log), trivial_failure_detector, fsm_cfg);
 
     // Initial state is follower
     BOOST_CHECK(fsm.is_follower());
@@ -825,7 +835,7 @@ BOOST_AUTO_TEST_CASE(test_confchange_remove_node) {
     BOOST_CHECK_EQUAL(msg.entries.size(), 1);
     BOOST_CHECK(std::holds_alternative<raft::configuration>(msg.entries[0]->data));
     idx = msg.entries.back().get()->idx;
-    BOOST_CHECK_EQUAL(idx, 102);
+    BOOST_CHECK_EQUAL(idx, index_t{102});
     // Ack AppendEntries for the joint configuration
     // In order to accept a configuration change
     // we need one ACK, since there is a quorum overlap.
@@ -844,7 +854,7 @@ BOOST_AUTO_TEST_CASE(test_confchange_remove_node) {
     }
 
     idx = msg.entries.back().get()->idx;
-    BOOST_CHECK_EQUAL(idx, 103);
+    BOOST_CHECK_EQUAL(idx, index_t{103});
 
     BOOST_CHECK_EQUAL(fsm.get_configuration().current.size(), 2);
     BOOST_CHECK(!fsm.get_configuration().is_joint());
@@ -929,7 +939,7 @@ BOOST_AUTO_TEST_CASE(test_leader_stepdown) {
         {server_addr_from_id(id1), true}, {server_addr_from_id(id2), true}, {server_addr_from_id(id3), false}});
     raft::log log(raft::snapshot_descriptor{.config = cfg});
 
-    raft::fsm fsm(id1, term_t{1}, /* voted for */ server_id{}, std::move(log), trivial_failure_detector, fsm_cfg);
+    fsm_debug fsm(id1, term_t{1}, /* voted for */ server_id{}, std::move(log), trivial_failure_detector, fsm_cfg);
 
     // Check that we move to candidate state on timeout_now message
     fsm.step(id2, raft::timeout_now{fsm.get_current_term()});
@@ -1034,7 +1044,7 @@ BOOST_AUTO_TEST_CASE(test_leader_stepdown) {
         {server_addr_from_id(id1), true}, {server_addr_from_id(id2), true}, {server_addr_from_id(id3), true}});
     raft::log log2(raft::snapshot_descriptor{.config = cfg});
 
-    raft::fsm fsm2(id1, term_t{1}, /* voted for */ server_id{}, std::move(log2), trivial_failure_detector, fsm_cfg);
+    fsm_debug fsm2(id1, term_t{1}, /* voted for */ server_id{}, std::move(log2), trivial_failure_detector, fsm_cfg);
 
     election_timeout(fsm2);
     // Turn to a leader
@@ -1099,7 +1109,7 @@ BOOST_AUTO_TEST_CASE(test_empty_configuration) {
     auto output = follower.get_output();
     BOOST_CHECK_EQUAL(output.log_entries.size(), 0);
     BOOST_CHECK_EQUAL(output.messages.size(), 0);
-    BOOST_CHECK_EQUAL(follower.get_current_term(), 0);
+    BOOST_CHECK_EQUAL(follower.get_current_term(), term_t{0});
 
     server_id id2 = id();
     auto log2 = raft::log(raft::snapshot_descriptor{.idx = index_t{0}, .config = config_from_ids({id2})});
@@ -1111,7 +1121,7 @@ BOOST_AUTO_TEST_CASE(test_empty_configuration) {
     leader.add_entry(config_from_ids({id1, id2}));
 
     communicate(leader, follower);
-    BOOST_CHECK_EQUAL(follower.get_current_term(), 1);
+    BOOST_CHECK_EQUAL(follower.get_current_term(), term_t{1});
     BOOST_CHECK_EQUAL(follower.in_memory_log_size(), leader.in_memory_log_size());
     BOOST_CHECK_EQUAL(leader.get_configuration().is_joint(), false);
 }
@@ -1136,11 +1146,11 @@ BOOST_AUTO_TEST_CASE(test_confchange_a_to_b) {
     A.add_entry(config_from_ids({B_id}));
 
     communicate(A, B);
-    BOOST_CHECK_EQUAL(A.get_current_term(), 1);
+    BOOST_CHECK_EQUAL(A.get_current_term(), term_t{1});
     BOOST_CHECK(A.is_follower());
     // A is not part of the current configuration
     BOOST_CHECK(B.is_leader());
-    BOOST_CHECK_EQUAL(B.get_current_term(), 2);
+    BOOST_CHECK_EQUAL(B.get_current_term(), term_t{2});
     BOOST_CHECK_EQUAL(B.get_configuration().is_joint(), false);
     BOOST_CHECK_EQUAL(B.get_configuration().current.size(), 1);
     BOOST_CHECK(B.get_configuration().current.contains(config_member_from_id(B_id)));
@@ -1152,7 +1162,7 @@ BOOST_AUTO_TEST_CASE(test_confchange_a_to_b) {
     // A somewhat awkward way to obtain B's log for restart
     log.emplace_back(make_lw_shared<raft::log_entry>(B.add_entry(config_from_ids({A_id}))));
     log.stable_to(log.last_idx());
-    raft::fsm B_1(B_id, B.get_current_term(), B_id, std::move(log), trivial_failure_detector, fsm_cfg);
+    fsm_debug B_1(B_id, B.get_current_term(), B_id, std::move(log), trivial_failure_detector, fsm_cfg);
     election_timeout(B_1);
     communicate(A, B_1);
     BOOST_CHECK(B_1.is_follower());
@@ -1184,7 +1194,7 @@ BOOST_AUTO_TEST_CASE(test_confchange_ab_to_cd) {
     A.add_entry(config_from_ids({C_id, D_id}));
     communicate(A, B, C, D);
 
-    BOOST_CHECK_EQUAL(A.get_current_term(), 1);
+    BOOST_CHECK_EQUAL(A.get_current_term(), term_t{1});
     // A and B are not part of the current configuration
     BOOST_CHECK(A.is_follower());
     BOOST_CHECK(B.is_follower());
@@ -1192,7 +1202,7 @@ BOOST_AUTO_TEST_CASE(test_confchange_ab_to_cd) {
     election_timeout(C);
     election_threshold(D);
     communicate(A, B, C, D);
-    BOOST_CHECK_EQUAL(C.get_current_term(), 2);
+    BOOST_CHECK_EQUAL(C.get_current_term(), term_t{2});
     BOOST_CHECK(C.is_leader());
     BOOST_CHECK_EQUAL(C.get_configuration().is_joint(), false);
     BOOST_CHECK_EQUAL(C.get_configuration().current.size(), 2);
@@ -1232,13 +1242,13 @@ BOOST_AUTO_TEST_CASE(test_confchange_abc_to_cde) {
     election_threshold(B);
     communicate(B, C, D, E);
     BOOST_CHECK(A.is_leader());
-    BOOST_CHECK_EQUAL(A.get_current_term(), 1);
+    BOOST_CHECK_EQUAL(A.get_current_term(), term_t{1});
     BOOST_CHECK(B.is_follower());
     BOOST_CHECK(C.is_leader());
     BOOST_CHECK(D.is_follower());
     BOOST_CHECK(E.is_follower());
 
-    BOOST_CHECK(C.get_current_term() >= 2);
+    BOOST_CHECK(C.get_current_term() >= term_t{2});
     BOOST_CHECK_EQUAL(C.get_configuration().is_joint(), false);
     BOOST_CHECK_EQUAL(C.get_configuration().current.size(), 3);
 }
@@ -1469,7 +1479,7 @@ BOOST_AUTO_TEST_CASE(test_zero) {
 
 BOOST_AUTO_TEST_CASE(test_reordered_reject) {
     auto id1 = id();
-    raft::fsm fsm1(id1, term_t{1}, server_id{},
+    fsm_debug fsm1(id1, term_t{1}, server_id{},
             raft::log{raft::snapshot_descriptor{.config = config_from_ids({id1})}},
             trivial_failure_detector, fsm_cfg);
 
@@ -1481,7 +1491,7 @@ BOOST_AUTO_TEST_CASE(test_reordered_reject) {
     (void)fsm1.get_output();
 
     auto id2 = id();
-    raft::fsm fsm2(id2, term_t{1}, server_id{},
+    fsm_debug fsm2(id2, term_t{1}, server_id{},
             raft::log{raft::snapshot_descriptor{.config = raft::configuration{}}},
             trivial_failure_detector, fsm_cfg);
 
@@ -2202,12 +2212,12 @@ BOOST_AUTO_TEST_CASE(test_read_barrier) {
     BOOST_CHECK(output.max_read_id_with_quorum);
 
     // check that read_barrier with lower term does not depose the leader
-    A.step(E_id, read_quorum{term_t{A.get_current_term() - 1}, index_t{10}, rid->first});
+    A.step(E_id, read_quorum{A.get_current_term() - term_t{1}, index_t{10}, rid->first});
     BOOST_CHECK(A.is_leader());
 
     // check that read_barrier with higher term leads to leader
     // step down
-    A.step(E_id, read_quorum{term_t{A.get_current_term() + 1}, index_t{10}, rid->first});
+    A.step(E_id, read_quorum{A.get_current_term() + term_t{1}, index_t{10}, rid->first});
     BOOST_CHECK(!A.is_leader());
 
     // create one node cluster

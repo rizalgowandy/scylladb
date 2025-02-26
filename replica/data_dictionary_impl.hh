@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -126,6 +126,9 @@ public:
     }
     virtual replica::database& real_database(data_dictionary::database db) const override {
         return const_cast<replica::database&>(unwrap(db));
+    }
+    virtual replica::database* real_database_ptr(data_dictionary::database db) const override {
+        return &real_database(db);
     }
     virtual schema_ptr get_cdc_base_table(data_dictionary::database db, const schema& s) const override {
         return cdc::get_base_table(unwrap(db), s);

@@ -1,7 +1,10 @@
 #include <seastar/core/coroutine.hh>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
+#include <seastar/core/pipe.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/on_internal_error.hh>
 #include <seastar/util/log.hh>
+#include "utils/assert.hh"
 #include "utils/lister.hh"
 #include "checked-file-impl.hh"
 
@@ -46,7 +49,7 @@ future<directory_entry> lister::guarantee_type(directory_entry de) {
         return f.then([dir = _dir, de = std::move(de)] (std::optional<directory_entry_type> t) mutable {
             // If some FS error occurs - return an exceptional future
             if (!t) {
-                return make_exception_future<directory_entry>(std::runtime_error(format("Failed to get {} type.", (dir / de.name.c_str()).native())));
+                return make_exception_future<directory_entry>(std::runtime_error(fmt::format("Failed to get {} type.", (dir / de.name.c_str()).native())));
             }
             de.type = t;
             return make_ready_future<directory_entry>(std::move(de));
@@ -89,7 +92,7 @@ future<std::optional<directory_entry>> directory_lister::get() {
         auto walker = [this] (fs::path dir, directory_entry de) {
             return _queue.push_eventually(std::make_optional<directory_entry>(std::move(de)));
         };
-        assert(!_lister);
+        SCYLLA_ASSERT(!_lister);
         _lister = std::make_unique<lister>(std::move(dir), _type, std::move(walker), _filter, _dir, _do_show_hidden);
         _opt_done_fut = _lister->done().then_wrapped([this] (future<> f) {
             if (f.failed()) [[unlikely]] {

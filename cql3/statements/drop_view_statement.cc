@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include <seastar/core/coroutine.hh>
@@ -42,7 +42,7 @@ future<> drop_view_statement::check_access(query_processor& qp, const service::c
 }
 
 future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>>
-drop_view_statement::prepare_schema_mutations(query_processor& qp, api::timestamp_type ts) const {
+drop_view_statement::prepare_schema_mutations(query_processor& qp, const query_options&, api::timestamp_type ts) const {
     ::shared_ptr<cql_transport::event::schema_change> ret;
     std::vector<mutation> m;
 
@@ -66,7 +66,7 @@ drop_view_statement::prepare_schema_mutations(query_processor& qp, api::timestam
 
 std::unique_ptr<cql3::statements::prepared_statement>
 drop_view_statement::prepare(data_dictionary::database db, cql_stats& stats) {
-    return std::make_unique<prepared_statement>(make_shared<drop_view_statement>(*this));
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<drop_view_statement>(*this));
 }
 
 }

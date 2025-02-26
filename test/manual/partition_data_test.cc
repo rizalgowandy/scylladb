@@ -3,16 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #define BOOST_TEST_MODULE partition_data
 #include <boost/test/unit_test.hpp>
 
 #include <random>
-
-#include <boost/range/irange.hpp>
-#include <boost/range/algorithm/generate.hpp>
 
 #include "test/lib/random_utils.hh"
 #include "utils/disk-error-handler.hh"

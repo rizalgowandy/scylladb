@@ -3,13 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "debug.hh"
 
 namespace debug {
 
-seastar::sharded<replica::database>* the_database = nullptr;
+seastar::sharded<replica::database>* volatile the_database = nullptr;
 
 }

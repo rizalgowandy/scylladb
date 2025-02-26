@@ -5,45 +5,33 @@ ScyllaDB FAQ
 .. meta::
    :title:
    :description: Frequently Asked Questions about ScyllaDB
-   :keywords: questions, Scylla, ScyllaDB, DBaaS, FAQ, error, problem
+   :keywords: questions, ScyllaDB, ScyllaDB, DBaaS, FAQ, error, problem
 
 Performance
 -----------
 
-I’m not getting the level of performance I expected. What’s wrong?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Lower than expected performance can be a result of many factors, from HW (storage, CPU, network) to data modeling to the application layer.
-As a first step, make sure to have |mon_root| in place. Looking at the Scylla dashboard is the best way to look for bottlenecks.
-If you need our help, please follow :doc:`How to Report a Performance Problem </troubleshooting/report-scylla-problem/>` to share data securely.
+ScyllaDB is using all of my memory! Why is that? What if the server runs out of memory?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ScyllaDB uses available memory to cache your data. ScyllaDB knows how to dynamically manage memory for optimal performance; for example, if many clients connect to ScyllaDB, it will evict some data from the cache to make room for these connections; when the connection count drops again, this memory is returned to the cache.
 
-Scylla is using all of my memory! Why is that? What if the server runs out of memory?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Scylla uses available memory to cache your data. Scylla knows how to dynamically manage memory for optimal performance; for example, if many clients connect to Scylla, it will evict some data from the cache to make room for these connections; when the connection count drops again, this memory is returned to the cache.
+Can I limit ScyllaDB to use less CPU and memory?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+The :code:`--smp` option (for instance, :code:`--smp 2`) will restrict ScyllaDB to a smaller number of CPUs. It will still use 100 % of those CPUs, but at least won’t take your system out completely. An analogous option exists for memory: :code:`-m`.
 
-Can I limit Scylla to use less CPU and memory?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-The :code:`--smp` option (for instance, :code:`--smp 2`) will restrict Scylla to a smaller number of CPUs. It will still use 100 % of those CPUs, but at least won’t take your system out completely. An analogous option exists for memory: :code:`-m`.
+What are some of the techniques ScyllaDB uses to achieve its performance?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ScyllaDB tries to utilize all available resources (processor cores, memory, storage, and networking) by always operating in parallel and never blocking. If ScyllaDB needs to read a disk block, it initiates the read and immediately moves on to another task. Later, when the read completes ScyllaDB resumes the original task from where it left off. By never blocking, a high degree of concurrency is achieved, allowing all resources to be utilized to their limit.
+Read more on ScyllaDB Architecture:
 
-Do I ever need to disable the Scylla cache to use less memory?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-It is not possible to turn off the Scylla cache. But cache problems do not arise in normal operation. Scylla can use up to 50% of memory for cache, and will dynamically evict rows from the cache if they are too large. So the only possibility of getting an out of memory error is if a single row is bigger than 50% of the memory for a shard. This is (total_machine_memory / (number_of_lcores * 2)).
+* `ScyllaDB Technology <http://www.scylladb.com/product/technology/>`_
+* `ScyllaDB Memory Management <http://www.scylladb.com/product/technology/memory-management/>`_
 
-For a 64GB machine with 16 cores and hyperthreading enabled, you have 2GB per shard, of which the cache can use 1GB per shard. With such large rows, you will have other problems. We recommend staying with rows that are less than a few megabytes maximum size.
-
-What are some of the techniques Scylla uses to achieve its performance?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Scylla tries to utilize all available resources (processor cores, memory, storage, and networking) by always operating in parallel and never blocking. If Scylla needs to read a disk block, it initiates the read and immediately moves on to another task. Later, when the read completes Scylla resumes the original task from where it left off. By never blocking, a high degree of concurrency is achieved, allowing all resources to be utilized to their limit.
-Read more on Scylla Architecture:
-
-* `Scylla Technology <http://www.scylladb.com/product/technology/>`_
-* `Scylla Memory Management <http://www.scylladb.com/product/technology/memory-management/>`_
-
-I thought that Scylla's underlying `Seastar framework <https://github.com/scylladb/seastar>`_ uses one thread per core, but I see more than two threads per core. Why?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+I thought that ScyllaDB's underlying `Seastar framework <https://github.com/scylladb/seastar>`_ uses one thread per core, but I see more than two threads per core. Why?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 Seastar creates an extra thread per core for blocking syscalls (like :code:`open()`/ :code:`fsync()` / :code:`close()` ); this allows the Seastar reactor to continue executing while a blocking operation takes place. Those threads are usually idle, so they don’t contribute to significant context switching activity.
 
-I’m seeing X compaction running in parallel on a single Scylla node. Is it normal?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+I’m seeing X compaction running in parallel on a single ScyllaDB node. Is it normal?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 Yes, for more than one reason:
 
 * each shard (core) will run its compactions independently, often at the same time,
@@ -54,22 +42,22 @@ Yes, for more than one reason:
 
 Setting io.conf configuration for HDD storage
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-As part of the Scylla setup process, **iotune** runs a short benchmark of your storage. When completed, it generates the `/etc/scylla.d/io.conf` configuration file. Note that iotune has known issues benchmarking HDD storage.
+As part of the ScyllaDB setup process, **iotune** runs a short benchmark of your storage. When completed, it generates the `/etc/scylla.d/io.conf` configuration file. Note that iotune has known issues benchmarking HDD storage.
 
 .. note:: This section is not relevant in 2.3
 
-Therefore, when using Scylla with HDD storage, it is recommended to use RAID0 on all of your available disks, and manually update the `io.conf` configuration file `max-io-request` parameter. This parameter sets the number of concurrent requests sent to the storage. The value for this parameter should be 3X (3 times) the number of your disks. For example, if you have 3 disks, you would set `max-io-request=9`.
+Therefore, when using ScyllaDB with HDD storage, it is recommended to use RAID0 on all of your available disks, and manually update the `io.conf` configuration file `max-io-request` parameter. This parameter sets the number of concurrent requests sent to the storage. The value for this parameter should be 3X (3 times) the number of your disks. For example, if you have 3 disks, you would set `max-io-request=9`.
 
-How many connections is it recommended to open from each Scylla client application?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+How many connections is it recommended to open from each ScyllaDB client application?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-As a rule of thumb, for Scylla's best performance, each client needs at least 1-3 connection per Scylla core.
-For example, a cluster with three nodes, each node with 16 cores, each client application should open 32 (2x16) connections to each Scylla node.
+As a rule of thumb, for ScyllaDB's best performance, each client needs at least 1-3 connection per ScyllaDB core.
+For example, a cluster with three nodes, each node with 16 cores, each client application should open 32 (2x16) connections to each ScyllaDB node.
 
-Do I need to configure ``swap`` on a Scylla node?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Do I need to configure ``swap`` on a ScyllaDB node?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Yes, configuring ``swap`` on a Scylla node is recommended.
+Yes, configuring ``swap`` on a ScyllaDB node is recommended.
 ``swap`` size should be set to either ``total_mem``/3 or 16GB - lower of the two.
 
 ``total_mem`` is the total size of the nodes memory.
@@ -82,10 +70,6 @@ For example:
 
 Swap can be set up in several ways. One way to set up swap is detailed in the KB Article :doc:`How to Set up a Swap Space </kb/set-up-swap>`.
 
-After upgrade from Scylla 2.1 and older, scylla_reactor_utilization metrics is at high percentage (high CPU utilization is observed). Why does this happen?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Scylla 2.2 enables the compaction automatic controller which was not present prior to version 2.2. What this means is that in Scylla 2.1 (and earlier) the system waits for 4 SSTables to be present in the same tier before starting a compaction. In Scylla 2.2 (and later), compactions can be controlled to not impact the workload. This means that workloads which have been considered as backlog in Scylla 2.1 and earlier, in Scylla 2.2 and later are not.
-
 My query does not return any or some of the data? What happened?
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 If you are using a time range in the query, refer to the solution in the troubleshooting document, :doc:`Time Range Queries Do Not Return Some or All of the Data </troubleshooting/time-zone>`.
@@ -94,7 +78,7 @@ If you are using a time range in the query, refer to the solution in the trouble
 DESC SCHEMA shows that I am using many materialized views (MVs) when I know I only added Secondary Indexes (SI). Why are there MVs in my schema?
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-As SI is built ontop of MV, you can expect to see MV in your schema. There is nothing wrong with your system. More information on :doc:`Global Secondary Indexes </using-scylla/secondary-indexes>`.
+As SI is built on top of MV, you can expect to see MV in your schema. There is nothing wrong with your system. More information on :doc:`Global Secondary Indexes </features/secondary-indexes>`.
 
 
 Using the Java driver SimpleStatements are slow. Why does this happen?
@@ -107,9 +91,9 @@ Disk Space
 
 .. _reclaim-space:
 
-Dropping a table does not reduce storage used by Scylla, how can I clean the disk from dropped tables?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-scylla.yaml includes an ``auto_snapshot`` parameter; when true (it is by default), Scylla creates a snapshot for a table just before dropping it, as a safety measure.
+Dropping a table does not reduce storage used by ScyllaDB, how can I clean the disk from dropped tables?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+scylla.yaml includes an ``auto_snapshot`` parameter; when true (it is by default), ScyllaDB creates a snapshot for a table just before dropping it, as a safety measure.
 You can find the snapshot in the ``snapshots`` directory, under the table SSTable. For example, for dropped table ``users`` in keyspace ``mykeyspace``:
 
 :code:`/var/lib/scylla/data/mykeyspace/users-bdba4e60f6d511e7a2ab000000000000/snapshots/1515678531438-users`
@@ -120,14 +104,35 @@ You can clean snapshots by using :doc:`nodetool clearsnapshot </operating-scylla
   
 Features
 --------
-I want to try out new features.  How do I enable experimental mode?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-You need to add the line :code:`experimental: true`  to your :code:`scylla.yaml` file.
 
-1. Launch the file in a text editor: :code:`$ vi /etc/scylla/scylla.yaml`. (Alternately, on docker, it's :code:`$ docker exec -it your_node vi /etc/scylla/scylla.yaml`);
-2. Add the line :code:`experimental: true`;
+I want to try out new features.  How do I enable them?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+ScyllaDB features can be enabled individually either through the configuration file or via command-line flags.
+
+To configure using :code:`scylla.yaml` file:
+
+1. Open the file in a text editor:
+
+   On Linux systems
+
+   :code:`$ vi /etc/scylla/scylla.yaml`
+
+   On Docker
+
+   :code:`$ docker exec -it your_node vi /etc/scylla/scylla.yaml`
+
+2. Add the features you want to enable
+
+   .. code-block:: yaml
+
+      # Example: enabling UDF and Alternator Streams features
+      experimental_features:
+         - udf
+         - alternator-streams
+
 3. Save the file and exit.
-4. Stop and restart the node. 
+4. Restart the node.
 
    On RedHat Enterprise Linux, CentOS or Ubuntu:
    
@@ -137,70 +142,30 @@ You need to add the line :code:`experimental: true`  to your :code:`scylla.yaml`
    
    :code:`$ docker stop <your_node> && docker start <your_node>`
 
-   Alternately, starting from Scylla 2.0, you can start Scylla for Docker with the :code:`experimental` flag as follows:
+Alternately, starting from ScyllaDB 3.3, you can enable features directly via command line flags the :code:`--experimental-features` flag as follows. This command line options can be repeated multiple times. For example, to enable UDF and Alternator Streams:
 
-   :code:`$ docker run --name <your_node> -d scylladb/scylla --experimental 1`
+.. code-block:: console
 
-You should now be able to use the experimental features available in your version of Scylla.
+   $ docker run --name <your_node> -d scylladb/scylla \
+       --experimental-features=udf \
+       --experimental-features=alternator-streams
 
-How do I check the current version of Scylla that I am running?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+You should now be able to use the specified experimental features.
+
+How do I check the current version of ScyllaDB that I am running?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 * On a regular system or VM (running Ubuntu, CentOS, or RedHat Enterprise): :code:`$ scylla --version`
 
 Check the :doc:`Operating System Support Guide </getting-started/os-support>` for a list of supported operating systems and versions.
 
 * On a docker node: :code:`$ docker exec -it Node_Z scylla --version`
 
-
-Is Scylla Apache Cassandra compatible? Is API / interface X compatible?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-See :doc:`ScyllaDB and Apache Cassandra Compatibility </using-scylla/cassandra-compatibility>` for compatibility matrix.
-
-Which version(s) of Apache Cassandra is Scylla compatible with? Will Scylla be compatible with future Cassandra versions?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-See :doc:`ScyllaDB and Apache Cassandra Compatibility </using-scylla/cassandra-compatibility>` for current and future Apache Cassandra release compatibility.
-
-
 I am upgrading my nodes to a version that uses a newer SSTable format, when will the nodes start using the new SSTable format?
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-The :doc:`new "mc" SSTable format</architecture/sstable/sstable3/index>` is supported in Scylla 3.0 and later.
-Scylla only starts using the newer format when every node in the cluster is capable to generate it.
+The :doc:`new "mc" SSTable format</architecture/sstable/sstable3/index>` is supported in ScyllaDB 3.0 and later.
+ScyllaDB only starts using the newer format when every node in the cluster is capable to generate it.
 Therefore, only when all nodes in the cluster are upgraded the new format is used.
-
-
-What if I get an error when trying to use cqlsh DESCRIBE commands?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-Apache Cassandra 4.0 includes breaking changes in the DESCRIBE command by moving its implementation from the client (cqlsh) 
-to the server. As a result, using DESCRIBE in cqlsh from Cassandra 4.0 package with Scylla will result in an error. As a remedy, 
-you can do one of the following:
-
-* Use Scylla cqlsh:
-
-    * On Linux, you can install the ``scylla-tools`` package from the official ScyllaDB repository on GitHub. 
-      The package contains cqlsh and other Apache Cassandra compatible tools for Scylla. 
-    * On Linux, Windows, or Mac, you can run a Scylla container.
-* Downgrade your cqlsh to a version based on Cassandra 3.x, which supports DESCRIBE commands.
-
-.. note::
-   The Scylla roadmap includes moving DESCRIBE to server side, similarly to Cassandra 4.0. See https://github.com/scylladb/scylla/issues/9571 for information about progress.
-
-Ubuntu
-------
-
-.. _faq-check-update-kernel:
-
-Check and update Ubuntu 14.04 kernel
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Running Scylla on Ubuntu 14.04 requires kernel 3.15 or later
-
-* To check your kernel version: :code:`$ uname -a`
-* If your kernel is older than 3.15 then:
-
-  * Check for available kernels: :code:`$ sudo apt-cache search linux-image`
-  * Install: :code:`$ sudo apt-get install linux-image-your_version_choice`, for example *linux-image-3.16.0*
-  * restart: :code:`$ sudo reboot now`
 
 Docker
 -------
@@ -215,10 +180,10 @@ See `Error connecting Java Spring application to ScyllaDB Cluster in Docker <htt
 
 
 Installation
-------------
-Can I install Scylla on an Apache Cassandra server?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Scylla comes with its own version of the Apache Cassandra client tools, in the package :code:`scylla-tools`. Trying to install it on a server with Cassandra already installed may result in something like:
+-----------------------------------------------------
+Can I install ScyllaDB on an Apache Cassandra server?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ScyllaDB comes with its own version of the Apache Cassandra client tools, in the package :code:`scylla-tools`. Trying to install it on a server with Cassandra already installed may result in something like:
 
 .. code-block:: console
 
@@ -227,6 +192,8 @@ Scylla comes with its own version of the Apache Cassandra client tools, in the p
    trying to overwrite '/usr/bin/nodetool', which is also in package cassandra 2.1.4
 
 We recommend uninstalling Apache Cassandra before installing :code:`scylla-tools`.
+
+ .. TODO Update the example below then a patch release for 2025.1 is available
 
 .. _faq-pinning:
 
@@ -254,7 +221,7 @@ Alternatively, you can explicitly install **all** the ScyllaDB packages for the 
 
 .. code-block:: console
 
-   sudo apt-get install scylla-enterprise{,-server,-jmx,-tools,-tools-core,-kernel-conf,-node-exporter,-conf,-python3}=2021.1.0-0.20210511.9e8e7d58b-1
+   sudo apt-get install scylla-enterprise{,-server,-tools,-tools-core,-kernel-conf,-node-exporter,-conf,-python3}=2021.1.0-0.20210511.9e8e7d58b-1
    sudo apt-get install scylla-enterprise-machine-image=2021.1.0-0.20210511.9e8e7d58b-1  # only execute on AMI instance
 
 
@@ -265,11 +232,9 @@ Which snitch or replication strategy should I use?
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 If you are creating a production cluster or if your cluster is going to have more than one data center you need to use a **DC-aware** snitch, e.g. :code:`GossipingPropertyFileSnitch` or :code:`Ec2MultiRegionSnitch`. You will also need to use a **DC-aware** replication strategy, e.g. :code:`NetworkTopologyStrategy`.
 
-However, if you are going to create your first cluster or want to try something simple, if your cluster is going to have a single data center then you may use a :code:`SimpleSnitch` and then use a :code:`SimpleStrategy` for your keyspaces.
-
 Our general recommendation is to always use a :code:`NetworkTopologyStrategy` and use :code:`Ec2XXX` snitches on AWS based clusters and :code:`GossipingPropertyFileSnitch` in all other cases.
 
-A description of all snitch options we support may be found here: `Snitches <https://github.com/scylladb/scylla/wiki/Snitches>`_.
+A description of all snitch options we support may be found in :doc:`Snitches </operating-scylla/system-configuration/snitch>`.
 
 Note: trying to mix a :code:`SimpleSnitch` with a :code:`DC-aware strategy` or a :code:`DC-aware snitch` with a :code:`SimpleStrategy` may cause your cluster not to work as intended therefore we **strongly discourage** these types of configurations in general.
 
@@ -329,12 +294,12 @@ Yes, but it will require running a full repair (or cleanup) to change the replic
 Why can't I set ``listen_address`` to listen to 0.0.0.0 (all my addresses)?
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Scylla is a gossip-based distributed system and ``listen_address`` is the address a node tells other nodes to reach
+ScyllaDB is a gossip-based distributed system and ``listen_address`` is the address a node tells other nodes to reach
 it at. Telling other nodes "contact me on any of my addresses" is a bad idea; if different nodes in the cluster pick
 different addresses for you, Bad Things happen.
 
 If you don't want to manually specify an IP to ``listen_address`` for each node in your cluster (understandable!), leave
-it blank and Scylla will use ``InetAddress.getLocalHost()`` to pick an address. Then it's up to you or your ops team
+it blank and ScyllaDB will use ``InetAddress.getLocalHost()`` to pick an address. Then it's up to you or your ops team
 to make things resolve correctly (``/etc/hosts/``, dns, etc).
 
 .. _faq-best-scenario-node-multi-availability-zone:
@@ -398,42 +363,26 @@ Where can I ask a question not covered here?
 * `scylladb-dev <https://groups.google.com/d/forum/scylladb-dev>`_: Discuss the development of ScyllaDB itself.
 
 
-I deleted data from Scylla, but disk usage stays the same. Why?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+I deleted data from ScyllaDB, but disk usage stays the same. Why?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Data you write to Scylla gets persisted to SSTables. Since SSTables are immutable, the data can't actually be removed
+Data you write to ScyllaDB gets persisted to SSTables. Since SSTables are immutable, the data can't actually be removed
 when you perform a delete, instead, a marker (also called a "tombstone") is written to indicate the value's new status.
 Never fear though, on the first compaction that occurs between the data and the tombstone, the data will be expunged
 completely and the corresponding disk space recovered. 
 
-What are seeds?
-^^^^^^^^^^^^^^^
-
-Seeds are used during startup to discover the cluster. They are referred by new nodes on bootstrap to learn about other nodes in the ring. When you add a new node to the cluster, you
-must specify one live seed to contact.
-
-In ScyllaDB versions earlier than Scylla Open Source 4.3 and Scylla Enterprise 2021.1, a seed node has an additional 
-function: it assists with gossip convergence. See :doc:`Scylla Seed Nodes </kb/seed-nodes/>` for details.
-
-We recommend updating your ScyllaDB to version 4.3 or later (Open Source) or 2021.1 or later (Enterprise).
-
-Does single seed mean single point of failure?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-The ring can operate or boot without a seed; however, you will not be able to add new nodes to the cluster. It is recommended to configure multiple seeds in production systems.
-
 .. _faq-raid0-required:
 
-Is RAID0 required for Scylla? Why?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Is RAID0 required for ScyllaDB? Why?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-No, it is not required, but it is highly recommended when using Scylla with more than one drive. Scylla requires one drive for its data file and one drive for commit log (can be the same). If you want to take advantage of more than one drive, the easiest way to do so is set RAID0 (striped) across all of them. If you choose, scylla_setup will setup RAID0 for you on your selected drive, as well as XFS file system (recommended).
-Similarly, Scylla AMI on EC2 will automatically mount all available SSD drives in RAID0.
+No, it is not required, but it is highly recommended when using ScyllaDB with more than one drive. ScyllaDB requires one drive for its data file and one drive for commit log (can be the same). If you want to take advantage of more than one drive, the easiest way to do so is set RAID0 (striped) across all of them. If you choose, scylla_setup will setup RAID0 for you on your selected drive, as well as XFS file system (recommended).
+Similarly, ScyllaDB AMI on EC2 will automatically mount all available SSD drives in RAID0.
 
 Should I use RAID for replications, such as RAID1, RAID4 or higher?
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-You can, but it is not recommended. Scylla :doc:`clustering architecture </architecture/ringarchitecture/index/>` already provides data replication across nodes and DCs.
+You can, but it is not recommended. ScyllaDB :doc:`clustering architecture </architecture/ringarchitecture/index/>` already provides data replication across nodes and DCs.
 Adding another layer of replication in each node is redundant, slows down I/O operation and reduces available storage.
 Want a higher level of replication?
 Increase the Replication Factor (RF) of :doc:`relevant Keyspaces </cql/ddl/>`.
@@ -441,16 +390,16 @@ Increase the Replication Factor (RF) of :doc:`relevant Keyspaces </cql/ddl/>`.
 Can I use JBOD and not use RAID0?
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-:term:`JBOD` is not supported by Scylla.
+:term:`JBOD` is not supported by ScyllaDB.
 
-:abbr:`JBOD (Just a Bunch Of Disks)` may be a reasonable solution for Cassandra because it rebuilds nodes very slowly. As this is not an issue for Scylla, it's more efficient to use RAID. 
+:abbr:`JBOD (Just a Bunch Of Disks)` may be a reasonable solution for Cassandra because it rebuilds nodes very slowly. As this is not an issue for ScyllaDB, it's more efficient to use RAID. 
 
 Explanation: There are two types of deployment when multiple disks exist. In the JBOD case, each disk is an isolated filesystem. I/O isn't stripped and thus performance can be slower than that of RAID. In addition, as the free space isn't shared, a single disk can be full while the others are available.
 
 The benefit of JBOD vs RAID is that it isolates failures to individual disk and not the entire node.
-However, Scylla rebuilds nodes quickly and thus it is not an issue when rebuilding an entire node.
+However, ScyllaDB rebuilds nodes quickly and thus it is not an issue when rebuilding an entire node.
 
-As a result, it is much more advantageous to use RAID with Scylla
+As a result, it is much more advantageous to use RAID with ScyllaDB
 
 
 Is ``Nodetool Repair`` a Local (One Node) Operation or a Global (Full Cluster) Operation?
@@ -476,18 +425,7 @@ You can restrict the number of items in the IN clause with the following options
    We recommend that you use these options with caution. Changing the maximum number of IN restrictions to more than 100 may result in server instability.
 
 The options can be configured on the command line, passed with ``SCYLLA_ARGS`` in ``/etc/default/scylla-server`` or ``/etc/sysconfig/scylla-server``, 
-or added to your ``scylla.yaml`` (see :doc:`Scylla Configuration<operating-scylla/admin>`).
-
-in-memory tables
-----------------
-
-Is MV and SI supported for use with in-memory tables? If so, how will it affect the total memory size limitation?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-You can make MV table an in-memory, as you would with every other table. It effects the total memory size allocation just like any other table. Make sure before you create any kind of in-memory table that its use case warrants the creation. 
- 
-Can Scylla Enterprise in-memory tables be used without having a mirror file on disk?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-No. In Scylla Enterprise 2018.1.7, in-memory tables are always persistent using an on-disk mirror file.
+or added to your ``scylla.yaml`` (see :doc:`ScyllaDB Configuration<operating-scylla/admin>`).
 
 Can I change the coredump mount point? 
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -496,7 +434,7 @@ Yes, by edit ``sysctl.d``.
  
 Procedure
 
-1. Create ``/etc/sysctl.d/99-scylla-coredump.conf`` (this file exists by default in Scylla AMI).
+1. Create ``/etc/sysctl.d/99-scylla-coredump.conf`` (this file exists by default in ScyllaDB AMI).
 
 2. Open the ``99-scylla-coredump.conf`` file.
 
@@ -510,11 +448,3 @@ For example:
 
 4. Run ``sysctl -p /etc/sysctl.d/99-scylla-coredump.conf`` 
 
-Do I need to run a tool like ``upgradesstables`` when moving to a new format?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-Unlike Apache Cassandra, Scylla does not ship with upgradesstables, a tool that converts SSTables to newer formats. When upgrading to a new table format, Scylla can still continue to read from the old format. Having this option, ensures a smoother transition and upgrade. New writes use the new format and reads will use both formats until the old tables are removed. If you want to purge all of the old SSTables in a single step, generate a compaction with :doc:`nodetool compact </operating-scylla/nodetool-commands/compact/>` follow by :doc:`nodetool cleanup </operating-scylla/nodetool-commands/cleanup/>` to remove no longer needed token ranges that belong to that node.
- 
-
-
-.. include:: /rst_include/apache-copyrights.rst

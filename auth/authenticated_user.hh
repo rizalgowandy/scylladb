@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -50,7 +50,7 @@ inline bool is_anonymous(const authenticated_user& u) noexcept {
 /// The user name, or "anonymous".
 ///
 template <>
-struct fmt::formatter<auth::authenticated_user> : fmt::formatter<std::string_view> {
+struct fmt::formatter<auth::authenticated_user> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const auth::authenticated_user& u, FormatContext& ctx) const {
         if (u.name) {

@@ -1,14 +1,12 @@
 # Copyright 2021-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 import pytest
 import sys
 import requests
 
-# Use the util.py library from ../cql-pytest:
-sys.path.insert(1, sys.path[0] + '/../cql-pytest')
-from util import new_test_table, unique_name
+from ..cqlpy.util import new_test_table, unique_name
 
 # "keyspace" function: Creates and returns a temporary keyspace to be
 # used in tests that need a keyspace. The keyspace is created with RF=1,

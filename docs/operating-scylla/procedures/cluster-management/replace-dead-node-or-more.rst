@@ -11,6 +11,8 @@ Replace More Than One Dead Node In A ScyllaDB Cluster
 Prerequisites
 -------------
 
+* .. include:: /operating-scylla/procedures/cluster-management/_common/quorum-requirement.rst
+
 * Verify the status of the cluster using :doc:`nodetool status </operating-scylla/nodetool-commands/status>` command. A node with status ``DN`` is down and needs to be replaced.
 
 .. code-block:: shell
@@ -28,8 +30,7 @@ Login to one of the nodes in the cluster with (UN) status, collect the following
 * cluster_name - ``cat /etc/scylla/scylla.yaml | grep cluster_name``
 * seeds - ``cat /etc/scylla/scylla.yaml | grep seeds:``
 * endpoint_snitch - ``cat /etc/scylla/scylla.yaml | grep endpoint_snitch``
-* Scylla version - ``scylla --version``
-* consistent_cluster_management - ``grep consistent_cluster_management /etc/scylla/scylla.yaml``
+* ScyllaDB version - ``scylla --version``
 
 Procedure
 ---------

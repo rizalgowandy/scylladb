@@ -5,27 +5,45 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/rwlock.hh>
 #include <seastar/core/condition-variable.hh>
+#include <seastar/coroutine/generator.hh>
+#include <string>
 
 #include "service/broadcast_tables/experimental/query_result.hh"
-#include "service/raft/raft_group_registry.hh"
 #include "service/raft/group0_fwd.hh"
+#include "service/raft/raft_timeout.hh"
 #include "utils/UUID.hh"
 #include "timestamp.hh"
 #include "gc_clock.hh"
 #include "service/raft/group0_state_machine.hh"
-#include "db/system_keyspace.hh"
+#include "service/maintenance_mode.hh"
+
+class mutation;
+
+namespace db {
+
+class system_keyspace;
+
+}
+
+namespace locator {
+class shared_token_metadata;
+}
 
 namespace service {
+
+class raft_group_registry;
+
 // Obtaining this object means that all previously finished operations on group 0 are visible on this node.
 
 // It is also required in order to perform group 0 changes
@@ -69,6 +87,7 @@ public:
 class raft_group0_client {
     service::raft_group_registry& _raft_gr;
     db::system_keyspace& _sys_ks;
+    locator::shared_token_metadata& _token_metadata;
 
     // See `group0_guard::impl` for explanation of the purpose of these locks.
     semaphore _read_apply_mutex = semaphore(1);
@@ -82,6 +101,8 @@ class raft_group0_client {
     seastar::condition_variable _upgraded;
 
     std::unordered_map<utils::UUID, std::optional<service::broadcast_tables::query_result>> _results;
+
+    maintenance_mode_enabled _maintenance_mode;
 
     // Guard manages the result of a single query. If it is created for a particular query,
     // then `group0_state_machine` will save the result of that query and it can be returned by the guard.
@@ -98,15 +119,19 @@ class raft_group0_client {
         service::broadcast_tables::query_result get();
     };
 
+    template <typename Command>
+    void validate_change(const Command& change) {}
+    void validate_change(const topology_change& change);
+
 public:
-    raft_group0_client(service::raft_group_registry&, db::system_keyspace&);
+    raft_group0_client(service::raft_group_registry&, db::system_keyspace&, locator::shared_token_metadata&, maintenance_mode_enabled);
 
     // Call after `system_keyspace` is initialized.
     future<> init();
 
-    future<> add_entry(group0_command group0_cmd, group0_guard guard, seastar::abort_source* as = nullptr);
+    future<> add_entry(group0_command group0_cmd, group0_guard guard, seastar::abort_source& as, std::optional<raft_timeout> timeout = std::nullopt);
 
-    future<> add_entry_unguarded(group0_command group0_cmd, seastar::abort_source* as = nullptr);
+    future<> add_entry_unguarded(group0_command group0_cmd, seastar::abort_source* as);
 
     // Ensures that all previously finished operations on group 0 are visible on this node;
     // in particular, performs a Raft read barrier on group 0.
@@ -128,14 +153,16 @@ public:
     // FIXME?: this is kind of annoying for the user.
     // we could forward the call to shard 0, have group0_guard keep a foreign_ptr to the internal data structures on shard 0,
     // and add_entry would again forward to shard 0.
-    future<group0_guard> start_operation(seastar::abort_source* as = nullptr);
+    future<group0_guard> start_operation(seastar::abort_source& as, std::optional<raft_timeout> timeout = std::nullopt);
 
     template<typename Command>
     requires std::same_as<Command, broadcast_table_query> || std::same_as<Command, write_mutations>
     group0_command prepare_command(Command change, std::string_view description);
     template<typename Command>
-    requires std::same_as<Command, schema_change> || std::same_as<Command, topology_change>
+    requires std::same_as<Command, schema_change> || std::same_as<Command, topology_change> || std::same_as<Command, write_mutations> || std::same_as<Command, mixed_change>
     group0_command prepare_command(Command change, group0_guard& guard, std::string_view description);
+    // Checks maximum allowed serialized command size, server rejects bigger commands with command_is_too_big_error exception
+    size_t max_command_size() const;
 
     // Returns the current group 0 upgrade state.
     //
@@ -170,17 +197,78 @@ public:
     // Wait until group 0 upgrade enters the `use_post_raft_procedures` state.
     future<> wait_until_group0_upgraded(abort_source&);
 
-    future<semaphore_units<>> hold_read_apply_mutex();
     future<semaphore_units<>> hold_read_apply_mutex(abort_source&);
 
     db::system_keyspace& sys_ks();
 
+    bool in_recovery() const;
+
+    gc_clock::duration get_history_gc_duration() const;
     // for test only
     void set_history_gc_duration(gc_clock::duration d);
     semaphore& operation_mutex();
 
     query_result_guard create_result_guard(utils::UUID query_id);
     void set_query_result(utils::UUID query_id, service::broadcast_tables::query_result qr);
+    static utils::UUID generate_group0_state_id(utils::UUID prev_state_id);
+};
+
+using mutations_generator = coroutine::experimental::generator<mutation>;
+
+// group0_batch is used to gather mutations which are side effects
+// of functions execution. They need to be announced under single guard
+// for atomicity. As functions which produce mutations may embed each other
+// we need to decouple announcing step to a common external place here.
+// It also supports generator callbacks to avoid holding too many mutations
+// in memory.
+//
+// Single group0_batch object represents a single transaction.
+// If size or number of mutations is too big for raft too handle it will be
+// rejected.
+class group0_batch {
+public:
+    using generator_func = std::function<mutations_generator(api::timestamp_type t)>;
+private:
+    std::vector<mutation> _muts;
+    std::vector<generator_func> _generators;
+    std::vector<sstring> _descriptions;
+    std::optional<::service::group0_guard> _guard;
+
+    future<> materialize_mutations();
+public:
+    explicit group0_batch(::service::group0_guard&& g);
+    // Constructor with optional guard used to handle both legacy and current code.
+    // There is no guard for legacy code but the whole class may be passed
+    // through to simplify the flow.
+    explicit group0_batch(std::optional<::service::group0_guard> g);
+
+    ~group0_batch();
+
+    // Annotation helper for cases where we need collector (e.g. some interface)
+    // but the code is fully legacy and the collector won't be used.
+    static group0_batch unused() {
+        return group0_batch(std::nullopt);
+    }
+
+    group0_batch(const group0_batch&) = delete;
+    group0_batch(group0_batch&&) = default;
+
+    // Gets timestamp which should be used when building mutations.
+    api::timestamp_type write_timestamp() const;
+    utils::UUID new_group0_state_id() const;
+
+    void add_mutation(mutation m, std::string_view description = "");
+    void add_mutations(std::vector<mutation> ms, std::string_view description = "");
+    void add_generator(generator_func f, std::string_view description = "");
+
+    // Commits the data, nop if there was no guard provided.
+    future<> commit(::service::raft_group0_client& group0_client, seastar::abort_source& as, std::optional<::service::raft_timeout> timeout) &&;
+    // For rare cases where collector is used but announce logic is replaced with a custom one.
+    future<std::pair<std::vector<mutation>, ::service::group0_guard>> extract() &&;
+
+    // Checks if any mutations or generators were added. Note that when generator is
+    // added it still can return no mutations.
+    bool empty() const;
 };
 
 }

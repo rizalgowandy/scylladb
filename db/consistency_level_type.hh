@@ -5,12 +5,12 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
-#include <iosfwd>
+#include <fmt/core.h>
 
 namespace db {
 
@@ -31,6 +31,15 @@ enum class consistency_level {
     LOCAL_ONE, MAX_VALUE = LOCAL_ONE
 };
 
-std::ostream& operator<<(std::ostream& os, consistency_level cl);
-
 }
+
+template <> struct fmt::formatter<db::consistency_level> {
+private:
+    static std::string_view to_string(db::consistency_level);
+public:
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    template <typename FormatContext>
+    auto format(db::consistency_level cl, FormatContext& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", to_string(cl));
+    }
+};

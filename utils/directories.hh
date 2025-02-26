@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -11,7 +11,7 @@
 #include <set>
 #include <vector>
 #include <seastar/core/future.hh>
-#include <seastar/core/smp.hh>
+#include <seastar/util/bool_class.hh>
 #include "utils/file_lock.hh"
 
 using namespace seastar;
@@ -42,13 +42,14 @@ public:
     using recursive = bool_class<struct recursive_tag>;
 
     directories(bool developer_mode);
-    future<> create_and_verify(set dir_set);
-    static future<> verify_owner_and_mode(std::filesystem::path path, recursive r = recursive::yes);
+    future<> create_and_verify(set dir_set, recursive recursive = recursive::yes);
+    static future<> verify_owner_and_mode(std::filesystem::path path, recursive recursive = recursive::yes);
+    static future<> verify_owner_and_mode_of_data_dir(set dir_set);
 private:
     bool _developer_mode;
     std::vector<file_lock> _locks;
 
-    static future<> do_verify_owner_and_mode(std::filesystem::path path, recursive, int level);
+    static future<> do_verify_owner_and_mode(std::filesystem::path path, recursive, int level, std::function<bool(const fs::path&)> do_verify_subpath = {});
 };
 
 } // namespace utils

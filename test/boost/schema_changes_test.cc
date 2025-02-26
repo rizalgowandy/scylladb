@@ -3,20 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
 #include <boost/test/unit_test.hpp>
-#include "sstables/generation_type.hh"
 #include "test/lib/scylla_test_case.hh"
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/core/thread.hh>
 #include "sstables/sstables.hh"
-#include "timestamp.hh"
-#include "schema/schema_builder.hh"
 #include "test/lib/mutation_source_test.hh"
-#include "test/lib/flat_mutation_reader_assertions.hh"
+#include "test/lib/mutation_reader_assertions.hh"
 #include "test/lib/sstable_utils.hh"
 
 using namespace sstables;

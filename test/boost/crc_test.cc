@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #define BOOST_TEST_MODULE core
@@ -12,7 +12,7 @@
 #include "utils/crc.hh"
 #include "utils/clmul.hh"
 #include "utils/gz/barrett.hh"
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 
 constexpr uint32_t input_32_1_c = 0x12345678;
 uint32_t input_32_1 = input_32_1_c; // NOT constexpr

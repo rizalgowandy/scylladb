@@ -3,51 +3,48 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include "functions.hh"
 #include "token_fct.hh"
-#include "cql3/maps.hh"
-#include "cql3/sets.hh"
-#include "cql3/lists.hh"
-#include "cql3/constants.hh"
-#include "cql3/user_types.hh"
 #include "cql3/ut_name.hh"
 #include "cql3/type_json.hh"
+#include "cql3/functions/aggregate_fcts.hh"
+#include "cql3/functions/bytes_conversion_fcts.hh"
+#include "cql3/functions/time_uuid_fcts.hh"
 #include "cql3/functions/user_function.hh"
 #include "cql3/functions/user_aggregate.hh"
+#include "cql3/functions/uuid_fcts.hh"
 #include "data_dictionary/data_dictionary.hh"
-#include "types/map.hh"
-#include "types/set.hh"
-#include "types/list.hh"
-#include "types/user.hh"
-#include "concrete_types.hh"
 #include "as_json_function.hh"
 #include "cql3/prepare_context.hh"
 #include "user_aggregate.hh"
 #include "cql3/expr/expression.hh"
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/range/adaptors.hpp>
+#include "types/set.hh"
+#include "types/listlike_partial_deserializing_iterator.hh"
 
 #include "error_injection_fcts.hh"
 
-namespace std {
-std::ostream& operator<<(std::ostream& os, const std::vector<data_type>& arg_types) {
+auto fmt::formatter<std::vector<data_type>>::format(const std::vector<data_type>& arg_types, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    auto out = ctx.out();
     for (size_t i = 0; i < arg_types.size(); ++i) {
         if (i > 0) {
-            os << ", ";
+            out = fmt::format_to(out, ", ");
         }
-        os << arg_types[i]->as_cql3_type().to_string();
+        out = fmt::format_to(out, "{}", arg_types[i]->as_cql3_type());
     }
-    return os;
-}
+    return out;
 }
 
 namespace cql3 {
 namespace functions {
 
 logging::logger log("cql3_fuctions");
+
+static auto SET_INTERSECTION_FUNCTION_NAME = function_name::native_function("set_intersection");
 
 bool abstract_function::requires_thread() const { return false; }
 
@@ -58,12 +55,6 @@ static bool same_signature(const shared_ptr<function>& f1, const shared_ptr<func
         return false;
     }
     return f1->name() == f2->name() && f1->arg_types() == f2->arg_types();
-}
-
-thread_local std::unordered_multimap<function_name, shared_ptr<function>> functions::_declared = init();
-
-void functions::clear_functions() noexcept {
-    functions::_declared = init();
 }
 
 std::unordered_multimap<function_name, shared_ptr<function>>
@@ -132,19 +123,20 @@ void functions::add_function(shared_ptr<function> func) {
     _declared.emplace(func->name(), func);
 }
 
-template <typename F>
-void functions::with_udf_iter(const function_name& name, const std::vector<data_type>& arg_types, F&& f) {
-    auto i = find_iter(name, arg_types);
-    if (i == _declared.end() || i->second->is_native()) {
+void functions::with_udf_iter(const function_name& name, const std::vector<data_type>& arg_types, std::function<void(declared_t::iterator)> f) {
+    auto cit = find_iter(name, arg_types);
+    if (cit == _declared.end() || cit->second->is_native()) {
         log.error("attempted to remove or alter non existent user defined function {}({})", name, arg_types);
         return;
     }
-    f(i);
+    // erase here is only to convert from const_iterator to iterator
+    auto it = _declared.erase(cit, cit);
+    f(it);
 }
 
 void functions::replace_function(shared_ptr<function> func) {
-    with_udf_iter(func->name(), func->arg_types(), [func] (functions::declared_t::iterator i) {
-        i->second = std::move(func);
+    with_udf_iter(func->name(), func->arg_types(), [func] (declared_t::iterator it) {
+        it->second = std::move(func);
     });
     auto scalar_func = dynamic_pointer_cast<scalar_function>(func);
     if (!scalar_func) {
@@ -166,11 +158,11 @@ void functions::replace_function(shared_ptr<function> func) {
 }
 
 void functions::remove_function(const function_name& name, const std::vector<data_type>& arg_types) {
-    with_udf_iter(name, arg_types, [] (functions::declared_t::iterator i) { _declared.erase(i); });
+    with_udf_iter(name, arg_types, [this] (declared_t::iterator it) { _declared.erase(it); });
 }
 
-std::optional<function_name> functions::used_by_user_aggregate(shared_ptr<user_function> func) {
-    for (const shared_ptr<function>& fptr : _declared | boost::adaptors::map_values) {
+std::optional<function_name> functions::used_by_user_aggregate(shared_ptr<user_function> func) const {
+    for (const shared_ptr<function>& fptr : _declared | std::views::values) {
         auto aggregate = dynamic_pointer_cast<user_aggregate>(fptr);
         if (aggregate && (same_signature(aggregate->sfunc(), func)
             || (same_signature(aggregate->finalfunc(), func))
@@ -182,8 +174,8 @@ std::optional<function_name> functions::used_by_user_aggregate(shared_ptr<user_f
     return {};
 }
 
-std::optional<function_name> functions::used_by_user_function(const ut_name& user_type) {
-    for (const shared_ptr<function>& fptr : _declared | boost::adaptors::map_values) {
+std::optional<function_name> functions::used_by_user_function(const ut_name& user_type) const {
+    for (const shared_ptr<function>& fptr : _declared | std::views::values) {
         for (auto& arg_type : fptr->arg_types()) {
             if (arg_type->references_user_type(user_type.get_keyspace(), user_type.get_user_type_name())) {
                 return fptr->name();
@@ -198,13 +190,13 @@ std::optional<function_name> functions::used_by_user_function(const ut_name& use
 
 lw_shared_ptr<column_specification>
 functions::make_arg_spec(const sstring& receiver_ks, std::optional<const std::string_view> receiver_cf_opt,
-        const function& fun, size_t i) {
+        const function& fun, size_t i) const {
     auto&& name = fmt::to_string(fun.name());
     const std::string_view receiver_cf = receiver_cf_opt.has_value() ? *receiver_cf_opt : "<unknown_col_family>";
     std::transform(name.begin(), name.end(), name.begin(), ::tolower);
     return make_lw_shared<column_specification>(receiver_ks,
                                    receiver_cf,
-                                   ::make_shared<column_identifier>(format("arg{:d}({})", i, name), true),
+                                   ::make_shared<column_identifier>(seastar::format("arg{:d}({})", i, name), true),
                                    fun.arg_types()[i]);
 }
 
@@ -310,6 +302,81 @@ static shared_ptr<function> get_dynamic_aggregate(const function_name &name, con
     return {};
 }
 
+static
+shared_ptr<function>
+get_set_intersection_function(data_dictionary::database db,
+        const sstring& keyspace,
+        const function_name& name,
+        const std::vector<shared_ptr<assignment_testable>>& provided_args,
+        const sstring& receiver_ks,
+        std::optional<const std::string_view> receiver_cf,
+        const column_specification* receiver) {
+    if (provided_args.size() != 2) {
+        throw exceptions::invalid_request_exception("set_intersection() accepts 2 arguments only");
+    }
+    auto known_arg_types = provided_args
+            | std::views::filter([] (const shared_ptr<assignment_testable>& arg) { return arg->assignment_testable_type_opt().has_value(); })
+            | std::views::transform([] (const shared_ptr<assignment_testable>& arg) -> data_type { return *arg->assignment_testable_type_opt(); })
+            | std::ranges::to<std::vector>();
+
+    if (known_arg_types.empty()) {
+        throw exceptions::invalid_request_exception("set_intersection() can only be called if at least one argument type is known");
+    }
+
+    auto known_set_types = known_arg_types
+        | std::views::transform([] (const data_type& arg_type) {
+            return dynamic_pointer_cast<const set_type_impl>(arg_type);
+        })
+        | std::ranges::to<std::vector>();
+
+    if (!std::ranges::all_of(known_set_types, [] (data_type t) { return t != nullptr; })) {
+        throw exceptions::invalid_request_exception("set_intersection() can only be called if both arguments are of set type");
+    }
+
+    // Normalize everything to be a frozen set
+    for (auto& set_type : known_set_types) {
+        set_type = dynamic_pointer_cast<const set_type_impl>(set_type->freeze());
+    }
+
+    auto unique_remove = std::ranges::unique(known_set_types);
+    known_set_types.erase(unique_remove.begin(), unique_remove.end());
+
+    if (known_set_types.size() != 1) {
+        throw exceptions::invalid_request_exception(fmt::format("set_intersection() can only be called if both arguments are of the same set type: {}",
+                known_set_types | std::views::transform(&abstract_type::name)));
+    }
+
+    auto set_type = known_set_types.front();
+    auto element_type = set_type->get_elements_type();
+
+    return make_native_scalar_function<true>("set_intersection", set_type, {set_type, set_type},
+            [set_type, element_type] (std::span<const bytes_opt> parameters) -> bytes_opt {
+        if (!parameters[0].has_value() || !parameters[1].has_value()) {
+            return {};
+        }
+        auto set_as_range = [&] (const bytes_opt& serialized_set, managed_bytes_view& buffer) {
+            buffer = managed_bytes_view(*serialized_set);
+            return std::ranges::subrange<listlike_partial_deserializing_iterator>(
+                    listlike_partial_deserializing_iterator::begin(buffer),
+                    listlike_partial_deserializing_iterator::end(buffer));
+        };
+        auto element_less = [&] (managed_bytes_view_opt v1, managed_bytes_view_opt v2) {
+            if (!v1 || !v2) {
+                on_internal_error(log, "set_intersection: unexpected null value");
+            }
+            return element_type->compare(*v1, *v2) < 0;
+        };
+        std::vector<managed_bytes_view_opt> result_vector;
+        managed_bytes_view buffer1, buffer2;
+        std::ranges::set_intersection(
+                set_as_range(parameters[0], buffer1),
+                set_as_range(parameters[1], buffer2),
+                std::back_inserter(result_vector),
+                element_less);
+        return to_bytes(set_type->pack_fragmented(result_vector.begin(), result_vector.end(), result_vector.size()));
+    });
+}
+
 shared_ptr<function>
 functions::get(data_dictionary::database db,
         const sstring& keyspace,
@@ -317,7 +384,7 @@ functions::get(data_dictionary::database db,
         const std::vector<shared_ptr<assignment_testable>>& provided_args,
         const sstring& receiver_ks,
         std::optional<const std::string_view> receiver_cf,
-        const column_specification* receiver) {
+        const column_specification* receiver) const {
 
     static const function_name TOKEN_FUNCTION_NAME = function_name::native_function("token");
     static const function_name TO_JSON_FUNCTION_NAME = function_name::native_function("tojson");
@@ -337,6 +404,9 @@ functions::get(data_dictionary::database db,
 
         if (!receiver_cf.has_value()) {
             throw exceptions::invalid_request_exception("functions::get for token doesn't have a known column family");
+        }
+        if (schema == nullptr) {
+            throw exceptions::invalid_request_exception(seastar::format("functions::get for token cannot find {} table", *receiver_cf));
         }
         auto fun = ::make_shared<token_fct>(schema);
         validate_types(db, keyspace, schema.get(), fun, provided_args, receiver_ks, receiver_cf);
@@ -367,6 +437,14 @@ functions::get(data_dictionary::database db,
         }
         return make_from_json_function(db, keyspace, receiver->type);
     }
+
+    // FIXME: add proper support for generic functions
+    if (name.has_keyspace()
+                ? name == SET_INTERSECTION_FUNCTION_NAME
+                : name.name == SET_INTERSECTION_FUNCTION_NAME.name) {
+        return get_set_intersection_function(db, keyspace, name, provided_args, receiver_ks, receiver_cf, receiver);
+    }
+
 
     auto aggr_fun = get_dynamic_aggregate(name, provided_args);
     if (aggr_fun) {
@@ -417,13 +495,13 @@ functions::get(data_dictionary::database db,
 
     if (compatibles.empty()) {
         throw exceptions::invalid_request_exception(
-                format("Invalid call to function {}, none of its type signatures match (known type signatures: {})",
+                seastar::format("Invalid call to function {}, none of its type signatures match (known type signatures: {})",
                                                         name, fmt::join(candidates, ", ")));
     }
 
     if (compatibles.size() > 1) {
         throw exceptions::invalid_request_exception(
-                format("Ambiguous call to function {} (can be matched by following signatures: {}): use type casts to disambiguate",
+                seastar::format("Ambiguous call to function {} (can be matched by following signatures: {}): use type casts to disambiguate",
                     name, fmt::join(compatibles, ", ")));
     }
 
@@ -431,7 +509,7 @@ functions::get(data_dictionary::database db,
 }
 
 template<typename F>
-std::vector<shared_ptr<F>> functions::get_filtered_transformed(const sstring& keyspace) {
+std::vector<shared_ptr<F>> functions::get_filtered_transformed(const sstring& keyspace) const {
     auto filter = [&] (const std::pair<const function_name, shared_ptr<function>>& d) -> bool {
         return d.first.keyspace == keyspace && dynamic_cast<F*>(d.second.get());
     };
@@ -439,32 +517,31 @@ std::vector<shared_ptr<F>> functions::get_filtered_transformed(const sstring& ke
         return dynamic_pointer_cast<F>(d.second);
     };
     
-    return boost::copy_range<std::vector<shared_ptr<F>>>(
-        _declared 
-        | boost::adaptors::filtered(filter) 
-        | boost::adaptors::transformed(transformer)
-    );
+    return _declared
+        | std::views::filter(filter)
+        | std::views::transform(transformer)
+        | std::ranges::to<std::vector>();
 }
 
 std::vector<shared_ptr<user_function>>
-functions::get_user_functions(const sstring& keyspace) {
+functions::get_user_functions(const sstring& keyspace) const {
     return get_filtered_transformed<user_function>(keyspace);
 }
 
 std::vector<shared_ptr<user_aggregate>>
-functions::get_user_aggregates(const sstring& keyspace) {
+functions::get_user_aggregates(const sstring& keyspace) const {
     return get_filtered_transformed<user_aggregate>(keyspace);
 }
 
-boost::iterator_range<functions::declared_t::iterator>
-functions::find(const function_name& name) {
-    assert(name.has_keyspace()); // : "function name not fully qualified";
+std::ranges::subrange<functions::declared_t::const_iterator>
+functions::find(const function_name& name) const {
+    SCYLLA_ASSERT(name.has_keyspace()); // : "function name not fully qualified";
     auto pair = _declared.equal_range(name);
-    return boost::make_iterator_range(pair.first, pair.second);
+    return std::ranges::subrange(pair.first, pair.second);
 }
 
-functions::declared_t::iterator
-functions::find_iter(const function_name& name, const std::vector<data_type>& arg_types) {
+functions::declared_t::const_iterator
+functions::find_iter(const function_name& name, const std::vector<data_type>& arg_types) const {
     auto range = find(name);
     auto i = std::find_if(range.begin(), range.end(), [&] (const std::pair<const function_name, shared_ptr<function>>& d) {
         return type_equals(d.second->arg_types(), arg_types);
@@ -476,7 +553,7 @@ functions::find_iter(const function_name& name, const std::vector<data_type>& ar
 }
 
 shared_ptr<function>
-functions::find(const function_name& name, const std::vector<data_type>& arg_types) {
+functions::find(const function_name& name, const std::vector<data_type>& arg_types) const {
     auto i = find_iter(name, arg_types);
     if (i != _declared.end()) {
         return i->second;
@@ -484,7 +561,7 @@ functions::find(const function_name& name, const std::vector<data_type>& arg_typ
     return {};
 }
 
-// This function is created only for forward_service use, thus it only checks for
+// This function is created only for mapreduce_service use, thus it only checks for
 // aggregate functions if no declared function was found.
 //
 // The reason for this function is, there is no serialization of `cql3::selection::selection`,
@@ -494,7 +571,7 @@ functions::find(const function_name& name, const std::vector<data_type>& arg_typ
 // mock or serialize expressions and `functions::find()` is not enough,
 // because it does not search for dynamic aggregate functions
 shared_ptr<function>
-functions::mock_get(const function_name &name, const std::vector<data_type>& arg_types) {
+functions::mock_get(const function_name &name, const std::vector<data_type>& arg_types) const {
     auto func = find(name, arg_types);
     if (!func) {
         func = get_dynamic_aggregate(name, arg_types);
@@ -511,7 +588,7 @@ functions::validate_types(data_dictionary::database db,
                           shared_ptr<function> fun,
                           const std::vector<shared_ptr<assignment_testable>>& provided_args,
                           const sstring& receiver_ks,
-                          std::optional<const std::string_view> receiver_cf) {
+                          std::optional<const std::string_view> receiver_cf) const {
     if (provided_args.size() != fun->arg_types().size()) {
         throw exceptions::invalid_request_exception(
                 format("Invalid number of arguments in call to function {}: {:d} required but {:d} provided",
@@ -542,7 +619,7 @@ functions::match_arguments(data_dictionary::database db, const sstring& keyspace
         shared_ptr<function> fun,
         const std::vector<shared_ptr<assignment_testable>>& provided_args,
         const sstring& receiver_ks,
-        std::optional<const std::string_view> receiver_cf) {
+        std::optional<const std::string_view> receiver_cf) const {
     if (provided_args.size() != fun->arg_types().size()) {
         return assignment_testable::test_result::NOT_ASSIGNABLE;
     }
@@ -568,8 +645,25 @@ functions::match_arguments(data_dictionary::database db, const sstring& keyspace
 }
 
 bool
-functions::type_equals(const std::vector<data_type>& t1, const std::vector<data_type>& t2) {
+functions::type_equals(const std::vector<data_type>& t1, const std::vector<data_type>& t2) const {
     return t1 == t2;
+}
+
+static thread_local functions f;
+
+const functions& instance() {
+    return f;
+}
+
+void change_batch::commit() {
+    if (_declared.empty()) {
+        return;
+    }
+    f._declared = std::move(_declared);
+}
+
+void change_batch::clear_functions() noexcept {
+    _declared = init();
 }
 
 }

@@ -3,16 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "redis/commands.hh"
 #include <seastar/core/shared_ptr.hh>
 #include "redis/request.hh"
 #include "redis/reply.hh"
-#include "types/types.hh"
 #include "service_permit.hh"
-#include "service/client_state.hh"
 #include "redis/options.hh"
 #include "redis/query_utils.hh"
 #include "redis/mutation_utils.hh"

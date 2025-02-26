@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <chrono>
@@ -15,6 +15,8 @@
 #include <seastar/core/thread.hh>
 #include <seastar/rpc/rpc_types.hh>
 #include <seastar/util/closeable.hh>
+#include "db/config.hh"
+#include "gms/feature_service.hh"
 #include "message/messaging_service.hh"
 #include "gms/gossip_digest_syn.hh"
 #include "gms/gossip_digest_ack.hh"
@@ -22,9 +24,11 @@
 #include "gms/gossip_digest.hh"
 #include "api/api.hh"
 #include "utils/UUID.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "locator/token_metadata.hh"
 #include "db/schema_tables.hh"
+#include "idl/gossip.dist.hh"
+#include "service/qos/service_level_controller.hh"
 
 using namespace std::chrono_literals;
 using namespace netw;
@@ -58,7 +62,7 @@ public:
     uint16_t port() const { return ms.port(); }
 public:
     void init_handler() {
-        ms.register_gossip_digest_syn([this] (const rpc::client_info& cinfo, gms::gossip_digest_syn msg) {
+        ser::gossip_rpc_verbs::register_gossip_digest_syn(&ms, [this] (const rpc::client_info& cinfo, gms::gossip_digest_syn msg) {
             test_logger.info("Server got syn msg = {}", msg);
 
             auto from = netw::messaging_service::get_source(cinfo);
@@ -75,13 +79,13 @@ public:
             };
             gms::gossip_digest_ack ack(std::move(digests), std::move(eps));
             // FIXME: discarded future.
-            (void)ms.send_gossip_digest_ack(from, std::move(ack)).handle_exception([] (auto ep) {
+            (void)ser::gossip_rpc_verbs::send_gossip_digest_ack(&ms, from, std::move(ack)).handle_exception([] (auto ep) {
                 test_logger.error("Fail to send ack : {}", ep);
             });
-            return messaging_service::no_wait();
+            return make_ready_future<rpc::no_wait_type>(netw::messaging_service::no_wait());
         });
 
-        ms.register_gossip_digest_ack([this] (const rpc::client_info& cinfo, gms::gossip_digest_ack msg) {
+        ser::gossip_rpc_verbs::register_gossip_digest_ack(&ms, [this] (const rpc::client_info& cinfo, gms::gossip_digest_ack msg) {
             test_logger.info("Server got ack msg = {}", msg);
             auto from = netw::messaging_service::get_source(cinfo);
             // Prepare gossip_digest_ack2 message
@@ -91,24 +95,24 @@ public:
             };
             gms::gossip_digest_ack2 ack2(std::move(eps));
             // FIXME: discarded future.
-            (void)ms.send_gossip_digest_ack2(from, std::move(ack2)).handle_exception([] (auto ep) {
+            (void)ser::gossip_rpc_verbs::send_gossip_digest_ack2(&ms, from, std::move(ack2)).handle_exception([] (auto ep) {
                 test_logger.error("Fail to send ack2 : {}", ep);
             });
             digest_test_done.set_value();
-            return messaging_service::no_wait();
+            return make_ready_future<rpc::no_wait_type>(netw::messaging_service::no_wait());
         });
 
-        ms.register_gossip_digest_ack2([] (const rpc::client_info& cinfo, gms::gossip_digest_ack2 msg) {
+        ser::gossip_rpc_verbs::register_gossip_digest_ack2(&ms, [] (const rpc::client_info& cinfo, gms::gossip_digest_ack2 msg) {
             test_logger.info("Server got ack2 msg = {}", msg);
-            return messaging_service::no_wait();
+            return make_ready_future<rpc::no_wait_type>(netw::messaging_service::no_wait());
         });
 
-        ms.register_gossip_shutdown([] (inet_address from, rpc::optional<int64_t> generation_number_opt) {
+        ser::gossip_rpc_verbs::register_gossip_shutdown(&ms, [] (inet_address from, rpc::optional<int64_t> generation_number_opt) {
             test_logger.info("Server got shutdown msg = {}", from);
-            return messaging_service::no_wait();
+            return make_ready_future<rpc::no_wait_type>(netw::messaging_service::no_wait());
         });
 
-        ms.register_gossip_echo([] (const rpc::client_info& cinfo, rpc::optional<int64_t> gen_opt) {
+        ser::gossip_rpc_verbs::register_gossip_echo(&ms, [] (const rpc::client_info& cinfo, rpc::opt_time_point, rpc::optional<int64_t> gen_opt, rpc::optional<bool> notify_up) {
             test_logger.info("Server got gossip echo msg");
             throw std::runtime_error("I'm throwing runtime_error exception");
             return make_ready_future<>();
@@ -116,11 +120,7 @@ public:
     }
 
     future<> deinit_handler() {
-        co_await ms.unregister_gossip_digest_syn();
-        co_await ms.unregister_gossip_digest_ack();
-        co_await ms.unregister_gossip_digest_ack2();
-        co_await ms.unregister_gossip_shutdown();
-        co_await ms.unregister_gossip_echo();
+        co_await ser::gossip_rpc_verbs::unregister(&ms);
         test_logger.info("tester deinit_hadler done");
     }
 
@@ -137,7 +137,7 @@ public:
         digests.push_back(gms::gossip_digest(ep1, gen++, ver++));
         digests.push_back(gms::gossip_digest(ep2, gen++, ver++));
         gms::gossip_digest_syn syn("my_cluster", "my_partition", digests, utils::null_uuid());
-        return ms.send_gossip_digest_syn(id, std::move(syn)).then([this] {
+        return ser::gossip_rpc_verbs::send_gossip_digest_syn(&ms, id, std::move(syn)).then([this] {
             test_logger.info("Sent gossip sigest syn. Waiting for digest_test_done...");
             return digest_test_done.get_future();
         });
@@ -148,7 +148,7 @@ public:
         auto id = get_msg_addr();
         inet_address from("127.0.0.1");
         int64_t gen = 0x1;
-        return ms.send_gossip_shutdown(id, from, gen).then([] () {
+        return ser::gossip_rpc_verbs::send_gossip_shutdown(&ms, id, from, gen).then([] () {
             test_logger.info("Client sent gossip_shutdown got reply = void");
             return make_ready_future<>();
         });
@@ -158,7 +158,7 @@ public:
         test_logger.info("=== {} ===", __func__);
         auto id = get_msg_addr();
         int64_t gen = 0x1;
-        return ms.send_gossip_echo(id, gen, std::chrono::seconds(10)).then_wrapped([] (auto&& f) {
+        return ser::gossip_rpc_verbs::send_gossip_echo(&ms, id, netw::messaging_service::clock_type::now() + std::chrono::seconds(10), gen, false).then_wrapped([] (auto&& f) {
             try {
                 f.get();
                 return make_ready_future<>();
@@ -183,9 +183,12 @@ int main(int ac, char ** av) {
         ("cpuid", bpo::value<uint32_t>()->default_value(0), "Server cpuid");
 
     distributed<replica::database> db;
+    sharded<auth::service> auth_service;
+    locator::shared_token_metadata tm({}, {});
+    distributed<qos::service_level_controller> sl_controller;
 
-    return app.run_deprecated(ac, av, [&app] {
-        return seastar::async([&app] {
+    return app.run_deprecated(ac, av, [&app, &auth_service, &tm, &sl_controller] {
+        return seastar::async([&app, &auth_service, &tm, &sl_controller] {
             auto config = app.configuration();
             bool stay_alive = config["stay-alive"].as<bool>();
             const gms::inet_address listen = gms::inet_address(config["listen-address"].as<std::string>());
@@ -195,8 +198,23 @@ int main(int ac, char ** av) {
             sharded<locator::shared_token_metadata> token_metadata;
             token_metadata.start([] () noexcept { return db::schema_tables::hold_merge_lock(); }, tm_cfg).get();
             auto stop_tm = deferred_stop(token_metadata);
+            auto default_scheduling_group = create_scheduling_group("sl_default_sg", 1.0).get();
+            sharded<abort_source> as;
+            as.start().get();
+            auto stop_as = defer([&as] { as.stop().get(); });
+            sl_controller.start(std::ref(auth_service), std::ref(tm), std::ref(as), qos::service_level_options{.shares = 1000}, default_scheduling_group).get();
+            seastar::sharded<utils::walltime_compressor_tracker> compressor_tracker;
+            compressor_tracker.start([] { return utils::walltime_compressor_tracker::config{}; }).get();
+            auto stop_compressor_tracker = deferred_stop(compressor_tracker);
+            seastar::sharded<gms::feature_service> feature_service;
+            auto cfg = gms::feature_config_from_db_config(db::config(), {});
+            feature_service.start(cfg).get();
+            seastar::sharded<gms::gossip_address_map> gossip_address_map;
+            gossip_address_map.start().get();
             seastar::sharded<netw::messaging_service> messaging;
-            messaging.start(locator::host_id{}, listen, 7000).get();
+            messaging.start(locator::host_id{}, listen, 7000, std::ref(feature_service),
+                            std::ref(gossip_address_map), std::ref(compressor_tracker),
+                            std::ref(sl_controller)).get();
             auto stop_messaging = deferred_stop(messaging);
             seastar::sharded<tester> testers;
             testers.start(std::ref(messaging)).get();
@@ -207,7 +225,7 @@ int main(int ac, char ** av) {
             auto deinit_testers = deferred_action([&testers] {
                 testers.invoke_on_all(&tester::deinit_handler).get();
             });
-            messaging.invoke_on_all(&netw::messaging_service::start_listen, std::ref(token_metadata)).get();
+            messaging.invoke_on_all(&netw::messaging_service::start_listen, std::ref(token_metadata), [] (gms::inet_address ip){ return locator::host_id{}; }).get();
             if (config.contains("server")) {
                 auto ip = config["server"].as<std::string>();
                 auto cpuid = config["cpuid"].as<uint32_t>();

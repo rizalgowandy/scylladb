@@ -32,6 +32,8 @@ CREATE TABLE system.large_partitions (
     sstable_name text,
     partition_size bigint,
     partition_key text,
+    range_tombstones bigint,
+    dead_rows bigint,
     rows bigint,
     compaction_time timestamp,
     PRIMARY KEY ((keyspace_name, table_name), sstable_name, partition_size, partition_key)
@@ -175,13 +177,13 @@ The "ownership" table for non-local sstables
 Schema:
 ~~~
 CREATE TABLE system.sstables (
-    location text,
+    owner uuid,
     generation timeuuid,
     format text,
     status text,
     uuid uuid,
     version text,
-    PRIMARY KEY (location, generation)
+    PRIMARY KEY (owner, generation)
 )
 ~~~
 
@@ -202,9 +204,30 @@ CREATE TABLE system.tablets (
     new_replicas frozen<list<frozen<tuple<uuid, int>>>>,
     replicas frozen<list<frozen<tuple<uuid, int>>>>,
     stage text,
+    transition text,
     table_name text static,
     tablet_count int static,
+    resize_type text static,
+    resize_seq_number bigint static,
+    repair_scheduler_config frozen<repair_scheduler_config> static,
+    repair_task_info frozen<tablet_task_info>,
+    repair_time timestamp,
     PRIMARY KEY ((keyspace_name, table_id), last_token)
+)
+
+CREATE TYPE system.repair_scheduler_config (
+    auto_repair_enabled boolean,
+    auto_repair_threshold bigint
+)
+
+CREATE TYPE system.tablet_task_info (
+    request_type text,
+    tablet_task_id uuid,
+    request_time timestamp,
+    sched_nr bigint,
+    sched_time timestamp,
+    repair_hosts_filter text,
+    repair_dcs_filter text,
 )
 ~~~
 
@@ -215,6 +238,10 @@ Only tables which use tablet-based replication strategy have an entry here.
 `tablet_count` is the number of tablets in the map.
 `table_name` is the name of the table, provided for convenience.
 
+`resize_type` is the resize decision type that spans all tablets of a given table, which can be one of: `merge`, `split` or `none`.
+
+`resize_seq_number` is the sequence number (>= 0) of the resize decision that globally identifies it. It's monotonically increasing, incremented by one for every new decision, so a higher value means it came later in time.
+
 `last_token` is the last token owned by the tablet. The i-th tablet, where i = 0, 1, ..., `tablet_count`-1),
  owns the token range:
 ```
@@ -222,11 +249,33 @@ Only tables which use tablet-based replication strategy have an entry here.
    (last_token(i-1), last_token(i)] for i > 0
 ```
 
+`repair_time` is the last time the tablet has been repaired.
+
+`repair_task_info` contains the metadata for the task manager. It contains the following values:
+  * `request_type` - The type of the request. It could be user_repair and auto_repair.
+  * `tablet_task_id` - The UUID of the task.
+  * `request_time` - The time the request is created.
+  * `sched_nr` - Number of times the request has been scheduled by the repair scheduler.
+  * `sched_time` - The time the request has been scheduled by the repair scheduler.
+  * `repair_hosts_filter` - Repair replicas listed in the comma-separated host_id list.
+  * `repair_dcs_filter` - Repair replicas listed in the comma-separated DC list.
+
+`repair_scheduler_config` contains configuration for the repair scheduler. It contains the following values:
+  * `auto_repair_enabled` - When set to true, auto repair is enabled. Disabled by default.
+  * `auto_repair_threshold` -  If the time since last repair is longer than auto_repair_threshold seconds, the tablet is eligible for auto repair.
+
 Each tablet is represented by a single row. `replicas` holds the set of shard-replicas of the tablet.
 It's a list of tuples where the first element is `host_id` of the replica and the second element is the `shard_id` of the replica.
 
-During tablet migration, the columns `new_replicas` and `stage` are set to represent the transition. The
+During tablet migration, the columns `new_replicas`, `stage` and `transition` are set to represent the transition. The
 `new_replicas` column holds what will be put in `replicas` after transition is done.
+
+During tablet splitting, the load balancer sets `resize_type` column with `split`, and sets `resize_seq_number` with the next sequence number, which is the previous value incremented by one.
+
+The `transition` column can have the following values:
+  * `migration` - One tablet replica is moving from one shard to another.
+  * `rebuild` - New tablet replica is created from the remaining replicas.
+  * `repair` - Tablet replicas are being repaired.
 
 # Virtual tables in the system keyspace
 
@@ -261,7 +310,7 @@ Implemented by `cluster_status_table` in `db/system_keyspace.cc`.
 ## system.protocol_servers
 
 The list of all the client-facing data-plane protocol servers and listen addresses (if running).
-Equivalent of the `nodetool statusbinary` plus the `Thrift active` and `Native Transport active` fields from `nodetool info`.
+Equivalent of the `nodetool statusbinary` plus the `Native Transport active` fields from `nodetool info`.
 
 TODO: include control-plane diagnostics-plane protocols here too.
 

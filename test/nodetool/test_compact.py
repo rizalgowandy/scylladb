@@ -1,11 +1,11 @@
 #
 # Copyright 2023-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
-from rest_api_mock import expected_request
-import utils
+from test.nodetool.rest_api_mock import expected_request
+from test.nodetool.utils import check_nodetool_fails_with
 import pytest
 
 
@@ -32,13 +32,12 @@ def test_keyspace(nodetool):
 
 
 def test_nonexistent_keyspace(nodetool):
-    utils.check_nodetool_fails_with(
+    check_nodetool_fails_with(
             nodetool,
             ("compact", "non_existent_ks"),
             {"expected_requests": [
                 expected_request("GET", "/storage_service/keyspaces", multiple=expected_request.MULTIPLE,
-                                 response=["system"]),
-                expected_request("POST", "/storage_service/keyspace_compaction/non_existent_ks")]},
+                                 response=["system"])]},
             ["nodetool: Keyspace [non_existent_ks] does not exist.",
              "error processing arguments: keyspace non_existent_ks does not exist"])
 
@@ -78,7 +77,7 @@ def test_token_range_compatibility_argument(nodetool):
 
 
 def test_user_defined(nodetool, scylla_only):
-    utils.check_nodetool_fails_with(
+    check_nodetool_fails_with(
             nodetool,
             ("compact", "--user-defined", "/var/lib/scylla/data/system/local-7ad54392bcdd35a684174e047860b377/"
              "me-3g8w_11cg_4317k2ppfb6d5vgp0w-big-Data.db"),

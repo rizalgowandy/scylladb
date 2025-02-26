@@ -3,17 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
+#include "utils/assert.hh"
 #include "sstables.hh"
 #include "consumer.hh"
 #include "downsampling.hh"
+#include "exceptions.hh"
 #include "sstables/partition_index_cache.hh"
 #include <seastar/util/bool_class.hh>
-#include "utils/buffer_input_stream.hh"
-#include "sstables/prepended_input_stream.hh"
+#include <seastar/core/when_all.hh>
 #include "tracing/traced_file.hh"
 #include "sstables/scanning_clustered_index_cursor.hh"
 #include "sstables/mx/bsearch_clustered_cursor.hh"
@@ -77,7 +78,7 @@ public:
                             e.promoted_index->promoted_index_size,
                             e.promoted_index->num_blocks);
                 }
-                auto key = managed_bytes(reinterpret_cast<const blob_storage::char_type*>(e.key.get()), e.key.size());
+                auto key = managed_bytes(reinterpret_cast<const bytes::value_type*>(e.key.get()), e.key.size());
                 indexes._entries.emplace_back(make_managed<index_entry>(std::move(key), e.data_file_offset, std::move(pi)));
             });
         });
@@ -131,16 +132,6 @@ inline std::string_view format_as(index_consume_entry_context_state s) {
 
 } // namespace sstables
 
-#if FMT_VERSION < 10'00'00
-template <>
-struct fmt::formatter<sstables::index_consume_entry_context_state> {
-    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
-    auto format(sstables::index_consume_entry_context_state s, fmt::format_context& ctx) const {
-        return fmt::format_to(ctx.out(), "{}", format_as(s));
-    }
-};
-#endif
-
 namespace sstables {
 
 // TODO: make it templated on SSTables version since the exact format can be passed in at compile time
@@ -166,10 +157,13 @@ private:
     std::optional<deletion_time> _deletion_time;
 
     trust_promoted_index _trust_pi;
-    std::optional<column_values_fixed_lengths> _ck_values_fixed_lengths;
+    column_translation _ctr;
     tracing::trace_state_ptr _trace_state;
+    const abort_source& _abort;
 
-    inline bool is_mc_format() const { return static_cast<bool>(_ck_values_fixed_lengths); }
+    inline bool is_mc_format() const {
+        return !_ctr.empty();
+    }
 
 public:
     void verify_end_state() const {
@@ -186,6 +180,8 @@ public:
     }
 
     processing_result process_state(temporary_buffer<char>& data) {
+        _abort.check();
+
         auto current_pos = [&] { return this->position() - data.size(); };
         auto read_vint_or_uint64 = [this] (temporary_buffer<char>& data) {
             return is_mc_format() ? this->read_unsigned_vint(data) : this->read_64(data);
@@ -319,11 +315,14 @@ public:
 
     index_consume_entry_context(const sstable& sst, reader_permit permit, IndexConsumer& consumer, trust_promoted_index trust_pi,
             input_stream<char>&& input, uint64_t start, uint64_t maxlen,
-            std::optional<column_values_fixed_lengths> ck_values_fixed_lengths, tracing::trace_state_ptr trace_state = {})
+            column_translation ctr,
+            const abort_source& abort,
+            tracing::trace_state_ptr trace_state = {})
         : continuous_data_consumer(std::move(permit), std::move(input), start, maxlen)
         , _sst(sst), _consumer(consumer), _entry_offset(start), _trust_pi(trust_pi)
-        , _ck_values_fixed_lengths(std::move(ck_values_fixed_lengths))
+        , _ctr(std::move(ctr))
         , _trace_state(std::move(trace_state))
+        , _abort(abort)
     {}
 };
 
@@ -344,13 +343,7 @@ std::unique_ptr<clustered_index_cursor> promoted_index::make_cursor(shared_sstab
     file_input_stream_options options,
     use_caching caching)
 {
-    std::optional<column_values_fixed_lengths> ck_values_fixed_lengths;
-    if (sst->get_version() >= sstable_version_types::mc) {
-        ck_values_fixed_lengths = std::make_optional(
-            get_clustering_values_fixed_lengths(sst->get_serialization_header()));
-    }
-
-    if (sst->get_version() >= sstable_version_types::mc) {
+    if (sst->get_version() >= sstable_version_types::mc) [[likely]] {
         seastar::shared_ptr<cached_file> cached_file_ptr = caching
                 ? sst->_cached_index_file
                 : seastar::make_shared<cached_file>(make_tracked_index_file(*sst, permit, trace_state, caching),
@@ -361,13 +354,13 @@ std::unique_ptr<clustered_index_cursor> promoted_index::make_cursor(shared_sstab
         return std::make_unique<mc::bsearch_clustered_cursor>(*sst->get_schema(),
             _promoted_index_start, _promoted_index_size,
             promoted_index_cache_metrics, permit,
-            *ck_values_fixed_lengths, cached_file_ptr, _num_blocks, trace_state);
+            sst->get_column_translation(), cached_file_ptr, _num_blocks, trace_state, sst->features());
     }
 
     auto file = make_tracked_index_file(*sst, permit, std::move(trace_state), caching);
     auto promoted_index_stream = make_file_input_stream(std::move(file), _promoted_index_start, _promoted_index_size,options);
     return std::make_unique<scanning_clustered_index_cursor>(*sst->get_schema(), permit,
-        std::move(promoted_index_stream), _promoted_index_size, _num_blocks, ck_values_fixed_lengths);
+        std::move(promoted_index_stream), _promoted_index_size, _num_blocks, std::nullopt);
 }
 
 // Less-comparator for lookups in the partition index.
@@ -460,20 +453,19 @@ class index_reader {
     logalloc::region& _region;
     use_caching _use_caching;
     bool _single_page_read;
+    abort_source _abort;
 
     std::unique_ptr<index_consume_entry_context<index_consumer>> make_context(uint64_t begin, uint64_t end, index_consumer& consumer) {
         auto index_file = make_tracked_index_file(*_sstable, _permit, _trace_state, _use_caching);
         auto input = make_file_input_stream(index_file, begin, (_single_page_read ? end : _sstable->index_size()) - begin,
                         get_file_input_stream_options());
         auto trust_pi = trust_promoted_index(_sstable->has_correct_promoted_index_entries());
-        auto ck_values_fixed_lengths = _sstable->get_version() >= sstable_version_types::mc
-                            ? std::make_optional(get_clustering_values_fixed_lengths(_sstable->get_serialization_header()))
-                            : std::optional<column_values_fixed_lengths>{};
         return std::make_unique<index_consume_entry_context<index_consumer>>(*_sstable, _permit, consumer, trust_pi, std::move(input),
-                            begin, end - begin, ck_values_fixed_lengths, _trace_state);
+                            begin, end - begin, _sstable->get_column_translation(), _abort, _trace_state);
     }
 
     future<> advance_context(index_bound& bound, uint64_t begin, uint64_t end, int quantity) {
+        assert(!bound.context || !_single_page_read);
         if (!bound.context) {
             bound.consumer = std::make_unique<index_consumer>(_region, _sstable->get_schema());
             bound.context = make_context(begin, end, *bound.consumer);
@@ -515,7 +507,7 @@ private:
     // Must be called for non-decreasing summary_idx.
     future<> advance_to_page(index_bound& bound, uint64_t summary_idx) {
         sstlog.trace("index {}: advance_to_page({}), bound {}", fmt::ptr(this), summary_idx, fmt::ptr(&bound));
-        assert(!bound.current_list || bound.current_summary_idx <= summary_idx);
+        SCYLLA_ASSERT(!bound.current_list || bound.current_summary_idx <= summary_idx);
         if (bound.current_list && bound.current_summary_idx == summary_idx) {
             sstlog.trace("index {}: same page", fmt::ptr(this));
             return make_ready_future<>();
@@ -548,12 +540,6 @@ private:
                     }
                     if (ex) {
                         return make_exception_future<index_list>(std::move(ex));
-                    }
-                    if (_single_page_read) {
-                        // if the associated reader is forwarding despite having singular range, we prepare for that
-                        _single_page_read = false;
-                        auto& ctx = *bound.context;
-                        return ctx.close().then([bc = std::move(bound.context), &bound] { return std::move(bound.consumer->indexes); });
                     }
                     return make_ready_future<index_list>(std::move(bound.consumer->indexes));
                 });
@@ -621,7 +607,7 @@ private:
 
     // Valid if partition_data_ready(bound)
     index_entry& current_partition_entry(index_bound& bound) {
-        assert(bound.current_list);
+        SCYLLA_ASSERT(bound.current_list);
         return *bound.current_list->_entries[bound.current_index_idx];
     }
 
@@ -664,7 +650,7 @@ private:
 
         auto& summary = _sstable->get_summary();
         bound.previous_summary_idx = std::distance(std::begin(summary.entries),
-            std::lower_bound(summary.entries.begin() + bound.previous_summary_idx, summary.entries.end(), pos, index_comparator(*_sstable->_schema)));
+            std::upper_bound(summary.entries.begin() + bound.previous_summary_idx, summary.entries.end(), pos, index_comparator(*_sstable->_schema)));
 
         if (bound.previous_summary_idx == 0) {
             sstlog.trace("index {}: first entry", fmt::ptr(this));
@@ -686,7 +672,7 @@ private:
         // is no G in that bucket so we read the following one to get the
         // position (see the advance_to_page() call below). After we've got it, it's time to
         // get J] position. Again, summary points us to the first bucket and we
-        // hit an assert since the reader is already at the second bucket and we
+        // hit an SCYLLA_ASSERT since the reader is already at the second bucket and we
         // cannot go backward.
         // The solution is this condition above. If our lookup requires reading
         // the previous bucket we assume that the entry doesn't exist and return
@@ -705,8 +691,13 @@ private:
             // i is valid until next allocation point
             auto& entries = bound.current_list->_entries;
             if (i == std::end(entries)) {
-                sstlog.trace("index {}: not found", fmt::ptr(this));
-                return advance_to_page(bound, summary_idx + 1);
+                if (_single_page_read) {
+                    sstlog.trace("index {}: not found in index page {}, returning eof because this is a single-partition read", summary_idx, fmt::ptr(this));
+                    return advance_to_end(bound);
+                } else {
+                    sstlog.trace("index {}: not found in index page {}, trying next index page", summary_idx, fmt::ptr(this));
+                    return advance_to_page(bound, summary_idx + 1);
+                }
             }
             bound.current_index_idx = std::distance(std::begin(entries), i);
             bound.current_pi_idx = 0;
@@ -718,6 +709,7 @@ private:
         });
     }
 
+public:
     // Forwards the upper bound cursor to a position which is greater than given position in current partition.
     //
     // Note that the index within partition, unlike the partition index, doesn't cover all keys.
@@ -734,7 +726,7 @@ private:
         // So need to make sure first that it is read
         if (!partition_data_ready(_lower_bound)) {
             return read_partition_data().then([this, pos] {
-                assert(partition_data_ready());
+                SCYLLA_ASSERT(partition_data_ready());
                 return advance_upper_past(pos);
             });
         }
@@ -745,7 +737,7 @@ private:
 
         index_entry& e = current_partition_entry(*_upper_bound);
         auto e_pos = e.position();
-        clustered_index_cursor* cur = current_clustered_cursor(*_upper_bound);
+        clustered_index_cursor* cur = current_clustered_cursor();
 
         if (!cur) {
             sstlog.trace("index {}: no promoted index", fmt::ptr(this));
@@ -763,6 +755,7 @@ private:
         });
     }
 
+private:
     // Returns position right after all partitions in the sstable
     uint64_t data_file_end() const {
         return _sstable->data_size();
@@ -811,12 +804,12 @@ public:
     // Ensures that partition_data_ready() returns true.
     // Can be called only when !eof()
     future<> read_partition_data() {
-        assert(!eof());
+        SCYLLA_ASSERT(!eof());
         if (partition_data_ready(_lower_bound)) {
             return make_ready_future<>();
         }
         // The only case when _current_list may be missing is when the cursor is at the beginning
-        assert(_lower_bound.current_summary_idx == 0);
+        SCYLLA_ASSERT(_lower_bound.current_summary_idx == 0);
         return advance_to_page(_lower_bound, 0);
     }
 
@@ -859,6 +852,10 @@ public:
 
     clustered_index_cursor* current_clustered_cursor() {
         return current_clustered_cursor(_lower_bound);
+    }
+
+    future<> reset_clustered_cursor() {
+        return reset_clustered_cursor(_lower_bound);
     }
 
     // Returns tombstone for the current partition if it was recorded in the sstable.
@@ -915,7 +912,7 @@ public:
         if (!partition_data_ready()) {
             return read_partition_data().then([this, pos] {
                 sstlog.trace("index {}: page done", fmt::ptr(this));
-                assert(partition_data_ready(_lower_bound));
+                SCYLLA_ASSERT(partition_data_ready(_lower_bound));
                 return advance_to(pos);
             });
         }
@@ -929,10 +926,10 @@ public:
             return make_ready_future<>();
         }
 
-        return cur->advance_to(pos).then([this, e_pos] (std::optional<clustered_index_cursor::skip_info> si) {
+        return cur->advance_to(pos).then([this, cur, e_pos] (std::optional<clustered_index_cursor::skip_info> si) {
             if (!si) {
                 sstlog.trace("index {}: position in the same block", fmt::ptr(this));
-                return;
+                si = cur->current_block();
             }
             if (!si->active_tombstone) {
                 // End open marker can be only engaged in SSTables 3.x ('mc' format) and never in ka/la
@@ -948,24 +945,18 @@ public:
 
     // Like advance_to(dht::ring_position_view), but returns information whether the key was found
     // If upper_bound is provided, the upper bound within position is looked up
-    future<bool> advance_lower_and_check_if_present(
-            dht::ring_position_view key, std::optional<position_in_partition_view> pos = {}) {
-        return advance_to(_lower_bound, key).then([this, key, pos] {
+    future<bool> advance_lower_and_check_if_present(dht::ring_position_view key) {
+        utils::get_local_injector().inject("advance_lower_and_check_if_present", [] { throw std::runtime_error("advance_lower_and_check_if_present"); });
+        return advance_to(_lower_bound, key).then([this, key] {
             if (eof()) {
                 return make_ready_future<bool>(false);
             }
-            return read_partition_data().then([this, key, pos] {
+            return read_partition_data().then([this, key] {
                 index_comparator cmp(*_sstable->_schema);
                 bool found = _alloc_section(_region, [&] {
                     return cmp(key, current_partition_entry(_lower_bound)) == 0;
                 });
-                if (!found || !pos) {
-                    return make_ready_future<bool>(found);
-                }
-
-                return advance_upper_past(*pos).then([] {
-                    return make_ready_future<bool>(true);
-                });
+                return make_ready_future<bool>(found);
             });
         });
     }
@@ -1002,7 +993,7 @@ public:
         // so need to make sure first that the lower bound partition data is in memory.
         if (!partition_data_ready(_lower_bound)) {
             return read_partition_data().then([this, pos] {
-                assert(partition_data_ready());
+                SCYLLA_ASSERT(partition_data_ready());
                 return advance_reverse(pos);
             });
         }
@@ -1047,7 +1038,7 @@ public:
     //
     // Preconditions: sstable version >= mc, partition_data_ready().
     future<std::optional<uint64_t>> last_block_offset() {
-        assert(partition_data_ready());
+        SCYLLA_ASSERT(partition_data_ready());
 
         auto cur = current_clustered_cursor();
         if (!cur) {

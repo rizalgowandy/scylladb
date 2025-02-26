@@ -5,17 +5,18 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include <seastar/core/distributed.hh>
 #include "gms/gossiper.hh"
 #include "streaming/stream_manager.hh"
 #include "streaming/stream_result_future.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "streaming/stream_session_state.hh"
 #include <seastar/core/metrics.hh>
 #include <seastar/core/coroutine.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 #include "db/config.hh"
 
 namespace streaming {
@@ -24,14 +25,12 @@ extern logging::logger sslog;
 
 stream_manager::stream_manager(db::config& cfg,
             sharded<replica::database>& db,
-            sharded<db::system_distributed_keyspace>& sys_dist_ks,
-            sharded<db::view::view_update_generator>& view_update_generator,
+            db::view::view_builder& view_builder,
             sharded<netw::messaging_service>& ms,
             sharded<service::migration_manager>& mm,
             gms::gossiper& gossiper, scheduling_group sg)
         : _db(db)
-        , _sys_dist_ks(sys_dist_ks)
-        , _view_update_generator(view_update_generator)
+        , _view_builder(view_builder)
         , _ms(ms)
         , _mm(mm)
         , _gossiper(gossiper)
@@ -181,7 +180,7 @@ std::vector<shared_ptr<stream_result_future>> stream_manager::get_all_streams() 
     return result;
 }
 
-void stream_manager::update_progress(streaming::plan_id plan_id, gms::inet_address peer, progress_info::direction dir, size_t fm_size) {
+void stream_manager::update_progress(streaming::plan_id plan_id, locator::host_id peer, progress_info::direction dir, size_t fm_size) {
     auto& sbytes = _stream_bytes[plan_id];
     if (dir == progress_info::direction::OUT) {
         sbytes[peer].bytes_sent += fm_size;
@@ -206,7 +205,7 @@ void stream_manager::remove_progress(streaming::plan_id plan_id) {
     _stream_bytes.erase(plan_id);
 }
 
-stream_bytes stream_manager::get_progress(streaming::plan_id plan_id, gms::inet_address peer) const {
+stream_bytes stream_manager::get_progress(streaming::plan_id plan_id, locator::host_id peer) const {
     auto it = _stream_bytes.find(plan_id);
     if (it == _stream_bytes.end()) {
         return stream_bytes();
@@ -237,7 +236,7 @@ future<> stream_manager::remove_progress_on_all_shards(streaming::plan_id plan_i
     });
 }
 
-future<stream_bytes> stream_manager::get_progress_on_all_shards(streaming::plan_id plan_id, gms::inet_address peer) const {
+future<stream_bytes> stream_manager::get_progress_on_all_shards(streaming::plan_id plan_id, locator::host_id peer) const {
     return container().map_reduce0(
         [plan_id, peer] (auto& sm) {
             return sm.get_progress(plan_id, peer);
@@ -257,7 +256,7 @@ future<stream_bytes> stream_manager::get_progress_on_all_shards(streaming::plan_
     );
 }
 
-future<stream_bytes> stream_manager::get_progress_on_all_shards(gms::inet_address peer) const {
+future<stream_bytes> stream_manager::get_progress_on_all_shards(locator::host_id peer) const {
     return container().map_reduce0(
         [peer] (auto& sm) {
             stream_bytes ret;
@@ -271,6 +270,10 @@ future<stream_bytes> stream_manager::get_progress_on_all_shards(gms::inet_addres
         stream_bytes(),
         std::plus<stream_bytes>()
     );
+}
+
+future<stream_bytes> stream_manager::get_progress_on_all_shards(gms::inet_address peer) const {
+    return get_progress_on_all_shards(_gossiper.get_host_id(peer));
 }
 
 future<stream_bytes> stream_manager::get_progress_on_all_shards() const {
@@ -302,7 +305,7 @@ stream_bytes stream_manager::get_progress_on_local_shard() const {
 bool stream_manager::has_peer(inet_address endpoint) const {
     for (auto sr : get_all_streams()) {
         for (auto session : sr->get_coordinator()->get_all_stream_sessions()) {
-            if (session->peer == endpoint) {
+            if (_gossiper.get_address_map().find(session->peer) == endpoint) {
                 return true;
             }
         }
@@ -310,10 +313,24 @@ bool stream_manager::has_peer(inet_address endpoint) const {
     return false;
 }
 
+future<> stream_manager::fail_stream_plan(streaming::plan_id plan_id) {
+    return container().invoke_on_all([plan_id] (auto& sm) -> future<> {
+        for (auto sr : sm.get_all_streams()) {
+            for (auto session : sr->get_coordinator()->get_all_stream_sessions()) {
+                co_await seastar::coroutine::maybe_yield();
+                if (session->plan_id() == plan_id) {
+                    sslog.info("stream_manager: Failed stream_session for stream_plan plan_id={}", plan_id);
+                    session->close_session(stream_session_state::FAILED);
+                }
+            }
+        }
+    });
+}
+
 void stream_manager::fail_sessions(inet_address endpoint) {
     for (auto sr : get_all_streams()) {
         for (auto session : sr->get_coordinator()->get_all_stream_sessions()) {
-            if (session->peer == endpoint) {
+            if (_gossiper.get_address_map().find(session->peer) == endpoint) {
                 session->close_session(stream_session_state::FAILED);
             }
         }
@@ -367,7 +384,7 @@ future<> stream_manager::on_dead(inet_address endpoint, endpoint_state_ptr ep_st
     return make_ready_future();
 }
 
-shared_ptr<stream_session> stream_manager::get_session(streaming::plan_id plan_id, gms::inet_address from, const char* verb, std::optional<table_id> cf_id) {
+shared_ptr<stream_session> stream_manager::get_session(streaming::plan_id plan_id, locator::host_id from, const char* verb, std::optional<table_id> cf_id) {
     if (cf_id) {
         sslog.debug("[Stream #{}] GOT {} from {}: cf_id={}", plan_id, verb, from, *cf_id);
     } else {

@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -16,7 +16,6 @@
 #include "cql3/statements/index_target.hh"
 
 #include <vector>
-#include <set>
 
 namespace cql3::expr {
 
@@ -34,6 +33,21 @@ sstring index_table_name(const sstring& index_name);
  * to create that table.
  */
 sstring index_name_from_table_name(const sstring& table_name);
+
+/// Given a list of base-table schemas, return all their secondary indexes, except that specified in cf_to_exclude.
+std::set<sstring>
+existing_index_names(const std::vector<schema_ptr>& tables, std::string_view cf_to_exclude);
+
+/// Given a base-table keyspace and table name, return the first available index
+/// name (containing index_name_root if specified).
+/// If needed, a running counder is appended to the index name, if it is already
+/// taken (existing_names contains it).
+sstring get_available_index_name(
+        std::string_view ks_name,
+        std::string_view cf_name,
+        std::optional<sstring> index_name_root,
+        const std::set<sstring>& existing_names,
+        std::function<bool(std::string_view, std::string_view)> has_schema);
 
 class index {
     index_metadata _im;
@@ -79,7 +93,7 @@ class secondary_index_manager {
 public:
     secondary_index_manager(data_dictionary::table cf);
     void reload();
-    view_ptr create_view_for_index(const index_metadata& index, bool new_token_column_computation) const;
+    view_ptr create_view_for_index(const index_metadata& index) const;
     std::vector<index_metadata> get_dependent_indices(const column_definition& cdef) const;
     std::vector<index> list_indexes() const;
     bool is_index(view_ptr) const;

@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -31,15 +31,15 @@ class type_parser {
 
     public static final TypeParser EMPTY_PARSER = new TypeParser("", 0);
 #endif
-    type_parser(sstring_view str, size_t idx);
+    type_parser(std::string_view str, size_t idx);
 public:
-    explicit type_parser(sstring_view str);
+    explicit type_parser(std::string_view str);
 
     /**
      * Parse a string containing an type definition.
      */
     static data_type parse(const sstring& str);
-    static data_type parse(sstring_view str);
+    static data_type parse(std::string_view str);
 
 #if 0
     public static AbstractType<?> parse(CharSequence compareWith) throws SyntaxException, ConfigurationException
@@ -97,6 +97,7 @@ public:
     }
 #endif
     std::vector<data_type> get_type_parameters(bool multicell=true);
+    std::tuple<data_type, size_t> get_vector_parameters();
     std::tuple<sstring, bytes, std::vector<bytes>, std::vector<data_type>> get_user_type_parameters();
     data_type do_parse(bool multicell = true);
 

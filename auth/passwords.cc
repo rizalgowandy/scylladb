@@ -3,13 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "auth/passwords.hh"
 
 #include <cerrno>
-#include <optional>
 
 extern "C" {
 #include <crypt.h>
@@ -47,14 +46,13 @@ sstring hash_with_salt(const sstring& pass, const sstring& salt) {
     return res;
 }
 
-const char* prefix_for_scheme(scheme c) noexcept {
+std::string_view prefix_for_scheme(scheme c) noexcept {
     switch (c) {
     case scheme::bcrypt_y: return "$2y$";
     case scheme::bcrypt_a: return "$2a$";
     case scheme::sha_512: return "$6$";
     case scheme::sha_256: return "$5$";
     case scheme::md5: return "$1$";
-    default: return nullptr;
     }
 }
 

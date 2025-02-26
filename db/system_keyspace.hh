@@ -4,26 +4,34 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include "gms/gossiper.hh"
 #include "schema/schema_fwd.hh"
 #include "utils/UUID.hh"
 #include "query-result-set.hh"
 #include "db_clock.hh"
 #include "mutation_query.hh"
 #include "system_keyspace_view_types.hh"
-#include <map>
+#include "sstables/sstables_registry.hh"
 #include <seastar/core/distributed.hh>
 #include "cdc/generation_id.hh"
 #include "locator/host_id.hh"
-#include "mutation/canonical_mutation.hh"
+#include "virtual_tables.hh"
+#include "types/types.hh"
+#include "auth_version.hh"
+
+namespace utils {
+    class shared_dict;
+};
 
 namespace sstables {
     struct entry_descriptor;
@@ -43,6 +51,9 @@ namespace paxos {
     class proposal;
 } // namespace service::paxos
 
+struct topology_request_state;
+
+class group0_guard;
 }
 
 namespace netw {
@@ -71,6 +82,10 @@ namespace gms {
 
 namespace cdc {
     class topology_description;
+}
+
+namespace cql3 {
+    class untyped_result_set_row;
 }
 
 bool is_system_keyspace(std::string_view ks_name);
@@ -112,6 +127,8 @@ class system_keyspace : public seastar::peering_sharded_service<system_keyspace>
     cql3::query_processor& _qp;
     replica::database& _db;
     std::unique_ptr<local_cache> _cache;
+    virtual_tables_registry _virtual_tables_registry;
+    bool _peers_table_read_fixup_done = false;
 
     static schema_ptr raft_snapshot_config();
     static schema_ptr local();
@@ -126,8 +143,15 @@ class system_keyspace : public seastar::peering_sharded_service<system_keyspace>
     static schema_ptr large_cells();
     static schema_ptr scylla_local();
     future<> force_blocking_flush(sstring cfname);
-    template <typename Value>
-    future<> update_cached_values(gms::inet_address ep, sstring column_name, Value value);
+    // This function is called when the system.peers table is read,
+    // and it fixes some types of inconsistencies that can occur
+    // due to node crashes:
+    //  * missing host_id. This is possible in the old versions of the code. Such records
+    //  are removed and the warning is written to the log.
+    //  * duplicate IPs for a given host_id. This is possible when some node changes its IP
+    //  and this node crashes after adding a new IP but before removing the old one. The
+    //  record with older timestamp is removed, the warning is written to the log.
+    future<> peers_table_read_fixup();
 public:
     static schema_ptr size_estimates();
 public:
@@ -138,6 +162,7 @@ public:
     static constexpr auto BUILT_INDEXES = "IndexInfo";
     static constexpr auto LOCAL = "local";
     static constexpr auto TRUNCATED = "truncated";
+    static constexpr auto COMMITLOG_CLEANUPS = "commitlog_cleanups";
     static constexpr auto PEERS = "peers";
     static constexpr auto PEER_EVENTS = "peer_events";
     static constexpr auto RANGE_XFERS = "range_xfers";
@@ -157,9 +182,19 @@ public:
     static constexpr auto DISCOVERY = "discovery";
     static constexpr auto BROADCAST_KV_STORE = "broadcast_kv_store";
     static constexpr auto TOPOLOGY = "topology";
+    static constexpr auto TOPOLOGY_REQUESTS = "topology_requests";
     static constexpr auto SSTABLES_REGISTRY = "sstables";
     static constexpr auto CDC_GENERATIONS_V3 = "cdc_generations_v3";
     static constexpr auto TABLETS = "tablets";
+    static constexpr auto SERVICE_LEVELS_V2 = "service_levels_v2";
+    static constexpr auto VIEW_BUILD_STATUS_V2 = "view_build_status_v2";
+    static constexpr auto DICTS = "dicts";
+
+    // auth
+    static constexpr auto ROLES = "roles";
+    static constexpr auto ROLE_MEMBERS = "role_members";
+    static constexpr auto ROLE_ATTRIBUTES = "role_attributes";
+    static constexpr auto ROLE_PERMISSIONS = "role_permissions";
 
     struct v3 {
         static constexpr auto BATCHES = "batches";
@@ -181,6 +216,7 @@ public:
         static schema_ptr built_indexes();
         static schema_ptr local();
         static schema_ptr truncated();
+        static schema_ptr commitlog_cleanups();
         static schema_ptr peers();
         static schema_ptr peer_events();
         static schema_ptr range_xfers();
@@ -241,11 +277,19 @@ public:
     static schema_ptr discovery();
     static schema_ptr broadcast_kv_store();
     static schema_ptr topology();
+    static schema_ptr topology_requests();
     static schema_ptr sstables_registry();
     static schema_ptr cdc_generations_v3();
     static schema_ptr tablets();
+    static schema_ptr service_levels_v2();
+    static schema_ptr view_build_status_v2();
+    static schema_ptr dicts();
 
-    static table_schema_version generate_schema_version(table_id table_id, uint16_t offset = 0);
+    // auth
+    static schema_ptr roles();
+    static schema_ptr role_members();
+    static schema_ptr role_attributes();
+    static schema_ptr role_permissions();
 
     future<> build_bootstrap_info();
     future<std::unordered_map<table_id, db_clock::time_point>> load_truncation_times();
@@ -256,16 +300,21 @@ public:
     */
     future<> update_tokens(const std::unordered_set<dht::token>& tokens);
 
-    /**
-     * Record tokens being used by another node in the PEERS table.
-     */
-    future<> update_tokens(gms::inet_address ep, const std::unordered_set<dht::token>& tokens);
-
     future<std::unordered_map<gms::inet_address, gms::inet_address>> get_preferred_ips();
 
 public:
-    template <typename Value>
-    future<> update_peer_info(gms::inet_address ep, sstring column_name, Value value);
+    struct peer_info {
+        std::optional<sstring> data_center;
+        std::optional<net::inet_address> preferred_ip;
+        std::optional<sstring> rack;
+        std::optional<sstring> release_version;
+        std::optional<net::inet_address> rpc_address;
+        std::optional<utils::UUID> schema_version;
+        std::optional<std::unordered_set<dht::token>> tokens;
+        std::optional<sstring> supported_features;
+    };
+
+    future<> update_peer_info(gms::inet_address ep, locator::host_id hid, const peer_info& info);
 
     future<> remove_endpoint(gms::inet_address ep);
 
@@ -283,7 +332,9 @@ public:
     template <typename T>
     future<std::optional<T>> get_scylla_local_param_as(const sstring& key);
 
+    static std::vector<schema_ptr> auth_tables();
     static std::vector<schema_ptr> all_tables(const db::config& cfg);
+
     future<> make(
             locator::effective_replication_map_factory&,
             replica::database&);
@@ -292,6 +343,10 @@ public:
 
 
     /// overloads
+
+    future<foreign_ptr<lw_shared_ptr<reconcilable_result>>>
+    static query_mutations(distributed<replica::database>& db,
+                    schema_ptr schema);
 
     future<foreign_ptr<lw_shared_ptr<reconcilable_result>>>
     static query_mutations(distributed<replica::database>& db,
@@ -322,9 +377,9 @@ public:
 
 
     /**
-     * Return a map of IP addresses containing a map of dc and rack info
+     * Return a map of nodes and their loaded_endpoint_state
      */
-    future<std::unordered_map<gms::inet_address, locator::endpoint_dc_rack>> load_dc_rack_info();
+    future<std::unordered_map<locator::host_id, gms::loaded_endpoint_state>> load_endpoint_state();
 
     enum class bootstrap_state {
         NEEDS_BOOTSTRAP,
@@ -348,6 +403,19 @@ public:
         int64_t range_end;
     };
 
+    struct topology_requests_entry {
+        utils::UUID id;
+        utils::UUID initiating_host;
+        std::optional<service::topology_request> request_type;
+        db_clock::time_point start_time;
+        bool done;
+        sstring error;
+        db_clock::time_point end_time;
+        db_clock::time_point ts;
+        table_id truncate_table_id;
+    };
+    using topology_requests_entries = std::unordered_map<utils::UUID, system_keyspace::topology_requests_entry>;
+
     future<> update_repair_history(repair_history_entry);
     using repair_history_consumer = noncopyable_function<future<>(const repair_history_entry&)>;
     future<> get_repair_history(table_id, repair_history_consumer f);
@@ -355,6 +423,51 @@ public:
     future<> save_truncation_record(const replica::column_family&, db_clock::time_point truncated_at, db::replay_position);
     future<replay_positions> get_truncated_positions(table_id);
     future<> drop_truncation_rp_records();
+
+    // Converts a `dht::token_range` object to the left-open integer range (x,y] form.
+    //
+    // Note: perhaps this should be extracted to `dht/`, or somewhere.
+    static std::pair<int64_t, int64_t> canonical_token_range(dht::token_range tr);
+
+    // When a commitlog replay happens after a successful cleanup operation,
+    // we have to filter out the mutations affected by the cleanup,
+    // to avoid data resurrection.
+    //
+    // For this purpose, records of cleanup operations (the affected token ranges
+    // and commitlog ranges) are kept in a system table.
+    //
+    // The below functions manipulate these records. 
+
+    // Saves a record of a token range affected by cleanup.
+    // After reboot, tokens from this range will be replayed only if they are on replay positions
+    // strictly greater than the given one.
+    future<> save_commitlog_cleanup_record(table_id, dht::token_range, db::replay_position);
+    struct commitlog_cleanup_map_hash {
+        size_t operator()(const std::pair<table_id, int32_t>& p) const;
+    };
+    // For a given token, this map returns the maximum replay position affected by cleanups.
+    // A mutation in commitlog should only be replayed if it lies on a replay position
+    // greater than that maximum for its token.
+    struct commitlog_cleanup_local_map {
+        // pimpl to avoid transitive #include of boost/icl.
+        class impl;
+        std::unique_ptr<impl> _pimpl;
+        ~commitlog_cleanup_local_map();
+        commitlog_cleanup_local_map();
+        std::optional<db::replay_position> get(int64_t token) const;
+    };
+    using commitlog_cleanup_map = std::unordered_map<
+        std::pair<table_id, int32_t>,
+        commitlog_cleanup_local_map,
+        commitlog_cleanup_map_hash
+        >;
+    future<commitlog_cleanup_map> get_commitlog_cleanup_records();
+    // Drops all cleanup records which apply to positions older than the given one.
+    // Used to drop records which only apply to segments which have already been deleted.
+    future<> drop_old_commitlog_cleanup_records(replay_position);
+    // Cleans all records. Used after a successful replay, since the records only
+    // apply to the commitlog of the last boot cycle, and can be wrong in this cycle.
+    future<> drop_all_commitlog_cleanup_records();
 
     /**
      * Return a map of stored tokens to IP addresses
@@ -369,6 +482,7 @@ public:
     future<std::unordered_map<gms::inet_address, locator::host_id>> load_host_ids();
 
     future<std::vector<gms::inet_address>> load_peers();
+    future<std::vector<locator::host_id>> load_peers_ids();
 
     /*
      * Read this node's tokens stored in the LOCAL table.
@@ -393,7 +507,7 @@ public:
     // may depend on it.
     future<> save_local_enabled_features(std::set<sstring> features, bool visible_before_cl_replay);
 
-    future<int> increment_and_get_generation();
+    future<gms::generation_type> increment_and_get_generation();
     bool bootstrap_needed() const;
     bool bootstrap_complete() const;
     bool bootstrap_in_progress() const;
@@ -467,19 +581,21 @@ public:
     // Assumes that the history table exists, i.e. Raft experimental feature is enabled.
     future<bool> group0_history_contains(utils::UUID state_id);
 
-    future<service::topology> load_topology_state();
-    future<service::topology_features> load_topology_features_state();
+    // force_load_hosts is a set of hosts which must be loaded even if they are in the left state.
+    future<service::topology> load_topology_state(const std::unordered_set<locator::host_id>& force_load_hosts);
+
+    future<std::optional<service::topology_features>> load_topology_features_state();
 
     // Read CDC generation data with the given UUID as key.
     // Precondition: the data is known to be present in the table (because it was committed earlier through group 0).
     future<cdc::topology_description> read_cdc_generation(utils::UUID id);
 
-    // Loads the current clean-up candidate for the CDC generation data. If there is no candidate, returns std::nullopt.
-    future<std::optional<cdc::generation_id_v2>> get_cdc_generations_cleanup_candidate();
-
-    // Returns a mutation that sets the current clean-up candidate for the CDC generation data. If given std::nullopt,
-    // the returned mutation sets the candidate to null, indicating there is no candidate.
-    mutation make_cleanup_candidate_mutation(std::optional<cdc::generation_id_v2> value, api::timestamp_type ts);
+    // Read CDC generation data with the given UUID as key.
+    // Unlike `read_cdc_generation`, does not require the data to be present.
+    // This method is meant to be used after switching back to legacy mode due to raft recovery,
+    // as the node will need to fetch definition of a CDC generation that was
+    // previously created in raft topology mode.
+    future<std::optional<cdc::topology_description>> read_cdc_generation_opt(utils::UUID id);
 
     // The mutation appends the given state ID to the group 0 history table, with the given description if non-empty.
     //
@@ -496,15 +612,33 @@ public:
     static future<mutation> get_group0_history(distributed<replica::database>&);
 
     // If the `group0_schema_version` key in `system.scylla_local` is present (either live or tombstone),
-    // returns the corresponding mutation. Otherwise returns an empty mutation for that key.
-    future<mutation> get_group0_schema_version();
+    // returns the corresponding mutation. Otherwise returns nullopt.
+    future<std::optional<mutation>> get_group0_schema_version();
 
-    future<> sstables_registry_create_entry(sstring location, sstring status, sstables::sstable_state state, sstables::entry_descriptor desc);
-    future<> sstables_registry_update_entry_status(sstring location, sstables::generation_type gen, sstring status);
-    future<> sstables_registry_update_entry_state(sstring location, sstables::generation_type gen, sstables::sstable_state state);
-    future<> sstables_registry_delete_entry(sstring location, sstables::generation_type gen);
-    using sstable_registry_entry_consumer = noncopyable_function<future<>(sstring status, sstables::sstable_state state, sstables::entry_descriptor desc)>;
-    future<> sstables_registry_list(sstring location, sstable_registry_entry_consumer consumer);
+    using auth_version_t = db::auth_version_t;
+
+    // If the `auth_version` key in `system.scylla_local` is present (either live or tombstone),
+    // returns the corresponding mutation. Otherwise returns nullopt.
+    future<std::optional<mutation>> get_auth_version_mutation();
+    future<mutation> make_auth_version_mutation(api::timestamp_type ts, auth_version_t version);
+    future<auth_version_t> get_auth_version();
+
+    enum class view_builder_version_t: int64_t {
+        v1 = 10,
+        v1_5 = 15,
+        v2 = 20,
+    };
+
+    future<std::optional<mutation>> get_view_builder_version_mutation();
+    future<mutation> make_view_builder_version_mutation(api::timestamp_type ts, view_builder_version_t version);
+    future<view_builder_version_t> get_view_builder_version();
+
+    future<> sstables_registry_create_entry(table_id owner, sstring status, sstables::sstable_state state, sstables::entry_descriptor desc);
+    future<> sstables_registry_update_entry_status(table_id owner, sstables::generation_type gen, sstring status);
+    future<> sstables_registry_update_entry_state(table_id owner, sstables::generation_type gen, sstables::sstable_state state);
+    future<> sstables_registry_delete_entry(table_id owner, sstables::generation_type gen);
+    using sstable_registry_entry_consumer = sstables::sstables_registry::entry_consumer;
+    future<> sstables_registry_list(table_id owner, sstable_registry_entry_consumer consumer);
 
     future<std::optional<sstring>> load_group0_upgrade_state();
     future<> save_group0_upgrade_state(sstring);
@@ -512,8 +646,26 @@ public:
     future<bool> get_must_synchronize_topology();
     future<> set_must_synchronize_topology(bool);
 
+    future<service::topology_request_state> get_topology_request_state(utils::UUID id, bool require_entry);
+    topology_requests_entry topology_request_row_to_entry(utils::UUID id, const cql3::untyped_result_set_row& row);
+    future<topology_requests_entry> get_topology_request_entry(utils::UUID id, bool require_entry);
+    future<topology_requests_entries> get_node_ops_request_entries(db_clock::time_point end_time_limit);
+
+public:
+    future<std::optional<int8_t>> get_service_levels_version();
+    
+    future<mutation> make_service_levels_version_mutation(int8_t version, api::timestamp_type timestamp);
+    future<std::optional<mutation>> get_service_levels_version_mutation();
+
+    // Publishes a new compression dictionary to `dicts`,
+    // with the current timestamp.
+    future<mutation> get_insert_dict_mutation(
+            bytes dict, locator::host_id self, db_clock::time_point dict_ts, api::timestamp_type write_ts) const;
+    // Queries `dicts` for the most recent compression dictionary.
+    future<utils::shared_dict> query_dict() const;
+
 private:
-    static service::topology_features decode_topology_features_state(::shared_ptr<cql3::untyped_result_set> rs);
+    static std::optional<service::topology_features> decode_topology_features_state(::shared_ptr<cql3::untyped_result_set> rs);
 
 public:
 
@@ -521,8 +673,9 @@ public:
     ~system_keyspace();
     future<> shutdown();
 
+    virtual_tables_registry& get_virtual_tables_registry() { return _virtual_tables_registry; }
 private:
-    future<::shared_ptr<cql3::untyped_result_set>> execute_cql(const sstring& query_string, const std::initializer_list<data_value>& values);
+    future<::shared_ptr<cql3::untyped_result_set>> execute_cql(const sstring& query_string, const data_value_list& values);
     template <typename... Args>
     future<::shared_ptr<cql3::untyped_result_set>> execute_cql_with_timeout(sstring req, db::timeout_clock::time_point timeout, Args&&... args);
 
@@ -538,6 +691,9 @@ public:
 
     const replica::database& local_db() const noexcept {
         return _db;
+    }
+    cql3::query_processor& query_processor() const noexcept {
+        return _qp;
     }
 }; // class system_keyspace
 

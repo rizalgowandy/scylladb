@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -47,5 +47,8 @@ dht::decorated_key generate_partition_key(schema_ptr s, local_shard_only lso, st
 std::vector<clustering_key> generate_clustering_keys(size_t n, schema_ptr s, bool allow_prefixes = false, std::optional<key_size> size = {});
 // Overload for a single key
 clustering_key generate_clustering_key(schema_ptr s, bool allow_prefix = false, std::optional<key_size> size = {});
+
+// Double to unsigned long conversion
+int64_t d2t(double d);
 
 } // namespace tests

@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -12,13 +12,13 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sharded.hh>
 
+#include "utils/assert.hh"
 #include "utils/disk-error-handler.hh"
 #include "gc_clock.hh"
 #include "sstables/sstables.hh"
 #include "sstables/shareable_components.hh"
 #include "sstables/shared_sstable.hh"
 #include "sstables/version.hh"
-#include "sstables/component_type.hh"
 #include "db/cache_tracker.hh"
 #include "locator/host_id.hh"
 #include "reader_concurrency_semaphore.hh"
@@ -27,7 +27,6 @@
 
 namespace db {
 
-class system_keyspace;
 class large_data_handler;
 class config;
 
@@ -62,7 +61,7 @@ class storage_manager : public peering_sharded_service<storage_manager> {
     std::unordered_map<sstring, s3_endpoint> _s3_endpoints;
     std::unique_ptr<config_updater> _config_updater;
 
-    void update_config(const db::config&);
+    future<> update_config(const db::config&);
 
 public:
     struct config {
@@ -77,10 +76,15 @@ public:
 
 class sstables_manager {
     using list_type = boost::intrusive::list<sstable,
-            boost::intrusive::member_hook<sstable, sstable::manager_link_type, &sstable::_manager_link>,
+            boost::intrusive::member_hook<sstable, sstable::manager_list_link_type, &sstable::_manager_list_link>,
             boost::intrusive::constant_time_size<false>>;
+    using set_type = boost::intrusive::set<sstable,
+            boost::intrusive::member_hook<sstable, sstable::manager_set_link_type, &sstable::_manager_set_link>,
+            boost::intrusive::constant_time_size<false>,
+            boost::intrusive::compare<sstable::lesser_reclaimed_memory>>;
 private:
     storage_manager* _storage;
+    size_t _available_memory;
     db::large_data_handler& _large_data_handler;
     const db::config& _db_config;
     gms::feature_service& _features;
@@ -90,7 +94,7 @@ private:
     // that format. read_sstables_format() also overwrites _sstables_format
     // if an sstable format was chosen earlier (and this choice was persisted
     // in the system table).
-    sstable_version_types _format = sstable_version_types::mc;
+    sstable_version_types _format = sstable_version_types::me;
 
     // _active and _undergoing_close are used in scylla-gdb.py to fetch all sstables
     // on current shard using "scylla sstables" command. If those fields are renamed,
@@ -98,23 +102,38 @@ private:
     list_type _active;
     list_type _undergoing_close;
 
+    // Total reclaimable memory used by components of sstables in _active list
+    size_t _total_reclaimable_memory{0};
+    // Total memory reclaimed so far across all sstables
+    size_t _total_memory_reclaimed{0};
+    // Set of sstables from which memory has been reclaimed
+    set_type _reclaimed;
+    // Condition variable that needs to be notified when an sstable is created or deleted
+    seastar::condition_variable _components_memory_change_event;
+    future<> _components_reloader_status = make_ready_future<>();
+
     bool _closing = false;
     promise<> _done;
     cache_tracker& _cache_tracker;
 
     reader_concurrency_semaphore _sstable_metadata_concurrency_sem;
     directory_semaphore& _dir_semaphore;
-    seastar::shared_ptr<db::system_keyspace> _sys_ks;
+    std::unique_ptr<sstables::sstables_registry> _sstables_registry;
     // This function is bound to token_metadata.get_my_id() in the database constructor,
     // it can return unset value (bool(host_id) == false) until host_id is loaded
     // after system_keyspace initialization.
     noncopyable_function<locator::host_id()> _resolve_host_id;
 
+    scheduling_group _maintenance_sg;
+
+    const abort_source& _abort;
+
 public:
-    explicit sstables_manager(db::large_data_handler& large_data_handler, const db::config& dbcfg, gms::feature_service& feat, cache_tracker&, size_t available_memory, directory_semaphore& dir_sem, noncopyable_function<locator::host_id()>&& resolve_host_id, storage_manager* shared = nullptr);
+    explicit sstables_manager(sstring name, db::large_data_handler& large_data_handler, const db::config& dbcfg, gms::feature_service& feat, cache_tracker&, size_t available_memory, directory_semaphore& dir_sem,
+                              noncopyable_function<locator::host_id()>&& resolve_host_id, const abort_source& abort, scheduling_group maintenance_sg = current_scheduling_group(), storage_manager* shared = nullptr);
     virtual ~sstables_manager();
 
-    shared_sstable make_sstable(schema_ptr schema, sstring table_dir,
+    shared_sstable make_sstable(schema_ptr schema,
             const data_dictionary::storage_options& storage,
             generation_type generation,
             sstable_state state = sstable_state::normal,
@@ -125,12 +144,12 @@ public:
             size_t buffer_size = default_sstable_buffer_size);
 
     shared_ptr<s3::client> get_endpoint_client(sstring endpoint) const {
-        assert(_storage != nullptr);
+        SCYLLA_ASSERT(_storage != nullptr);
         return _storage->get_endpoint_client(std::move(endpoint));
     }
 
     bool is_known_endpoint(sstring endpoint) const {
-        assert(_storage != nullptr);
+        SCYLLA_ASSERT(_storage != nullptr);
         return _storage->is_known_endpoint(std::move(endpoint));
     }
 
@@ -157,21 +176,28 @@ public:
     future<> close();
     directory_semaphore& dir_semaphore() noexcept { return _dir_semaphore; }
 
-    void plug_system_keyspace(db::system_keyspace& sys_ks) noexcept;
-    void unplug_system_keyspace() noexcept;
+    void plug_sstables_registry(std::unique_ptr<sstables_registry>) noexcept;
+    void unplug_sstables_registry() noexcept;
 
     // Only for sstable::storage usage
-    db::system_keyspace& system_keyspace() const noexcept {
-        assert(_sys_ks && "System keyspace is not plugged");
-        return *_sys_ks;
+    sstables::sstables_registry& sstables_registry() const noexcept {
+        SCYLLA_ASSERT(_sstables_registry && "sstables_registry is not plugged");
+        return *_sstables_registry;
     }
 
     future<> delete_atomically(std::vector<shared_sstable> ssts);
-    future<> init_table_storage(const data_dictionary::storage_options& so, sstring dir);
-    future<> destroy_table_storage(const data_dictionary::storage_options& so, sstring dir);
+    future<lw_shared_ptr<const data_dictionary::storage_options>> init_table_storage(const schema& s, const data_dictionary::storage_options& so);
+    future<> destroy_table_storage(const data_dictionary::storage_options& so);
     future<> init_keyspace_storage(const data_dictionary::storage_options& so, sstring dir);
 
     void validate_new_keyspace_storage_options(const data_dictionary::storage_options&);
+
+    const abort_source& get_abort_source() const noexcept { return _abort; }
+
+    // To be called by the sstable to signal its unlinking
+    void on_unlink(sstable* sst);
+
+    std::vector<std::filesystem::path> get_local_directories(const data_dictionary::storage_options::local& so) const;
 
 private:
     void add(sstable* sst);
@@ -185,11 +211,29 @@ private:
     static constexpr size_t max_count_sstable_metadata_concurrent_reads{10};
     // Allow at most 10% of memory to be filled with such reads.
     size_t max_memory_sstable_metadata_concurrent_reads(size_t available_memory) { return available_memory * 0.1; }
+
+    // Increment the _total_reclaimable_memory with the new SSTable's reclaimable memory
+    void increment_total_reclaimable_memory(sstable* sst);
+    // Fiber to reload reclaimed components back into memory when memory becomes available.
+    future<> components_reclaim_reload_fiber();
+    // Reclaims components from SSTables if total memory usage exceeds the threshold.
+    future<> maybe_reclaim_components();
+    // Reloads components from reclaimed SSTables if memory is available.
+    future<> maybe_reload_components();
+    size_t get_components_memory_reclaim_threshold() const;
+    size_t get_memory_available_for_reclaimable_components() const;
+    // Reclaim memory from the SSTable and remove it from the memory tracking metrics.
+    // The method is idempotent and for an sstable that is deleted, it is called both
+    // during unlink and during deactivation.
+    void reclaim_memory_and_stop_tracking_sstable(sstable* sst);
 private:
     db::large_data_handler& get_large_data_handler() const {
         return _large_data_handler;
     }
     friend class sstable;
+
+    // Allow testing private methods/variables via test_env_sstables_manager
+    friend class test_env_sstables_manager;
 };
 
 }   // namespace sstables

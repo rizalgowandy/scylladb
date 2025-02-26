@@ -5,12 +5,11 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
-#include "cql3/functions/function.hh"
 #include "cql3/functions/scalar_function.hh"
 #include "cql3/functions/function_name.hh"
 #include "cql3/cql3_type.hh"
@@ -18,8 +17,6 @@
 
 #include "bytes_ostream.hh"
 #include "types/types.hh"
-
-#include <boost/algorithm/cxx11/any_of.hpp>
 
 namespace cql3 {
 
@@ -53,7 +50,7 @@ public:
             if (i > 0) {
                 encoded_row.write(", ", 2);
             }
-            bool has_any_upper = boost::algorithm::any_of(_selector_names[i], [](unsigned char c) { return std::isupper(c); });
+            bool has_any_upper = std::ranges::any_of(_selector_names[i], [](unsigned char c) { return std::isupper(c); });
             encoded_row.write("\"", 1);
             if (has_any_upper) {
                 encoded_row.write("\\\"", 2);

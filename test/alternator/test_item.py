@@ -1,13 +1,13 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for the CRUD item operations: PutItem, GetItem, UpdateItem, DeleteItem
 
 import pytest
 from botocore.exceptions import ClientError
 from decimal import Decimal
-from util import random_string, random_bytes
+from test.alternator.util import random_string, random_bytes
 
 # Basic test for creating a new item with a random name, and reading it back
 # with strong consistency.
@@ -774,6 +774,17 @@ def test_key_empty_string_value(test_table):
         test_table.put_item(Item={'p': '', 'c': c})
     with pytest.raises(ClientError, match='ValidationException.*empty string'):
         test_table.put_item(Item={'p': p, 'c': ''})
+    with pytest.raises(ClientError, match='ValidationException.*empty string'):
+        test_table.update_item(Key={'p': '', 'c': c}, AttributeUpdates={'x': {'Value': 3, 'Action': 'PUT'}})
+    with pytest.raises(ClientError, match='ValidationException.*empty string'):
+        test_table.update_item(Key={'p': p, 'c': ''}, AttributeUpdates={'x': {'Value': 3, 'Action': 'PUT'}})
+    with pytest.raises(ClientError, match='ValidationException.*empty string'):
+        with test_table.batch_writer() as batch:
+            batch.put_item({'p': '', 'c': c})
+    with pytest.raises(ClientError, match='ValidationException.*empty string'):
+        with test_table.batch_writer() as batch:
+            batch.put_item({'p': p, 'c': ''})
+
 def test_key_empty_bytes_value(test_table_b, test_table_sb):
     p = random_string()
     # Interestingly, Scylla reports an "empty string" in the bytes case as well,
@@ -783,6 +794,35 @@ def test_key_empty_bytes_value(test_table_b, test_table_sb):
         test_table_b.put_item(Item={'p': b''})
     with pytest.raises(ClientError, match='ValidationException.*empty'):
         test_table_sb.put_item(Item={'p': p, 'c': b''})
+    with pytest.raises(ClientError, match='ValidationException.*empty'):
+        test_table_b.update_item(Key={'p': b''}, AttributeUpdates={'x': {'Value': 3, 'Action': 'PUT'}})
+    with pytest.raises(ClientError, match='ValidationException.*empty'):
+        test_table_sb.update_item(Key={'p': p, 'c': b''}, AttributeUpdates={'x': {'Value': 3, 'Action': 'PUT'}})
+    with pytest.raises(ClientError, match='ValidationException.*empty'):
+        with test_table_b.batch_writer() as batch:
+            batch.put_item({'p': b''})
+    with pytest.raises(ClientError, match='ValidationException.*empty'):
+        with test_table_sb.batch_writer() as batch:
+            batch.put_item({'p': p, 'c': b''})
+
+def test_nonkey_empty_value(test_table_s):
+    p = random_string()
+    # PutItem:
+    test_table_s.put_item(Item={'p': p, 'a': '', 'b': b''})
+    item = test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']
+    assert '' == item['a']
+    assert b'' == item['b']
+    # UpdateItem:
+    test_table_s.update_item(Key={'p': p}, AttributeUpdates={'c': {'Value': '', 'Action': 'PUT'}})
+    assert '' == test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['c']
+    test_table_s.update_item(Key={'p': p}, AttributeUpdates={'c': {'Value': b'', 'Action': 'PUT'}})
+    assert b'' == test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['c']
+    # BatchWriteItem:
+    with test_table_s.batch_writer() as batch:
+        batch.put_item({'p': p, 'x': '', 'y': b''})
+    item = test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']
+    assert '' == item['x']
+    assert b'' == item['y']
 
 # And UpdateItem's AttributeUpdates may specify an operation on more than
 # one attribute. Note that because AttributeUpdates is a map, by definition

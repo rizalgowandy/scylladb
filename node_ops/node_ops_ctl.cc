@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "db/config.hh"
@@ -11,9 +11,12 @@
 #include "message/messaging_service.hh"
 #include "node_ops/node_ops_ctl.hh"
 #include "service/storage_service.hh"
+#include "replica/database.hh"
 
+#include <fmt/ranges.h>
 #include <seastar/core/sleep.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
+#include "idl/node_ops.dist.hh"
 
 static logging::logger nlogger("node_ops");
 
@@ -37,7 +40,7 @@ const node_ops_id& node_ops_ctl::uuid() const noexcept {
 }
 
 // may be called multiple times
-void node_ops_ctl::start(sstring desc_, std::function<bool(gms::inet_address)> sync_to_node) {
+void node_ops_ctl::start(sstring desc_, std::function<bool(locator::host_id)> sync_to_node) {
     desc = std::move(desc_);
 
     nlogger.info("{}[{}]: Started {} operation: node={}/{}", desc, uuid(), desc, host_id, endpoint);
@@ -45,10 +48,9 @@ void node_ops_ctl::start(sstring desc_, std::function<bool(gms::inet_address)> s
     refresh_sync_nodes(std::move(sync_to_node));
 }
 
-void node_ops_ctl::refresh_sync_nodes(std::function<bool(gms::inet_address)> sync_to_node) {
+void node_ops_ctl::refresh_sync_nodes(std::function<bool(locator::host_id)> sync_to_node) {
     // sync data with all normal token owners
     sync_nodes.clear();
-    const auto& topo = tmptr->get_topology();
     auto can_sync_with_node = [] (const locator::node& node) {
         // Sync with reachable token owners.
         // Note that although nodes in `being_replaced` and `being_removed`
@@ -61,12 +63,12 @@ void node_ops_ctl::refresh_sync_nodes(std::function<bool(gms::inet_address)> syn
             return false;
         }
     };
-    topo.for_each_node([&] (const locator::node* np) {
+    tmptr->for_each_token_owner([&] (const locator::node& node) {
         seastar::thread::maybe_yield();
         // FIXME: use node* rather than endpoint
-        auto node = np->endpoint();
-        if (!ignore_nodes.contains(node) && can_sync_with_node(*np) && sync_to_node(node)) {
-            sync_nodes.insert(node);
+        auto endpoint = node.host_id();
+        if (!ignore_nodes.contains(endpoint) && can_sync_with_node(node) && sync_to_node(endpoint)) {
+            sync_nodes.insert(endpoint);
         }
     });
 
@@ -102,10 +104,10 @@ void node_ops_ctl::start_heartbeat_updater(node_ops_cmd cmd) {
 
 future<> node_ops_ctl::query_pending_op() {
     req.cmd = node_ops_cmd::query_pending_ops;
-    co_await coroutine::parallel_for_each(sync_nodes, [this] (const gms::inet_address& node) -> future<> {
-        auto resp = co_await ss._messaging.local().send_node_ops_cmd(netw::msg_addr(node), req);
+    co_await coroutine::parallel_for_each(sync_nodes, [this] (const locator::host_id& node) -> future<> {
+        auto resp = co_await ser::node_ops_rpc_verbs::send_node_ops_cmd(&ss._messaging.local(), node, req);
         nlogger.debug("{}[{}]: Got query_pending_ops response from node={}, resp.pending_ops={}", desc, uuid(), node, resp.pending_ops);
-        if (boost::find(resp.pending_ops, uuid()) == resp.pending_ops.end()) {
+        if (std::ranges::find(resp.pending_ops, uuid()) == resp.pending_ops.end()) {
             throw std::runtime_error(::format("{}[{}]: Node {} no longer tracks the operation", desc, uuid(), node));
         }
     });
@@ -140,18 +142,20 @@ future<> node_ops_ctl::abort_on_error(node_ops_cmd cmd, std::exception_ptr ex) n
 
 future<> node_ops_ctl::send_to_all(node_ops_cmd cmd) {
     req.cmd = cmd;
-    req.ignore_nodes = boost::copy_range<std::list<gms::inet_address>>(ignore_nodes);
+    req.ignore_nodes = ignore_nodes |
+            std::views::transform([&] (locator::host_id id) { return ss.gossiper().get_address_map().get(id); }) |
+            std::ranges::to<std::list>();
     sstring op_desc = ::format("{}", cmd);
     nlogger.info("{}[{}]: Started {}", desc, uuid(), req);
     auto cmd_category = categorize_node_ops_cmd(cmd);
-    co_await coroutine::parallel_for_each(sync_nodes, [&] (const gms::inet_address& node) -> future<> {
+    co_await coroutine::parallel_for_each(sync_nodes, [&] (const locator::host_id& node) -> future<> {
         if (nodes_unknown_verb.contains(node) || nodes_down.contains(node) ||
                 (nodes_failed.contains(node) && (cmd_category != node_ops_cmd_category::abort))) {
             // Note that we still send abort commands to failed nodes.
             co_return;
         }
         try {
-            co_await ss._messaging.local().send_node_ops_cmd(netw::msg_addr(node), req);
+            co_await ser::node_ops_rpc_verbs::send_node_ops_cmd(&ss._messaging.local(), node, req);
             nlogger.debug("{}[{}]: Got {} response from node={}", desc, uuid(), op_desc, node);
         } catch (const seastar::rpc::unknown_verb_error&) {
             if (cmd_category == node_ops_cmd_category::prepare) {
@@ -192,9 +196,9 @@ future<> node_ops_ctl::heartbeat_updater(node_ops_cmd cmd) {
     nlogger.info("{}[{}]: Started heartbeat_updater (interval={}s)", desc, uuid(), heartbeat_interval.count());
     while (!as.abort_requested()) {
         auto req = node_ops_cmd_request{cmd, uuid(), {}, {}, {}};
-        co_await coroutine::parallel_for_each(sync_nodes, [&] (const gms::inet_address& node) -> future<> {
+        co_await coroutine::parallel_for_each(sync_nodes, [&] (const locator::host_id& node) -> future<> {
             try {
-                co_await ss._messaging.local().send_node_ops_cmd(netw::msg_addr(node), req);
+                co_await ser::node_ops_rpc_verbs::send_node_ops_cmd(&ss._messaging.local(), node, req);
                 nlogger.debug("{}[{}]: Got heartbeat response from node={}", desc, uuid(), node);
             } catch (...) {
                 nlogger.warn("{}[{}]: Failed to get heartbeat response from node={}", desc, uuid(), node);

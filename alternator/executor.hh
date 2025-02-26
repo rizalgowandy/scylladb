@@ -3,13 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <seastar/core/future.hh>
-#include <seastar/http/httpd.hh>
 #include "seastarx.hh"
 #include <seastar/json/json_elements.hh>
 #include <seastar/core/sharded.hh>
@@ -23,6 +22,8 @@
 #include "stats.hh"
 #include "utils/rjson.hh"
 #include "utils/updateable_value.hh"
+
+#include "tracing/trace_state.hh"
 
 namespace db {
     class system_distributed_keyspace;
@@ -51,6 +52,8 @@ class gossiper;
 
 }
 
+class schema_builder;
+
 namespace alternator {
 
 class rmw_operation;
@@ -68,7 +71,7 @@ public:
  * (very) large objects as there are overhead issues with this
  * as well, but for massive lists of return objects this can
  * help avoid large allocations/many re-allocs
- */ 
+ */
 json::json_return_type make_streamed(rjson::value&&);
 
 struct json_string : public json::jsonable {
@@ -159,6 +162,7 @@ class executor : public peering_sharded_service<executor> {
     service::migration_manager& _mm;
     db::system_distributed_keyspace& _sdks;
     cdc::metadata& _cdc_metadata;
+    utils::updateable_value<bool> _enforce_authorization;
     // An smp_service_group to be used for limiting the concurrency when
     // forwarding Alternator request between shards - if necessary for LWT.
     smp_service_group _ssg;
@@ -177,10 +181,7 @@ public:
              db::system_distributed_keyspace& sdks,
              cdc::metadata& cdc_metadata,
              smp_service_group ssg,
-             utils::updateable_value<uint32_t> default_timeout_in_ms)
-        : _gossiper(gossiper), _proxy(proxy), _mm(mm), _sdks(sdks), _cdc_metadata(cdc_metadata), _ssg(ssg) {
-        s_default_timeout_in_ms = std::move(default_timeout_in_ms);
-    }
+             utils::updateable_value<uint32_t> default_timeout_in_ms);
 
     future<request_return_type> create_table(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request);
     future<request_return_type> describe_table(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request);
@@ -225,7 +226,7 @@ private:
     friend class rmw_operation;
 
     static void describe_key_schema(rjson::value& parent, const schema&, std::unordered_map<std::string,std::string> * = nullptr);
-    
+
 public:
     static void describe_key_schema(rjson::value& parent, const schema& schema, std::unordered_map<std::string,std::string>&);
 
@@ -233,7 +234,8 @@ public:
         const query::partition_slice&,
         const cql3::selection::selection&,
         const query::result&,
-        const std::optional<attrs_to_get>&);
+        const std::optional<attrs_to_get>&,
+        uint64_t* = nullptr);
 
     static future<std::vector<rjson::value>> describe_multi_item(schema_ptr schema,
         const query::partition_slice&& slice,
@@ -245,6 +247,7 @@ public:
         const std::vector<managed_bytes_opt>&,
         const std::optional<attrs_to_get>&,
         rjson::value&,
+        uint64_t* item_length_in_bytes = nullptr,
         bool = false);
 
     static void add_stream_options(const rjson::value& stream_spec, schema_builder&, service::storage_proxy& sp);
@@ -262,5 +265,10 @@ public:
 // Alternator limits the depth of JSONs it reads from inputs, and doesn't
 // add more than a couple of levels in its own output construction.
 bool is_big(const rjson::value& val, int big_size = 100'000);
+
+// Check CQL's Role-Based Access Control (RBAC) permission (MODIFY,
+// SELECT, DROP, etc.) on the given table. When permission is denied an
+// appropriate user-readable api_error::access_denied is thrown.
+future<> verify_permission(bool enforce_authorization, const service::client_state&, const schema_ptr&, auth::permission);
 
 }

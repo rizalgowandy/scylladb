@@ -1,18 +1,21 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for basic table operations: CreateTable, DeleteTable, ListTables.
 # Also some basic tests for UpdateTable - although UpdateTable usually
 # enables more elaborate features (such as GSI or Streams) and those are
 # tested elsewhere.
 
-import pytest
-import time
 import threading
-from botocore.exceptions import ClientError
-from util import list_tables, multiset, unique_table_name, create_test_table, random_string, new_test_table
+import time
 from re import fullmatch
+
+import pytest
+from botocore.exceptions import ClientError
+
+from test.alternator.util import list_tables, unique_table_name, create_test_table, random_string, new_test_table, is_aws
+
 
 # Utility function for create a table with a given name and some valid
 # schema.. This function initiates the table's creation, but doesn't
@@ -449,10 +452,9 @@ def test_update_table_non_existent(dynamodb, test_table):
 # fixture. When consistent mode becomes the default, this fixture can be removed.
 @pytest.fixture(scope="session")
 def check_pre_consistent_cluster_management(dynamodb):
-    from util import is_aws
     # If not running on Scylla, return false.
     if is_aws(dynamodb):
-        return false
+        return False
     # In Scylla, we check Raft mode by inspecting the configuration via a
     # system table (which is also visible in Alternator)
     config_table = dynamodb.Table('.scylla.alternator.system.config')
@@ -483,7 +485,7 @@ def fails_without_consistent_cluster_management(request, check_pre_consistent_cl
 # InternalServerError) in the *middle* of the table creation or deletion.
 # Such a failure may even leave behind some half-created table.
 #
-# NOTE: This test, like all cql-pytest tests, runs on a single node. So it
+# NOTE: This test, like all cqlpy tests, runs on a single node. So it
 # doesn't exercise the most general possibility that two concurrent schema
 # modifications from two different coordinators collide. So multi-node
 # tests will be needed to check for that potential problem as well.
@@ -684,3 +686,22 @@ def test_delete_table_description_with_si(dynamodb):
     for i in ['KeySchema', 'AttributeDefinitions', 'GlobalSecondaryIndexes', 'LocalSecondaryIndexes']:
         assert i in got_describe
         assert not i in got_delete
+
+# Test that CreateTable rejects spurious entries in AttributeDefinitions
+# (entries which aren't used as a key of the table or any GSI or LSI).
+# Reproduces issue #19784.
+def test_create_table_spurious_attribute_definitions(dynamodb):
+    with pytest.raises(ClientError, match='ValidationException.*AttributeDefinitions'):
+        with new_test_table(dynamodb,
+            KeySchema=[{ 'AttributeName': 'p', 'KeyType': 'HASH' }],
+            AttributeDefinitions=[{ 'AttributeName': 'p', 'AttributeType': 'S' },
+                                  { 'AttributeName': 'c', 'AttributeType': 'S' }]) as table:
+                pass
+
+# Currently, because of incomplete LWT support, Alternator tables do not use
+# tablets by default - even if the tablets experimental feature is enabled.
+# This test enshrines this fact - that an Alternator table doesn't use tablets.
+# This is a temporary test: When we reverse this decision and tablets go back
+# to being used by default on Alternator tables, this test should be deleted.
+def test_alternator_doesnt_use_tablets(dynamodb, has_tablets):
+    assert not has_tablets

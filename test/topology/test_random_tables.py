@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2022-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 import asyncio
 import time
@@ -115,7 +115,7 @@ async def test_paged_result(manager, random_tables):
 
     # Check only 1 page
     stmt = SimpleStatement(f"SELECT * FROM {table} ALLOW FILTERING", fetch_size = fetch_size)
-    res = await cql.run_async(stmt)
+    res = await cql.run_async(stmt, all_pages=False)
     assert len(res) == fetch_size
 
     # Check all pages

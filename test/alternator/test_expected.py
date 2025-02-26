@@ -1,6 +1,6 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for the "Expected" parameter used to make certain operations (PutItem,
 # UpdateItem and DeleteItem) conditional on the existing attribute values.
@@ -9,7 +9,7 @@
 
 import pytest
 from botocore.exceptions import ClientError
-from util import random_string
+from test.alternator.util import random_string
 
 # Most of the tests in this file check that the "Expected" parameter works for
 # the UpdateItem operation. It should also work the same for the PutItem and

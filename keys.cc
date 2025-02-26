@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <iostream>
@@ -52,18 +52,24 @@ partition_key partition_key::from_nodetool_style_string(const schema_ptr s, cons
     return partition_key::from_range(std::move(r));
 }
 
-std::ostream& operator<<(std::ostream& out, const bound_kind k) {
+auto fmt::formatter<bound_kind>::format(bound_kind k, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    std::string_view name;
     switch (k) {
     case bound_kind::excl_end:
-        return out << "excl end";
+        name = "excl end";
+        break;
     case bound_kind::incl_start:
-        return out << "incl start";
+        name = "incl start";
+        break;
     case bound_kind::incl_end:
-        return out << "incl end";
+        name = "incl end";
+        break;
     case bound_kind::excl_start:
-        return out << "excl start";
+        name = "excl start";
+        break;
     }
-    abort();
+    return fmt::format_to(ctx.out(), "{}", name);
 }
 
 bound_kind invert_kind(bound_kind k) {
@@ -104,8 +110,8 @@ const thread_local clustering_key_prefix bound_view::_empty_prefix = clustering_
 
 std::ostream&
 operator<<(std::ostream& os, const exploded_clustering_prefix& ecp) {
-    // Can't pass to_hex() to transformed(), since it is overloaded, so wrap:
+    // Can't pass to_hex() to transform(), since it is overloaded, so wrap:
     auto enhex = [] (auto&& x) { return fmt_hex(x); };
-    fmt::print(os, "prefix{{{}}}", fmt::join(ecp._v | boost::adaptors::transformed(enhex), ":"));
+    fmt::print(os, "prefix{{{}}}", fmt::join(ecp._v | std::views::transform(enhex), ":"));
     return os;
 }

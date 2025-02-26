@@ -1,19 +1,22 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for batch operations - BatchWriteItem, BatchGetItem.
 # Note that various other tests in other files also use these operations,
 # so they are actually tested by other tests as well.
 
-import pytest
 import random
-from botocore.exceptions import ClientError, HTTPClientError
-from util import random_string, full_scan, full_query, multiset, scylla_inject_error
-import urllib3
-import traceback
 import sys
-from conftest import new_dynamodb_session
+import traceback
+
+import pytest
+import urllib3
+from botocore.exceptions import ClientError, HTTPClientError
+
+from test.alternator.conftest import new_dynamodb_session
+from test.alternator.util import random_string, full_query, multiset, scylla_inject_error
+
 
 # Test ensuring that items inserted by a batched statement can be properly extracted
 # via GetItem. Schema has both hash and sort keys.
@@ -189,7 +192,7 @@ def test_batch_write_invalid_operation(test_table_s):
             for item in items:
                 batch.put_item(item)
     for p in [p1, p2]:
-        assert not 'item' in test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
+        assert not 'Item' in test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
     # test missing key attribute:
     p1 = random_string()
     p2 = random_string()
@@ -199,7 +202,7 @@ def test_batch_write_invalid_operation(test_table_s):
             for item in items:
                 batch.put_item(item)
     for p in [p1, p2]:
-        assert not 'item' in test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
+        assert not 'Item' in test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
 
 # In test_item.py we have a bunch of test_empty_* tests on different ways to
 # create an empty item (which in Scylla requires the special CQL row marker
@@ -270,6 +273,27 @@ def test_batch_get_item_hash(test_table_s):
     reply = test_table_s.meta.client.batch_get_item(RequestItems = {test_table_s.name: {'Keys': keys, 'ConsistentRead': True}})
     got_items = reply['Responses'][test_table_s.name]
     assert multiset(got_items) == multiset(items)
+
+# A single GetBatchItem batch can ask for items from multiple tables, let's
+# test that too.
+def test_batch_get_item_two_tables(test_table, test_table_s):
+    items1 = [{'p': random_string(), 'c': random_string(), 'v': random_string()} for i in range(3)]
+    items2 = [{'p': random_string(), 'v': random_string()} for i in range(3)]
+    with test_table.batch_writer() as batch:
+        for item in items1:
+            batch.put_item(item)
+    with test_table_s.batch_writer() as batch:
+        for item in items2:
+            batch.put_item(item)
+    keys1 = [{k: x[k] for k in ('p', 'c')} for x in items1]
+    keys2 = [{k: x[k] for k in ('p')} for x in items2]
+    reply = test_table_s.meta.client.batch_get_item(RequestItems = {
+        test_table.name: {'Keys': keys1, 'ConsistentRead': True},
+        test_table_s.name: {'Keys': keys2, 'ConsistentRead': True}})
+    got_items1 = reply['Responses'][test_table.name]
+    got_items2 = reply['Responses'][test_table_s.name]
+    assert multiset(got_items1) == multiset(items1)
+    assert multiset(got_items2) == multiset(items2)
 
 # Test what do we get if we try to read two *missing* values in addition to
 # an existing one. It turns out the missing items are simply not returned,

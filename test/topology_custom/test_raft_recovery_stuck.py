@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2022-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
 import asyncio
@@ -11,24 +11,34 @@ import time
 from test.pylib.manager_client import ManagerClient
 from test.pylib.random_tables import RandomTables
 from test.pylib.util import unique_name, wait_for_cql_and_get_hosts
-from test.topology.util import reconnect_driver, restart, enter_recovery_state, wait_for_upgrade_state, \
-        wait_until_upgrade_finishes, delete_raft_data_and_upgrade_state, log_run_time
+from test.topology.conftest import skip_mode
+from test.topology.util import (delete_raft_data_and_upgrade_state, enter_recovery_state, log_run_time,
+                                reconnect_driver, wait_for_upgrade_state, wait_until_upgrade_finishes)
 
 
 @pytest.mark.asyncio
+@skip_mode('release', 'error injections are not supported in release mode')
 @log_run_time
 async def test_recover_stuck_raft_recovery(request, manager: ManagerClient):
     """
-    After creating a cluster, we enter RECOVERY state on every server. Then, we delete the Raft data
-    and the upgrade state on all servers. We restart them and the upgrade procedure starts. One of the
-    servers fails, the rest enter 'synchronize' state. We assume the failed server cannot be recovered.
-    We cannot just remove it at this point; it's already part of group 0, `remove_from_group0` will wait
-    until upgrade procedure finishes - but the procedure is stuck.  To proceed we enter RECOVERY state on
-    the other servers, remove the failed one, and clear existing Raft data. After leaving RECOVERY the
-    remaining nodes will restart the procedure, establish a new group 0 and finish upgrade.
+    1. Create a cluster,
+    2. Enter RECOVERY state on every server.
+    3. Delete the Raft data and the upgrade state on all servers.
+    4. Restart them and the upgrade procedure starts.
+    5. Start the first node with a group 0 upgrade error injected to it, so it fails.
+    6. Start the rest of the nodes in the cluster, they enter 'synchronize' state.
+       We assume the failed server cannot be recovered. We cannot just remove it at this point;
+       it's already part of group 0, `remove_from_group0` will wait until upgrade procedure
+       finishes - but the procedure is stuck.  To proceed we:
+    7. Enter RECOVERY state on the other servers,
+    8. Remove the failed node, and
+    9. Clear existing Raft data.
+    10. After leaving RECOVERY, the remaining nodes will restart the procedure, establish a new
+        group 0 and finish upgrade.
     """
     cfg = {'enable_user_defined_functions': False,
-           'experimental_features': list[str]()}
+           'force_gossip_topology_changes': True,
+           'enable_tablets': False}
     servers = [await manager.server_add(config=cfg) for _ in range(3)]
     srv1, *others = servers
 
@@ -38,7 +48,7 @@ async def test_recover_stuck_raft_recovery(request, manager: ManagerClient):
 
     logging.info(f"Setting recovery state on {hosts}")
     await asyncio.gather(*(enter_recovery_state(cql, h) for h in hosts))
-    await asyncio.gather(*(restart(manager, srv) for srv in servers))
+    await asyncio.gather(*(manager.server_restart(srv.server_id) for srv in servers))
     cql = await reconnect_driver(manager)
 
     logging.info(f"Cluster restarted, waiting until driver reconnects to {others}")
@@ -67,15 +77,19 @@ async def test_recover_stuck_raft_recovery(request, manager: ManagerClient):
     await asyncio.gather(*(wait_for_upgrade_state('synchronize', cql, h, time.time() + 60) for h in hosts))
     logging.info(f"{hosts} entered synchronize")
 
-    # TODO ensure that srv1 failed upgrade - look at logs?
-    # '[shard 0] raft_group0_upgrade - Raft upgrade failed: std::runtime_error (error injection before group 0 upgrade enters synchronize).'
+    log_file1 = await manager.server_open_log(srv1.server_id)
+    logging.info(f"Checking if Raft upgrade procedure failed on {srv1}")
+    await log_file1.wait_for("error injection before group 0 upgrade enters synchronize")
 
     logging.info(f"Setting recovery state on {hosts}")
     await asyncio.gather(*(enter_recovery_state(cql, h) for h in hosts))
 
     logging.info(f"Restarting {others}")
-    await asyncio.gather(*(restart(manager, srv) for srv in others))
-    cql = await reconnect_driver(manager)
+    await manager.rolling_restart(others)
+
+    # Prevent scylladb/scylladb#21724
+    logging.info("Wait until everyone sees everyone as alive")
+    await manager.servers_see_each_other(servers)
 
     logging.info(f"{others} restarted, waiting until driver reconnects to them")
     hosts = await wait_for_cql_and_get_hosts(cql, others, time.time() + 60)
@@ -97,11 +111,11 @@ async def test_recover_stuck_raft_recovery(request, manager: ManagerClient):
     logging.info(f"Removing {srv1} using {others[0]}")
     await manager.remove_node(others[0].server_id, srv1.server_id)
 
-    logging.info(f"Deleting Raft data and upgrade state on {hosts} and restarting")
+    logging.info(f"Deleting Raft data and upgrade state on {hosts}")
     await asyncio.gather(*(delete_raft_data_and_upgrade_state(cql, h) for h in hosts))
 
-    await asyncio.gather(*(restart(manager, srv) for srv in others))
-    cql = await reconnect_driver(manager)
+    logging.info(f"Restarting {others}")
+    await manager.rolling_restart(others)
 
     logging.info(f"Cluster restarted, waiting until driver reconnects to {others}")
     hosts = await wait_for_cql_and_get_hosts(cql, others, time.time() + 60)

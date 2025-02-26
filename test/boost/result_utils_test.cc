@@ -3,11 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <vector>
-#include <stdexcept>
 #include "utils/exception_container.hh"
 #include "utils/result.hh"
 #include "utils/result_combinators.hh"

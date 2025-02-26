@@ -3,15 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "user_function.hh"
+#include "cql3/description.hh"
 #include "cql3/util.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "lang/wasm.hh"
 
 #include <seastar/core/thread.hh>
+
+#include <ranges>
 
 namespace cql3 {
 namespace functions {
@@ -55,43 +58,48 @@ bytes_opt user_function::execute(std::span<const bytes_opt> parameters) {
                 const bytes_opt& bytes = parameters[i];
                 values.push_back(bytes ? type->deserialize(*bytes) : data_value::make_null(type));
             }
-            return lua::run_script(lua::bitcode_view{ctx.bitcode}, values, return_type(), ctx.cfg).get0();
+            return lua::run_script(lua::bitcode_view{ctx.bitcode}, values, return_type(), ctx.cfg).get();
         },
         [&] (wasm::context& ctx) -> bytes_opt {
             try {
-                return wasm::run_script(name(), ctx, arg_types(), parameters, return_type(), _called_on_null_input).get0();
+                return wasm::run_script(name(), ctx, arg_types(), parameters, return_type(), _called_on_null_input).get();
             } catch (const wasm::exception& e) {
                 throw exceptions::invalid_request_exception(format("UDF error: {}", e.what()));
             }
         });
 }
 
-std::ostream& user_function::describe(std::ostream& os) const {
-    auto ks = cql3::util::maybe_quote(name().keyspace);
-    auto na = cql3::util::maybe_quote(name().name);
-
-    os << "CREATE FUNCTION " << ks << "." << na << "(";
-    for (size_t i = 0; i < _arg_names.size(); i++) {
-        if (i > 0) {
-            os << ", ";
+description user_function::describe(with_create_statement with_stmt) const {
+    auto maybe_create_statement = std::invoke([&] -> std::optional<sstring> {
+        if (!with_stmt) {
+            return std::nullopt;
         }
-        os << _arg_names[i] << " " << _arg_types[i]->cql3_type_name();
-    }
-    os << ")\n";
 
-    if (_called_on_null_input) {
-        os << "CALLED";
-    } else {
-        os << "RETURNS NULL";
-    }
-    os << " ON NULL INPUT\n"
-       << "RETURNS " << _return_type->cql3_type_name() << "\n"
-       << "LANGUAGE " << _language << "\n"
-       << "AS $$\n"
-       << _body << "\n"
-       << "$$;";
+        auto arg_type_range = _arg_types | std::views::transform(std::mem_fn(&abstract_type::cql3_type_name_without_frozen));
+        auto arg_range = std::views::zip(_arg_names, arg_type_range)
+                | std::views::transform([] (std::tuple<std::string_view, std::string_view> arg) {
+                    const auto [name, type] = arg;
+                    return seastar::format("{} {}", name, type);
+                });
 
-    return os;
+        return seastar::format("CREATE FUNCTION {}.{}({})\n"
+                "{} ON NULL INPUT\n"
+                "RETURNS {}\n"
+                "LANGUAGE {}\n"
+                "AS $${}$$;",
+                cql3::util::maybe_quote(name().keyspace), cql3::util::maybe_quote(name().name), fmt::join(arg_range, ", "),
+                _called_on_null_input ? "CALLED" : "RETURNS NULL",
+                _return_type->cql3_type_name_without_frozen(),
+                _language,
+                _body);
+    });
+
+    return description {
+        .keyspace = name().keyspace,
+        .type = "function",
+        .name = name().name,
+        .create_statement = std::move(maybe_create_statement)
+    };
 }
 
 }

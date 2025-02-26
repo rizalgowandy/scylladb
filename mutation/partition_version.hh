@@ -3,20 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "mutation_partition.hh"
 #include "mutation_partition_v2.hh"
+#include "utils/assert.hh"
 #include "utils/anchorless_list.hh"
 #include "utils/logalloc.hh"
 #include "utils/coroutine.hh"
 #include "utils/chunked_vector.hh"
 
 #include <boost/intrusive/parent_from_member.hpp>
-#include <boost/intrusive/slist.hpp>
 
 class static_row;
 
@@ -208,13 +208,13 @@ public:
         : _schema(std::move(s))
         , _partition(*_schema)
     {
-        assert(_schema);
+        SCYLLA_ASSERT(_schema);
     }
     explicit partition_version(mutation_partition_v2 mp, schema_ptr s) noexcept
         : _schema(std::move(s))
         , _partition(std::move(mp))
     {
-        assert(_schema);
+        SCYLLA_ASSERT(_schema);
     }
 
     partition_version(partition_version&& pv) noexcept;
@@ -251,7 +251,7 @@ public:
         : _version(&pv)
         , _unique_owner(unique_owner)
     {
-        assert(!_version->_backref);
+        SCYLLA_ASSERT(!_version->_backref);
         _version->_backref = this;
     }
     ~partition_version_ref() {
@@ -279,19 +279,19 @@ public:
     explicit operator bool() const { return _version; }
 
     partition_version& operator*() {
-        assert(_version);
+        SCYLLA_ASSERT(_version);
         return *_version;
     }
     const partition_version& operator*() const {
-        assert(_version);
+        SCYLLA_ASSERT(_version);
         return *_version;
     }
     partition_version* operator->() {
-        assert(_version);
+        SCYLLA_ASSERT(_version);
         return _version;
     }
     const partition_version* operator->() const {
-        assert(_version);
+        SCYLLA_ASSERT(_version);
         return _version;
     }
 
@@ -651,7 +651,8 @@ public:
         logalloc::region&,
         cache_tracker& this_tracker,
         partition_snapshot::phase_type,
-        real_dirty_memory_accounter&);
+        real_dirty_memory_accounter&,
+        preemption_source&);
 
     // If this entry is evictable, cache_tracker must be provided.
     // Must not be called when is_locked().
@@ -668,9 +669,9 @@ public:
                 // If entry is being updated, we will get reads for non-latest phase, and
                 // they must attach to the non-current version.
                 partition_version* second = _version->next();
-                assert(second && second->is_referenced());
+                SCYLLA_ASSERT(second && second->is_referenced());
                 auto&& snp = partition_snapshot::referer_of(*second);
-                assert(phase == snp._phase);
+                SCYLLA_ASSERT(phase == snp._phase);
                 return *second;
             } else { // phase > _snapshot->_phase
                 add_version(s, t);
@@ -680,6 +681,7 @@ public:
     }
 
     mutation_partition_v2 squashed_v2(const schema& to, is_evictable);
+    clustering_interval_set squashed_continuity(const schema&);
     mutation_partition squashed(const schema&, is_evictable);
     tombstone partition_tombstone() const;
 
@@ -703,9 +705,9 @@ public:
         printer(const printer&) = delete;
         printer(printer&&) = delete;
 
-        friend std::ostream& operator<<(std::ostream& os, const printer& p);
+        friend fmt::formatter<printer>;
     };
-    friend std::ostream& operator<<(std::ostream& os, const printer& p);
+    friend fmt::formatter<printer>;
 };
 
 // Monotonic exception guarantees
@@ -728,3 +730,7 @@ inline const partition_version_ref& partition_snapshot::version() const
         return _entry->_version;
     }
 }
+
+template <> struct fmt::formatter<partition_entry::printer> : fmt::formatter<string_view> {
+    auto format(const partition_entry::printer&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

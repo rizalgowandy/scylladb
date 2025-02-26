@@ -3,16 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
+#include "utils/assert.hh"
 #include <boost/test/unit_test.hpp>
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 
 #include "test/lib/cql_test_env.hh"
 #include "transport/messages/result_message.hh"
 #include "types/types.hh"
+
+BOOST_AUTO_TEST_SUITE(large_paging_state_test)
 
 static lw_shared_ptr<service::pager::paging_state> extract_paging_state(::shared_ptr<cql_transport::messages::result_message> res) {
     auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(res);
@@ -41,7 +45,7 @@ static bool has_more_pages(::shared_ptr<cql_transport::messages::result_message>
 SEASTAR_TEST_CASE(test_use_high_bits_of_remaining_rows_in_paging_state) {
     return do_with_cql_env_thread([] (cql_test_env& e) {
         e.execute_cql("CREATE TABLE test (pk int, ck int, PRIMARY KEY (pk, ck));").get();
-        auto id = e.prepare("INSERT INTO test (pk, ck) VALUES (?, ?);").get0();
+        auto id = e.prepare("INSERT INTO test (pk, ck) VALUES (?, ?);").get();
         const auto raw_pk = int32_type->decompose(data_value(0));
         const auto cql3_pk = cql3::raw_value::make_value(raw_pk);
 
@@ -52,7 +56,7 @@ SEASTAR_TEST_CASE(test_use_high_bits_of_remaining_rows_in_paging_state) {
 
         auto qo = std::make_unique<cql3::query_options>(db::consistency_level::LOCAL_ONE, std::vector<cql3::raw_value>{},
                     cql3::query_options::specific_options{5, nullptr, {}, api::new_timestamp()});
-        auto msg = e.execute_cql("select * from test;", std::move(qo)).get0();
+        auto msg = e.execute_cql("select * from test;", std::move(qo)).get();
         auto paging_state = extract_paging_state(msg);
         uint64_t rows_fetched = count_rows_fetched(msg);
         BOOST_REQUIRE_EQUAL(paging_state->get_remaining() + rows_fetched, query::max_rows);
@@ -64,12 +68,12 @@ SEASTAR_TEST_CASE(test_use_high_bits_of_remaining_rows_in_paging_state) {
         while (has_more_pages(msg)) {
             qo = std::make_unique<cql3::query_options>(db::consistency_level::LOCAL_ONE, std::vector<cql3::raw_value>{},
                     cql3::query_options::specific_options{5, paging_state, {}, api::new_timestamp()});
-            msg = e.execute_cql("SELECT * FROM test;", std::move(qo)).get0();
+            msg = e.execute_cql("SELECT * FROM test;", std::move(qo)).get();
             rows_fetched = count_rows_fetched(msg);
             test_remaining = test_remaining - rows_fetched;
             if (has_more_pages(msg)) {
                 paging_state = extract_paging_state(msg);
-                assert(paging_state);
+                SCYLLA_ASSERT(paging_state);
                 BOOST_REQUIRE_EQUAL(test_remaining, paging_state->get_remaining());
             }
         }
@@ -79,7 +83,7 @@ SEASTAR_TEST_CASE(test_use_high_bits_of_remaining_rows_in_paging_state) {
 SEASTAR_TEST_CASE(test_use_high_bits_of_remaining_rows_in_paging_state_filtering) {
     return do_with_cql_env_thread([] (cql_test_env& e) {
         e.execute_cql("CREATE TABLE test (pk int, ck int, PRIMARY KEY (pk, ck));").get();
-        auto id = e.prepare("INSERT INTO test (pk, ck) VALUES (?, ?);").get0();
+        auto id = e.prepare("INSERT INTO test (pk, ck) VALUES (?, ?);").get();
         const auto raw_pk = int32_type->decompose(data_value(0));
         const auto cql3_pk = cql3::raw_value::make_value(raw_pk);
 
@@ -90,7 +94,7 @@ SEASTAR_TEST_CASE(test_use_high_bits_of_remaining_rows_in_paging_state_filtering
 
         auto qo = std::make_unique<cql3::query_options>(db::consistency_level::LOCAL_ONE, std::vector<cql3::raw_value>{},
                     cql3::query_options::specific_options{5, nullptr, {}, api::new_timestamp()});
-        auto msg = e.execute_cql("select * from test where ck > 10 allow filtering;", std::move(qo)).get0();
+        auto msg = e.execute_cql("select * from test where ck > 10 allow filtering;", std::move(qo)).get();
         auto paging_state = extract_paging_state(msg);
         uint64_t rows_fetched = count_rows_fetched(msg);
         BOOST_REQUIRE_EQUAL(paging_state->get_remaining() + rows_fetched, query::max_rows);
@@ -102,14 +106,16 @@ SEASTAR_TEST_CASE(test_use_high_bits_of_remaining_rows_in_paging_state_filtering
         while (has_more_pages(msg)) {
             qo = std::make_unique<cql3::query_options>(db::consistency_level::LOCAL_ONE, std::vector<cql3::raw_value>{},
                     cql3::query_options::specific_options{5, paging_state, {}, api::new_timestamp()});
-            msg = e.execute_cql("SELECT * FROM test where ck > 10 allow filtering;", std::move(qo)).get0();
+            msg = e.execute_cql("SELECT * FROM test where ck > 10 allow filtering;", std::move(qo)).get();
             rows_fetched = count_rows_fetched(msg);
             test_remaining = test_remaining - rows_fetched;
             if (has_more_pages(msg)) {
                 paging_state = extract_paging_state(msg);
-                assert(paging_state);
+                SCYLLA_ASSERT(paging_state);
                 BOOST_REQUIRE_EQUAL(test_remaining, paging_state->get_remaining());
             }
         }
     });
 }
+
+BOOST_AUTO_TEST_SUITE_END()

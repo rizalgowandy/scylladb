@@ -57,6 +57,25 @@ region = us-east-1
 You don't need these files to run the tests against a local installation
 of ScyllaDB.
 
+The "run" script also has an ability to run tests against a specific old
+release of Scylla downloaded (pre-compiled) from ScyllaDB's official
+release collection. For example:
+
+```
+test/alternator/run --release 6.0 test_streams.py::test_stream_list_tables
+test/alternator/run --release 6.1 test_streams.py::test_stream_list_tables
+```
+
+can demonstrate that a bug (reproduced by that test) was fixed in the latest
+official release of 6.1, but not in the latest 6.0 release. The `--release`
+option (which must be the first option to "run") downloads the requested
+official release and caches it in the `build/` directory (e.g.,
+`build/6.0.4`), and then runs the requested tests against that version.
+The `--release` option supports various version specifiers, such as 5.4.7
+(a specific version), 5.4 (asking for the latest version in the 5.4 branch),
+5.4.0~rc2 (a pre-release), or Enterprise releases such as 2021.1.9 or 2023.1
+(the latest in that branch).
+
 ## HTTPS support
 
 In order to run tests over HTTPS instead of the default HTTP, run
@@ -98,17 +117,8 @@ configuration parameter:
 ```yaml
   alternator_enforce_authorization: true
 ```
-The implementation is currently coupled with Scylla's system\_auth.roles table,
-which means that an additional step needs to be performed when setting up Scylla
-as the test environment. Tests will use the following credentials:
-Username: `alternator`
-Secret key: `secret_pass`
-
-With CQLSH, it can be achieved by executing this snipped:
-
-```bash
-cqlsh -x "INSERT INTO system_auth.roles (role, salted_hash) VALUES ('alternator', 'secret_pass')"
-```
+The test implementation is currently coupled with Scylla's default account
+"cassandra" with password "cassandra".
 
 Most tests expect the authorization to succeed, so they will pass even with `alternator_enforce_authorization`
 turned off. However, test cases from `test_authorization.py` may require this option to be turned on,

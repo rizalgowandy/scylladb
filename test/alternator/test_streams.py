@@ -1,19 +1,47 @@
 # Copyright 2020-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for stream operations: ListStreams, DescribeStream, GetShardIterator,
 # GetRecords.
 
-import pytest
 import time
 import urllib.request
-
-from botocore.exceptions import ClientError
-from util import list_tables, unique_table_name, create_test_table, random_string, freeze
 from contextlib import contextmanager, ExitStack
 from urllib.error import URLError
+
+import pytest
 from boto3.dynamodb.types import TypeDeserializer
+from botocore.exceptions import ClientError
+
+from test.alternator.util import unique_table_name, create_test_table, new_test_table, random_string, freeze, list_tables
+
+# All tests in this file are expected to fail with tablets due to #16317.
+# To ensure that Alternator Streams is still being tested, instead of
+# xfailing these tests, we temporarily coerce the tests below to avoid
+# using default tablets setting, even if it's available. We do this by
+# using the following tags when creating each table below:
+TAGS = [{'Key': 'experimental:initial_tablets', 'Value': 'none'}]
+
+# Before Alternator Streams is supported with tablets (#16317), let's verify
+# that enabling Streams results in an orderly error. This test should be
+# deleted when #16317 is fixed.
+def test_streams_enable_error_with_tablets(dynamodb, scylla_only):
+    # Test attempting to create a table already with streams
+    with pytest.raises(ClientError, match='ValidationException.*tablets'):
+        with new_test_table(dynamodb,
+            Tags=[{'Key': 'experimental:initial_tablets', 'Value': '4'}],
+            StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'KEYS_ONLY'},
+            KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, ],
+            AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' } ]) as table:
+            pass
+    # Test attempting to add a stream to an existing table
+    with new_test_table(dynamodb,
+        Tags=[{'Key': 'experimental:initial_tablets', 'Value': '4'}],
+        KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, ],
+        AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' } ]) as table:
+        with pytest.raises(ClientError, match='ValidationException.*tablets'):
+            table.update(StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'KEYS_ONLY'});
 
 stream_types = [ 'OLD_IMAGE', 'NEW_IMAGE', 'KEYS_ONLY', 'NEW_AND_OLD_IMAGES']
 
@@ -51,6 +79,7 @@ def create_stream_test_table(dynamodb, StreamViewType=None):
     if StreamViewType != None:
         spec = {'StreamEnabled': True, 'StreamViewType': StreamViewType}
     table = create_test_table(dynamodb, StreamSpecification=spec,
+        Tags=TAGS,
         KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' },
                     { 'AttributeName': 'c', 'KeyType': 'RANGE' }
         ],
@@ -475,6 +504,7 @@ def test_get_records_nonexistent_iterator(dynamodbstreams):
 
 def create_table_ss(dynamodb, dynamodbstreams, type):
     table = create_test_table(dynamodb,
+        Tags=TAGS,
         KeySchema=[{ 'AttributeName': 'p', 'KeyType': 'HASH' }, { 'AttributeName': 'c', 'KeyType': 'RANGE' }],
         AttributeDefinitions=[{ 'AttributeName': 'p', 'AttributeType': 'S' }, { 'AttributeName': 'c', 'AttributeType': 'S' }],
         StreamSpecification={ 'StreamEnabled': True, 'StreamViewType': type })
@@ -500,15 +530,25 @@ def test_table_ss_new_and_old_images(dynamodb, dynamodbstreams):
 
 # Test that it is, sadly, not allowed to use UpdateTable on a table which
 # already has a stream enabled to change that stream's StreamViewType.
-# Currently, Alternator does allow this (see issue #6939), so the test is
-# marked xfail.
-@pytest.mark.xfail(reason="Alternator allows changing StreamViewType - see issue #6939")
+# Relates to #6939
 def test_streams_change_type(test_table_ss_keys_only):
     table, arn = test_table_ss_keys_only
     with pytest.raises(ClientError, match='ValidationException.*already'):
         table.update(StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'OLD_IMAGE'});
         # If the above change succeeded (because of issue #6939), switch it back :-)
         table.update(StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'KEYS_ONLY'});
+
+# It is not allowed to enable stream for a table that already has a stream,
+# even if of the same type.
+def test_streams_enable_on_enabled(test_table_ss_new_and_old_images):
+    table, arn = test_table_ss_new_and_old_images
+    with pytest.raises(ClientError, match='ValidationException.*already.*enabled'):
+        table.update(StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'NEW_AND_OLD_IMAGES'});
+
+# It is not allowed to disbale stream on a table that does not have a stream.
+def test_streams_disable_on_disabled(test_table):
+    with pytest.raises(ClientError, match='ValidationException.*stream.*disable'):
+        test_table.update(StreamSpecification={'StreamEnabled': False});
 
 # Utility function for listing all the shards of the given stream arn.
 # Implemented by multiple calls to DescribeStream, possibly several pages
@@ -807,6 +847,7 @@ def test_streams_updateitem_old_image_empty_item(test_table_ss_old_image, dynamo
 @pytest.fixture(scope="function")
 def test_table_ss_old_image_and_lsi(dynamodb, dynamodbstreams):
     table = create_test_table(dynamodb,
+        Tags=TAGS,
         KeySchema=[
             {'AttributeName': 'p', 'KeyType': 'HASH'},
             {'AttributeName': 'c', 'KeyType': 'RANGE'}],
@@ -1281,6 +1322,7 @@ def test_streams_1_new_and_old_images(test_table_ss_new_and_old_images, dynamodb
 def test_table_stream_with_result(dynamodb, dynamodbstreams):
     tablename = unique_table_name()
     result = dynamodb.meta.client.create_table(TableName=tablename,
+        Tags=TAGS,
         BillingMode='PAY_PER_REQUEST',
         StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'KEYS_ONLY'},
         KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' },
@@ -1548,6 +1590,29 @@ def test_stream_arn_unchanging(dynamodb, dynamodbstreams):
         assert 'Streams' in streams
         assert len(streams['Streams']) == 1
         assert streams['Streams'][0]['StreamArn'] == arn
+
+# Enabling a stream shouldn't cause any extra table to appear in ListTables.
+# In issue #19911, enabling streams on a table called xyz caused the name
+# "xyz_scylla_cdc_log" to appear in ListTables. The following test creates
+# a table with a long unique name, and ensures that only one table containing
+# this name as a substring is listed.
+# In test_gsi.py and test_lsi.py we have similar tests for GSI and LSI.
+# Reproduces #19911
+def test_stream_list_tables(dynamodb):
+    with new_test_table(dynamodb,
+        Tags=TAGS,
+        StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'KEYS_ONLY'},
+        KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' } ],
+        AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' }, ]
+    ) as table:
+            # Check that the test table is listed by ListTable, but its long
+            # and unique name (created by unique_table_name()) isn't a proper
+            # substring of any other table's name.
+            tables = list_tables(dynamodb)
+            assert table.name in tables
+            for listed_name in tables:
+                if table.name != listed_name:
+                    assert table.name not in listed_name
 
 # TODO: tests on multiple partitions
 # TODO: write a test that disabling the stream and re-enabling it works, but

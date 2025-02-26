@@ -4,14 +4,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <algorithm>
-#include <boost/algorithm/cxx11/all_of.hpp>
-#include <boost/algorithm/cxx11/any_of.hpp>
-#include <boost/range/adaptors.hpp>
-#include <boost/range/algorithm.hpp>
+#include <boost/range/algorithm/set_algorithm.hpp>
 #include <functional>
 #include <ranges>
 #include <stdexcept>
@@ -19,20 +16,17 @@
 #include "cql3/expr/expression.hh"
 #include "cql3/expr/evaluate.hh"
 #include "cql3/expr/expr-utils.hh"
-#include "query-result-reader.hh"
 #include "statement_restrictions.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "cartesian_product.hh"
-#include "cql3/cql_config.hh"
 
-#include "cql3/constants.hh"
-#include "cql3/lists.hh"
+#include "cql3/cql_config.hh"
+#include "cql3/query_options.hh"
 #include "cql3/selection/selection.hh"
 #include "cql3/statements/request_validations.hh"
-#include "types/list.hh"
-#include "types/map.hh"
-#include "types/set.hh"
+#include "cql3/functions/token_fct.hh"
 #include "dht/i_partitioner.hh"
+#include "types/tuple.hh"
 
 namespace {
 struct maybe_column_definition {
@@ -41,7 +35,7 @@ struct maybe_column_definition {
 }
 
 template<>
-struct fmt::formatter<maybe_column_definition> : fmt::formatter<std::string_view> {
+struct fmt::formatter<maybe_column_definition> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const maybe_column_definition& cd, FormatContext& ctx) const {
         if (cd.value != nullptr) {
@@ -55,11 +49,768 @@ struct fmt::formatter<maybe_column_definition> : fmt::formatter<std::string_view
 namespace cql3 {
 namespace restrictions {
 
-static logging::logger rlogger("restrictions");
+using namespace expr;
 
-using boost::adaptors::filtered;
-using boost::adaptors::transformed;
-using statements::request_validations::invalid_request;
+static logging::logger rlogger("restrictions");
+static auto& expr_logger = rlogger; // compatibility with code moved from expression.cc
+
+/// A set of discrete values.
+using value_list = std::vector<managed_bytes>; // Sorted and deduped using value comparator.
+
+/// General set of values.  Empty set and single-element sets are always value_list.  interval is
+/// never singular and never has start > end.  Universal set is a interval with both bounds null.
+using value_set = std::variant<value_list, interval<managed_bytes>>;
+
+/// A set of all column values that would satisfy an expression. The _token_values variant finds
+/// matching values for the partition token function call instead of the column.
+///
+/// An expression restricts possible values of a column or token:
+/// - `A>5` restricts A from below
+/// - `A>5 AND A>6 AND B<10 AND A=12 AND B>0` restricts A to 12 and B to between 0 and 10
+/// - `A IN (1, 3, 5)` restricts A to 1, 3, or 5
+/// - `A IN (1, 3, 5) AND A>3` restricts A to just 5
+/// - `A=1 AND A<=0` restricts A to an empty list; no value is able to satisfy the expression
+/// - `A>=NULL` also restricts A to an empty list; all comparisons to NULL are false
+/// - an expression without A "restricts" A to unbounded range
+extern value_set possible_column_values(const column_definition*, const expression&, const query_options&);
+extern value_set possible_partition_token_values(const expression&, const query_options&, const schema& table_schema);
+
+/// Turns value_set into a range, unless it's a multi-valued list (in which case this throws).
+extern interval<managed_bytes> to_range(const value_set&);
+
+/// A range of all X such that X op val.
+interval<clustering_key_prefix> to_range(oper_t op, const clustering_key_prefix& val);
+
+/// True iff the index can support the entire expression.
+extern bool is_supported_by(const expression&, const secondary_index::index&);
+
+/// True iff any of the indices from the manager can support the entire expression.  If allow_local, use all
+/// indices; otherwise, use only global indices.
+extern bool has_supporting_index(
+        const expression&, const secondary_index::secondary_index_manager&, allow_local_index allow_local);
+
+// Looks at each column individually and checks whether some index can support restrictions on this single column.
+// Expression has to consist only of single column restrictions.
+extern bool index_supports_some_column(
+    const expression&,
+    const secondary_index::secondary_index_manager&,
+    allow_local_index allow_local);
+
+inline bool needs_filtering(oper_t op) {
+    return (op == oper_t::CONTAINS) || (op == oper_t::CONTAINS_KEY) || (op == oper_t::LIKE) ||
+           (op == oper_t::IS_NOT) || (op == oper_t::NEQ) || (op == oper_t::NOT_IN);
+}
+
+inline auto find_needs_filtering(const expression& e) {
+    return find_binop(e, [] (const binary_operator& bo) { return needs_filtering(bo.op); });
+}
+
+inline bool is_multi_column(const binary_operator& op) {
+    return expr::is<tuple_constructor>(op.lhs);
+}
+
+inline bool has_slice_or_needs_filtering(const expression& e) {
+    return find_binop(e, [] (const binary_operator& o) { return is_slice(o.op) || needs_filtering(o.op); });
+}
+
+/// True iff binary_operator involves a collection.
+extern bool is_on_collection(const binary_operator&);
+
+// Checks whether the given column has an EQ restriction in the expression.
+// EQ restriction is `col = ...` or `(col, col2) = ...`
+// IN restriction is NOT an EQ restriction, this function will not look for IN restrictions.
+// Uses column_defintion::operator== for comparison, columns with the same name but different schema will not be equal.
+bool has_eq_restriction_on_column(const column_definition& column, const expression& e);
+
+// Checks whether this expression contains restrictions on one single column.
+// There might be more than one restriction, but exactly one column.
+// The expression must be prepared.
+bool is_single_column_restriction(const expression&);
+
+// Gets the only column from a single_column_restriction expression.
+const column_value& get_the_only_column(const expression&);
+
+// Extracts map of single column restrictions for each column from expression
+single_column_restrictions_map get_single_column_restrictions_map(const expression&);
+
+
+bool contains_multi_column_restriction(const expression&);
+
+bool has_only_eq_binops(const expression&);
+
+namespace {
+
+const value_set empty_value_set = value_list{};
+const value_set unbounded_value_set = interval<managed_bytes>::make_open_ended_both_sides();
+
+struct intersection_visitor {
+    const abstract_type* type;
+    value_set operator()(const value_list& a, const value_list& b) const {
+        value_list common;
+        common.reserve(std::max(a.size(), b.size()));
+        boost::set_intersection(a, b, back_inserter(common), type->as_less_comparator());
+        return std::move(common);
+    }
+
+    value_set operator()(const interval<managed_bytes>& a, const value_list& b) const {
+        auto common = b | std::views::filter([&] (const managed_bytes& el) { return a.contains(el, type->as_tri_comparator()); });
+        return common | std::ranges::to<value_list>();
+    }
+
+    value_set operator()(const value_list& a, const interval<managed_bytes>& b) const {
+        return (*this)(b, a);
+    }
+
+    value_set operator()(const interval<managed_bytes>& a, const interval<managed_bytes>& b) const {
+        const auto common_range = a.intersection(b, type->as_tri_comparator());
+        return common_range ? *common_range : empty_value_set;
+    }
+};
+
+value_set intersection(value_set a, value_set b, const abstract_type* type) {
+    return std::visit(intersection_visitor{type}, std::move(a), std::move(b));
+}
+
+template<std::ranges::forward_range Range>
+value_list to_sorted_vector(Range r, const serialized_compare& comparator) {
+    value_list tmp(r.begin(), r.end()); // Need random-access range to sort (r is not necessarily random-access).
+    std::ranges::sort(tmp, comparator);
+    auto last = std::unique(tmp.begin(), tmp.end());
+    tmp.resize(last - tmp.begin());
+    return tmp;
+}
+
+const auto non_null = std::views::filter([] (const managed_bytes_opt& b) { return b.has_value(); });
+
+const auto deref = std::views::transform([] (const managed_bytes_opt& b) { return b.value(); });
+
+/// Returns possible values from t, which must be RHS of IN.
+value_list get_IN_values(
+        const expression& e, const query_options& options, const serialized_compare& comparator,
+        std::string_view column_name) {
+    const cql3::raw_value in_list = evaluate(e, options);
+    if (in_list.is_null()) {
+        return value_list();
+    }
+    utils::chunked_vector<managed_bytes_opt> list_elems = get_list_elements(in_list);
+    return to_sorted_vector(std::move(list_elems) | non_null | deref, comparator);
+}
+
+/// Returns possible values for k-th column from t, which must be RHS of IN.
+value_list get_IN_values(const expression& e, size_t k, const query_options& options,
+                         const serialized_compare& comparator) {
+    const cql3::raw_value in_list = evaluate(e, options);
+    const auto split_values = get_list_of_tuples_elements(in_list, *type_of(e)); // Need lvalue from which to make std::view.
+    const auto result_range = split_values
+            | std::views::transform([k] (const std::vector<managed_bytes_opt>& v) { return v[k]; }) | non_null | deref;
+    return to_sorted_vector(std::move(result_range), comparator);
+}
+
+static constexpr bool inclusive = true, exclusive = false;
+
+} // anonymous namespace
+
+template<typename T>
+interval<std::remove_cvref_t<T>> to_range(oper_t op, T&& val) {
+    using U = std::remove_cvref_t<T>;
+    static constexpr bool inclusive = true, exclusive = false;
+    switch (op) {
+    case oper_t::EQ:
+        return interval<U>::make_singular(std::forward<T>(val));
+    case oper_t::GT:
+        return interval<U>::make_starting_with(interval_bound(std::forward<T>(val), exclusive));
+    case oper_t::GTE:
+        return interval<U>::make_starting_with(interval_bound(std::forward<T>(val), inclusive));
+    case oper_t::LT:
+        return interval<U>::make_ending_with(interval_bound(std::forward<T>(val), exclusive));
+    case oper_t::LTE:
+        return interval<U>::make_ending_with(interval_bound(std::forward<T>(val), inclusive));
+    default:
+        throw std::logic_error(format("to_range: unknown comparison operator {}", op));
+    }
+}
+
+interval<clustering_key_prefix> to_range(oper_t op, const clustering_key_prefix& val) {
+    return to_range<const clustering_key_prefix&>(op, val);
+}
+
+// When cdef == nullptr it finds possible token values instead of column values.
+// When finding token values the table_schema_opt argument has to point to a valid schema,
+// but it isn't used when finding values for column.
+// The schema is needed to find out whether a call to token() function represents
+// the partition token.
+static value_set possible_lhs_values(const column_definition* cdef,
+                                        const expression& expr,
+                                        const query_options& options,
+                                        const schema* table_schema_opt) {
+    const auto type = cdef ? &cdef->type->without_reversed() : long_type.get();
+    return expr::visit(overloaded_functor{
+            [] (const constant& constant_val) {
+                std::optional<bool> bool_val = get_bool_value(constant_val);
+                if (bool_val.has_value()) {
+                    return *bool_val ? unbounded_value_set : empty_value_set;
+                }
+
+                on_internal_error(expr_logger,
+                    "possible_lhs_values: a constant that is not a bool value cannot serve as a restriction by itself");
+            },
+            [&] (const conjunction& conj) {
+                return std::ranges::fold_left(conj.children, unbounded_value_set, [&](value_set&& acc, const expression& child) {
+                    return intersection(
+                        std::move(acc), possible_lhs_values(cdef, child, options, table_schema_opt), type);
+                });
+            },
+            [&] (const binary_operator& oper) -> value_set {
+                return expr::visit(overloaded_functor{
+                        [&] (const column_value& col) -> value_set {
+                            if (!cdef || cdef != col.col) {
+                                return unbounded_value_set;
+                            }
+                            if (is_compare(oper.op)) {
+                                managed_bytes_opt val = evaluate(oper.rhs, options).to_managed_bytes_opt();
+                                if (!val) {
+                                    return empty_value_set; // All NULL comparisons fail; no column values match.
+                                }
+                                return oper.op == oper_t::EQ ? value_set(value_list{*val})
+                                        : to_range(oper.op, std::move(*val));
+                            } else if (oper.op == oper_t::IN) {
+                                return get_IN_values(oper.rhs, options, type->as_less_comparator(), cdef->name_as_text());
+                            } else if (oper.op == oper_t::CONTAINS || oper.op == oper_t::CONTAINS_KEY) {
+                                managed_bytes_opt val = evaluate(oper.rhs, options).to_managed_bytes_opt();
+                                if (!val) {
+                                    return empty_value_set; // All NULL comparisons fail; no column values match.
+                                }
+                                return value_set(value_list{*val});
+                            }
+                            throw std::logic_error(format("possible_lhs_values: unhandled operator {}", oper));
+                        },
+                        [&] (const subscript& s) -> value_set {
+                            const column_value& col = get_subscripted_column(s);
+
+                            if (!cdef || cdef != col.col) {
+                                return unbounded_value_set;
+                            }
+
+                            managed_bytes_opt sval = evaluate(s.sub, options).to_managed_bytes_opt();
+                            if (!sval) {
+                                return empty_value_set; // NULL can't be a map key
+                            }
+
+                            if (oper.op == oper_t::EQ) {
+                                managed_bytes_opt rval = evaluate(oper.rhs, options).to_managed_bytes_opt();
+                                if (!rval) {
+                                    return empty_value_set; // All NULL comparisons fail; no column values match.
+                                }
+                                managed_bytes_opt elements[] = {sval, rval};
+                                managed_bytes val = tuple_type_impl::build_value_fragmented(elements);
+                                return value_set(value_list{val});
+                            }
+                            throw std::logic_error(format("possible_lhs_values: unhandled operator {}", oper));
+                        },
+                        [&] (const tuple_constructor& tuple) -> value_set {
+                            if (!cdef) {
+                                return unbounded_value_set;
+                            }
+                            const auto found = std::ranges::find_if(
+                                    tuple.elements, [&] (const expression& c) { return expr::as<column_value>(c).col == cdef; });
+                            if (found == tuple.elements.end()) {
+                                return unbounded_value_set;
+                            }
+                            const auto column_index_on_lhs = std::distance(tuple.elements.begin(), found);
+                            if (is_compare(oper.op)) {
+                                // RHS must be a tuple due to upstream checks.
+                                managed_bytes_opt val = get_tuple_elements(evaluate(oper.rhs, options), *type_of(oper.rhs)).at(column_index_on_lhs);
+                                if (!val) {
+                                    return empty_value_set; // All NULL comparisons fail; no column values match.
+                                }
+                                if (oper.op == oper_t::EQ) {
+                                    return value_list{std::move(*val)};
+                                }
+                                if (column_index_on_lhs > 0) {
+                                    // A multi-column comparison restricts only the first column, because
+                                    // comparison is lexicographical.
+                                    return unbounded_value_set;
+                                }
+                                return to_range(oper.op, std::move(*val));
+                            } else if (oper.op == oper_t::IN) {
+                                return get_IN_values(oper.rhs, column_index_on_lhs, options, type->as_less_comparator());
+                            }
+                            return unbounded_value_set;
+                        },
+                        [&] (const function_call& token_fun_call) -> value_set {
+                            if (!is_partition_token_for_schema(token_fun_call, *table_schema_opt)) {
+                                on_internal_error(expr_logger, "possible_lhs_values: function calls are not supported as the LHS of a binary expression");
+                            }
+
+                            if (cdef) {
+                                return unbounded_value_set;
+                            }
+                            const auto val = evaluate(oper.rhs, options).to_managed_bytes_opt();
+                            if (!val) {
+                                return empty_value_set; // All NULL comparisons fail; no token values match.
+                            }
+                            if (oper.op == oper_t::EQ) {
+                                return value_list{*val};
+                            } else if (oper.op == oper_t::GT) {
+                                return interval<managed_bytes>::make_starting_with(interval_bound(std::move(*val), exclusive));
+                            } else if (oper.op == oper_t::GTE) {
+                                return interval<managed_bytes>::make_starting_with(interval_bound(std::move(*val), inclusive));
+                            }
+                            static const managed_bytes MININT = managed_bytes(serialized(std::numeric_limits<int64_t>::min())),
+                                    MAXINT = managed_bytes(serialized(std::numeric_limits<int64_t>::max()));
+                            // Undocumented feature: when the user types `token(...) < MININT`, we interpret
+                            // that as MAXINT for some reason.
+                            const auto adjusted_val = (*val == MININT) ? MAXINT : *val;
+                            if (oper.op == oper_t::LT) {
+                                return interval<managed_bytes>::make_ending_with(interval_bound(std::move(adjusted_val), exclusive));
+                            } else if (oper.op == oper_t::LTE) {
+                                return interval<managed_bytes>::make_ending_with(interval_bound(std::move(adjusted_val), inclusive));
+                            }
+                            throw std::logic_error(format("get_token_interval invalid operator {}", oper.op));
+                        },
+                        [&] (const binary_operator&) -> value_set {
+                            on_internal_error(expr_logger, "possible_lhs_values: nested binary operators are not supported");
+                        },
+                        [&] (const conjunction&) -> value_set {
+                            on_internal_error(expr_logger, "possible_lhs_values: conjunctions are not supported as the LHS of a binary expression");
+                        },
+                        [] (const constant&) -> value_set {
+                            on_internal_error(expr_logger, "possible_lhs_values: constants are not supported as the LHS of a binary expression");
+                        },
+                        [] (const unresolved_identifier&) -> value_set {
+                            on_internal_error(expr_logger, "possible_lhs_values: unresolved identifiers are not supported as the LHS of a binary expression");
+                        },
+                        [] (const column_mutation_attribute&) -> value_set {
+                            on_internal_error(expr_logger, "possible_lhs_values: writetime/ttl are not supported as the LHS of a binary expression");
+                        },
+                        [] (const cast&) -> value_set {
+                            on_internal_error(expr_logger, "possible_lhs_values: typecasts are not supported as the LHS of a binary expression");
+                        },
+                        [] (const field_selection&) -> value_set {
+                            on_internal_error(expr_logger, "possible_lhs_values: field selections are not supported as the LHS of a binary expression");
+                        },
+                        [] (const bind_variable&) -> value_set {
+                            on_internal_error(expr_logger, "possible_lhs_values: bind variables are not supported as the LHS of a binary expression");
+                        },
+                        [] (const untyped_constant&) -> value_set {
+                            on_internal_error(expr_logger, "possible_lhs_values: untyped constants are not supported as the LHS of a binary expression");
+                        },
+                        [] (const collection_constructor&) -> value_set {
+                            on_internal_error(expr_logger, "possible_lhs_values: collection constructors are not supported as the LHS of a binary expression");
+                        },
+                        [] (const usertype_constructor&) -> value_set {
+                            on_internal_error(expr_logger, "possible_lhs_values: user type constructors are not supported as the LHS of a binary expression");
+                        },
+                        [] (const temporary&) -> value_set {
+                            on_internal_error(expr_logger, "possible_lhs_values: temporaries are not supported as the LHS of a binary expression");
+                        },
+                    }, oper.lhs);
+            },
+            [] (const column_value&) -> value_set {
+                on_internal_error(expr_logger, "possible_lhs_values: a column cannot serve as a restriction by itself");
+            },
+            [] (const subscript&) -> value_set {
+                on_internal_error(expr_logger, "possible_lhs_values: a subscript cannot serve as a restriction by itself");
+            },
+            [] (const unresolved_identifier&) -> value_set {
+                on_internal_error(expr_logger, "possible_lhs_values: an unresolved identifier cannot serve as a restriction");
+            },
+            [] (const column_mutation_attribute&) -> value_set {
+                on_internal_error(expr_logger, "possible_lhs_values: the writetime/ttl functions cannot serve as a restriction by itself");
+            },
+            [] (const function_call&) -> value_set {
+                on_internal_error(expr_logger, "possible_lhs_values: a function call cannot serve as a restriction by itself");
+            },
+            [] (const cast&) -> value_set {
+                on_internal_error(expr_logger, "possible_lhs_values: a typecast cannot serve as a restriction by itself");
+            },
+            [] (const field_selection&) -> value_set {
+                on_internal_error(expr_logger, "possible_lhs_values: a field selection cannot serve as a restriction by itself");
+            },
+            [] (const bind_variable&) -> value_set {
+                on_internal_error(expr_logger, "possible_lhs_values: a bind variable cannot serve as a restriction by itself");
+            },
+            [] (const untyped_constant&) -> value_set {
+                on_internal_error(expr_logger, "possible_lhs_values: an untyped constant cannot serve as a restriction by itself");
+            },
+            [] (const tuple_constructor&) -> value_set {
+                on_internal_error(expr_logger, "possible_lhs_values: an tuple constructor cannot serve as a restriction by itself");
+            },
+            [] (const collection_constructor&) -> value_set {
+                on_internal_error(expr_logger, "possible_lhs_values: a collection constructor cannot serve as a restriction by itself");
+            },
+            [] (const usertype_constructor&) -> value_set {
+                on_internal_error(expr_logger, "possible_lhs_values: a user type constructor cannot serve as a restriction by itself");
+            },
+            [] (const temporary&) -> value_set {
+                on_internal_error(expr_logger, "possible_lhs_values: a temporary cannot serve as a restriction by itself");
+            },
+        }, expr);
+}
+
+value_set possible_column_values(const column_definition* col, const expression& e, const query_options& options) {
+    return possible_lhs_values(col, e, options, nullptr);
+}
+
+value_set possible_partition_token_values(const expression& e, const query_options& options, const schema& table_schema) {
+    return possible_lhs_values(nullptr, e, options, &table_schema);
+}
+
+interval<managed_bytes> to_range(const value_set& s) {
+    return std::visit(overloaded_functor{
+            [] (const interval<managed_bytes>& r) { return r; },
+            [] (const value_list& lst) {
+                if (lst.size() != 1) {
+                    throw std::logic_error(format("to_range called on list of size {}", lst.size()));
+                }
+                return interval<managed_bytes>::make_singular(lst[0]);
+            },
+        }, s);
+}
+
+namespace {
+constexpr inline secondary_index::index::supports_expression_v operator&&(secondary_index::index::supports_expression_v v1, secondary_index::index::supports_expression_v v2) {
+    using namespace secondary_index;
+    auto True = index::supports_expression_v::from_bool(true);
+    return v1 == True && v2 == True ? True : index::supports_expression_v::from_bool(false);
+}
+
+secondary_index::index::supports_expression_v is_supported_by_helper(const expression& expr, const secondary_index::index& idx) {
+    using ret_t = secondary_index::index::supports_expression_v;
+    using namespace secondary_index;
+    return expr::visit(overloaded_functor{
+            [&] (const conjunction& conj) -> ret_t {
+                if (conj.children.empty()) {
+                    return index::supports_expression_v::from_bool(true);
+                }
+                auto init = is_supported_by_helper(conj.children[0], idx);
+                return std::accumulate(std::begin(conj.children) + 1, std::end(conj.children), init, 
+                        [&] (ret_t acc, const expression& child) -> ret_t {
+                            return acc && is_supported_by_helper(child, idx);
+                });
+            },
+            [&] (const binary_operator& oper) {
+                return expr::visit(overloaded_functor{
+                        [&] (const column_value& col) {
+                            return idx.supports_expression(*col.col, oper.op);
+                        },
+                        [&] (const tuple_constructor& tuple) {
+                            if (tuple.elements.size() == 1) {
+                                if (auto column = expr::as_if<column_value>(&tuple.elements[0])) {
+                                    return idx.supports_expression(*column->col, oper.op);
+                                }
+                            }
+                            // We don't use index table for multi-column restrictions, as it cannot avoid filtering.
+                            return index::supports_expression_v::from_bool(false);
+                        },
+                        [&] (const function_call&) { return index::supports_expression_v::from_bool(false); },
+                        [&] (const subscript& s) -> ret_t {
+                            const column_value& col = get_subscripted_column(s);
+                            return idx.supports_subscript_expression(*col.col, oper.op);
+                        },
+                        [&] (const binary_operator&) -> ret_t {
+                            on_internal_error(expr_logger, "is_supported_by: nested binary operators are not supported");
+                        },
+                        [&] (const conjunction&) -> ret_t {
+                            on_internal_error(expr_logger, "is_supported_by: conjunctions are not supported as the LHS of a binary expression");
+                        },
+                        [] (const constant&) -> ret_t {
+                            on_internal_error(expr_logger, "is_supported_by: constants are not supported as the LHS of a binary expression");
+                        },
+                        [] (const unresolved_identifier&) -> ret_t {
+                            on_internal_error(expr_logger, "is_supported_by: an unresolved identifier is not supported as the LHS of a binary expression");
+                        },
+                        [&] (const column_mutation_attribute&) -> ret_t {
+                            on_internal_error(expr_logger, "is_supported_by: writetime/ttl are not supported as the LHS of a binary expression");
+                        },
+                        [&] (const cast&) -> ret_t {
+                            on_internal_error(expr_logger, "is_supported_by: typecasts are not supported as the LHS of a binary expression");
+                        },
+                        [&] (const field_selection&) -> ret_t {
+                            on_internal_error(expr_logger, "is_supported_by: field selections are not supported as the LHS of a binary expression");
+                        },
+                        [&] (const bind_variable&) -> ret_t {
+                            on_internal_error(expr_logger, "is_supported_by: bind variables are not supported as the LHS of a binary expression");
+                        },
+                        [&] (const untyped_constant&) -> ret_t {
+                            on_internal_error(expr_logger, "is_supported_by: untyped constants are not supported as the LHS of a binary expression");
+                        },
+                        [&] (const collection_constructor&) -> ret_t {
+                            on_internal_error(expr_logger, "is_supported_by: collection constructors are not supported as the LHS of a binary expression");
+                        },
+                        [&] (const usertype_constructor&) -> ret_t {
+                            on_internal_error(expr_logger, "is_supported_by: user type constructors are not supported as the LHS of a binary expression");
+                        },
+                        [&] (const temporary&) -> ret_t {
+                            on_internal_error(expr_logger, "is_supported_by: temporaries are not supported as the LHS of a binary expression");
+                        },
+                    }, oper.lhs);
+            },
+            [] (const auto& default_case) { return index::supports_expression_v::from_bool(false); }
+        }, expr);
+}
+}
+
+bool is_supported_by(const expression& expr, const secondary_index::index& idx) {
+    auto s = is_supported_by_helper(expr, idx);
+    return s != secondary_index::index::supports_expression_v::from_bool(false);
+}
+
+
+bool has_supporting_index(
+        const expression& expr,
+        const secondary_index::secondary_index_manager& index_manager,
+        allow_local_index allow_local) {
+    const auto indexes = index_manager.list_indexes();
+    const auto support = std::bind(is_supported_by, std::ref(expr), std::placeholders::_1);
+    return allow_local ? std::ranges::any_of(indexes, support)
+            : std::ranges::any_of(
+                    indexes | std::views::filter([] (const secondary_index::index& i) { return !i.metadata().local(); }),
+                    support);
+}
+
+bool index_supports_some_column(
+        const expression& e,
+        const secondary_index::secondary_index_manager& index_manager,
+        allow_local_index allow_local) {
+    single_column_restrictions_map single_col_restrictions = get_single_column_restrictions_map(e);
+
+    for (auto&& [col, col_restrictions] : single_col_restrictions) {
+        if (has_supporting_index(col_restrictions, index_manager, allow_local)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool is_on_collection(const binary_operator& b) {
+    if (b.op == oper_t::CONTAINS || b.op == oper_t::CONTAINS_KEY) {
+        return true;
+    }
+    if (auto tuple = expr::as_if<tuple_constructor>(&b.lhs)) {
+        return std::ranges::any_of(tuple->elements, [] (const expression& v) { return expr::is<subscript>(v); });
+    }
+    return false;
+}
+
+bool has_eq_restriction_on_column(const column_definition& column, const expression& e) {
+    std::function<bool(const expression&)> column_in_lhs = [&](const expression& e) -> bool {
+        return visit(overloaded_functor {
+            [&](const column_value& cv) {
+                // Use column_defintion::operator== for comparison,
+                // columns with the same name but different schema will not be equal.
+                return *cv.col == column;
+            },
+            [&](const tuple_constructor& tc) {
+                for (const expression& elem : tc.elements) {
+                    if (column_in_lhs(elem)) {
+                        return true;
+                    }
+                }
+
+                return false;
+            },
+            [&](const auto&) {return false;}
+        }, e);
+    };
+
+    // Look for binary operator describing eq relation with this column on lhs
+    const binary_operator* eq_restriction_search_res = find_binop(e, [&](const binary_operator& b) {
+        if (b.op != oper_t::EQ) {
+            return false;
+        }
+
+        if (!column_in_lhs(b.lhs)) {
+            return false;
+        }
+
+        // These conditions are not allowed to occur in the current code,
+        // but they might be allowed in the future.
+        // They are added now to avoid surprises later.
+        //
+        // These conditions detect cases like:
+        // WHERE column1 = column2
+        // WHERE column1 = row_number()
+        if (contains_column(column, b.rhs) || contains_nonpure_function(b.rhs)) {
+            return false;
+        }
+
+        return true;
+    });
+
+    return eq_restriction_search_res != nullptr;
+}
+
+std::vector<expression> extract_single_column_restrictions_for_column(const expression& expr,
+                                                                      const column_definition& column) {
+    struct visitor {
+        std::vector<expression> restrictions;
+        const column_definition& column;
+        const binary_operator* current_binary_operator;
+
+        void operator()(const constant&) {}
+
+        void operator()(const conjunction& conj) {
+            for (const expression& child : conj.children) {
+                expr::visit(*this, child);
+            }
+        }
+
+        void operator()(const binary_operator& oper) {
+            if (current_binary_operator != nullptr) {
+                on_internal_error(expr_logger,
+                    "extract_single_column_restrictions_for_column: nested binary operators are not supported");
+            }
+
+            current_binary_operator = &oper;
+            expr::visit(*this, oper.lhs);
+            current_binary_operator = nullptr;
+        }
+
+        void operator()(const column_value& cv) {
+            if (*cv.col == column && current_binary_operator != nullptr) {
+                restrictions.emplace_back(*current_binary_operator);
+            }
+        }
+
+        void operator()(const subscript& s) {
+            const column_value& cv = get_subscripted_column(s);
+            if (*cv.col == column && current_binary_operator != nullptr) {
+                restrictions.emplace_back(*current_binary_operator);
+            }
+        }
+
+        void operator()(const unresolved_identifier&) {}
+        void operator()(const column_mutation_attribute&) {}
+        void operator()(const function_call&) {}
+        void operator()(const cast&) {}
+        void operator()(const field_selection&) {}
+        void operator()(const bind_variable&) {}
+        void operator()(const untyped_constant&) {}
+        void operator()(const tuple_constructor&) {}
+        void operator()(const collection_constructor&) {}
+        void operator()(const usertype_constructor&) {}
+        void operator()(const temporary&) {}
+    };
+
+    visitor v {
+        .restrictions = std::vector<expression>(),
+        .column = column,
+        .current_binary_operator = nullptr,
+    };
+
+    expr::visit(v, expr);
+
+    return std::move(v.restrictions);
+}
+
+static std::optional<std::reference_wrapper<const column_value>> get_single_column_restriction_column(const expression& e) {
+    if (find_in_expression<unresolved_identifier>(e, [](const auto&) {return true;})) {
+        on_internal_error(expr_logger,
+            seastar::format("get_single_column_restriction_column expects a prepared expression, but it's not: {}", e));
+    }
+
+    const column_value* the_only_column = nullptr;
+    bool expression_is_single_column = false;
+
+    for_each_expression<column_value>(e,
+        [&](const column_value& cval) {
+            if (the_only_column == nullptr) {
+                // It's the first column_value we've encountered - set it as the only column
+                the_only_column = &cval;
+                expression_is_single_column = true;
+                return;
+            }
+
+            if (cval.col != the_only_column->col) {
+                // In case any other column is encountered the restriction
+                // restricts more than one column.
+                expression_is_single_column = false;
+            }
+        }
+    );
+
+    if (expression_is_single_column) {
+        return std::cref(*the_only_column);
+    } else {
+        return std::nullopt;
+    }
+}
+
+bool is_single_column_restriction(const expression& e) {
+    return get_single_column_restriction_column(e).has_value();
+}
+
+const column_value& get_the_only_column(const expression& e) {
+    std::optional<std::reference_wrapper<const column_value>> result = get_single_column_restriction_column(e);
+
+    if (!result.has_value()) {
+        on_internal_error(expr_logger,
+            format("get_the_only_column - bad expression: {}", e));
+    }
+
+    return *result;
+}
+
+single_column_restrictions_map get_single_column_restrictions_map(const expression& e) {
+    single_column_restrictions_map result;
+
+    std::vector<const column_definition*> sorted_defs = get_sorted_column_defs(e);
+    for (const column_definition* cdef : sorted_defs) {
+        expression col_restrictions = conjunction {
+            .children = extract_single_column_restrictions_for_column(e, *cdef)
+        };
+        result.emplace(cdef, std::move(col_restrictions));
+    }
+
+    return result;
+}
+
+bool is_empty_restriction(const expression& e) {
+    bool contains_non_conjunction = recurse_until(e, [&](const expression& e) -> bool {
+        return !is<conjunction>(e);
+    });
+
+    return !contains_non_conjunction;
+}
+
+bytes_opt value_for(const column_definition& cdef, const expression& e, const query_options& options) {
+    value_set possible_vals = possible_column_values(&cdef, e, options);
+    return std::visit(overloaded_functor {
+        [&](const value_list& val_list) -> bytes_opt {
+            if (val_list.empty()) {
+                return std::nullopt;
+            }
+
+            if (val_list.size() != 1) {
+                on_internal_error(expr_logger, format("expr::value_for - multiple possible values for column: {}", e));
+            }
+
+            return to_bytes(val_list.front());
+        },
+        [&](const interval<managed_bytes>&) -> bytes_opt {
+            on_internal_error(expr_logger, format("expr::value_for - possible values are a range: {}", e));
+        }
+    }, possible_vals);
+}
+
+bool contains_multi_column_restriction(const expression& e) {
+    const binary_operator* find_res = find_binop(e, [](const binary_operator& binop) {
+        return is<tuple_constructor>(binop.lhs);
+    });
+    return find_res != nullptr;
+}
+
+bool has_only_eq_binops(const expression& e) {
+    const expr::binary_operator* non_eq_binop = find_in_expression<expr::binary_operator>(e,
+        [](const expr::binary_operator& binop) {
+            return binop.op != expr::oper_t::EQ;
+        }
+    );
+
+    return non_eq_binop == nullptr;
+}
 
 statement_restrictions::statement_restrictions(schema_ptr schema, bool allow_filtering)
     : _schema(schema)
@@ -194,7 +945,7 @@ static std::vector<expr::expression> extract_partition_range(
         return {std::move(*v.tokens)};
     }
     if (v.single_column.size() == schema->partition_key_size()) {
-        return boost::copy_range<std::vector<expression>>(v.single_column | boost::adaptors::map_values);
+        return v.single_column | std::views::values | std::ranges::to<std::vector>();
     }
     return {};
 }
@@ -369,28 +1120,28 @@ statement_restrictions::statement_restrictions(data_dictionary::database db,
     }
     if (_where.has_value()) {
         if (!has_token_restrictions()) {
-            _single_column_partition_key_restrictions = expr::get_single_column_restrictions_map(_partition_key_restrictions);
+            _single_column_partition_key_restrictions = get_single_column_restrictions_map(_partition_key_restrictions);
         }
-        if (!expr::contains_multi_column_restriction(_clustering_columns_restrictions)) {
-            _single_column_clustering_key_restrictions = expr::get_single_column_restrictions_map(_clustering_columns_restrictions);
+        if (!contains_multi_column_restriction(_clustering_columns_restrictions)) {
+            _single_column_clustering_key_restrictions = get_single_column_restrictions_map(_clustering_columns_restrictions);
         }
-        _single_column_nonprimary_key_restrictions = expr::get_single_column_restrictions_map(_nonprimary_key_restrictions);
+        _single_column_nonprimary_key_restrictions = get_single_column_restrictions_map(_nonprimary_key_restrictions);
         _clustering_prefix_restrictions = extract_clustering_prefix_restrictions(*_where, _schema);
         _partition_range_restrictions = extract_partition_range(*_where, _schema);
     }
-    _has_multi_column = find_binop(_clustering_columns_restrictions, expr::is_multi_column);
+    _has_multi_column = find_binop(_clustering_columns_restrictions, is_multi_column);
     if (_check_indexes) {
         auto cf = db.find_column_family(schema);
         auto& sim = cf.get_index_manager();
         const expr::allow_local_index allow_local(
                 !has_partition_key_unrestricted_components()
                 && partition_key_restrictions_is_all_eq());
-        _has_multi_column = find_binop(_clustering_columns_restrictions, expr::is_multi_column);
+        _has_multi_column = find_binop(_clustering_columns_restrictions, is_multi_column);
         _has_queriable_ck_index = clustering_columns_restrictions_have_supporting_index(sim, allow_local)
                 && !type.is_delete();
         _has_queriable_pk_index = parition_key_restrictions_have_supporting_index(sim, allow_local)
                 && !type.is_delete();
-        _has_queriable_regular_index = expr::index_supports_some_column(_nonprimary_key_restrictions, sim, allow_local)
+        _has_queriable_regular_index = index_supports_some_column(_nonprimary_key_restrictions, sim, allow_local)
                 && !type.is_delete();
     } else {
         _has_queriable_ck_index = false;
@@ -437,11 +1188,11 @@ statement_restrictions::statement_restrictions(data_dictionary::database db,
 
     if (_uses_secondary_indexing || clustering_key_restrictions_need_filtering()) {
         _index_restrictions.push_back(_clustering_columns_restrictions);
-    } else if (find_binop(_clustering_columns_restrictions, expr::is_on_collection)) {
+    } else if (find_binop(_clustering_columns_restrictions, is_on_collection)) {
         fail(unimplemented::cause::INDEXES);
     }
 
-    if (!expr::is_empty_restriction(_nonprimary_key_restrictions)) {
+    if (!is_empty_restriction(_nonprimary_key_restrictions)) {
         if (_has_queriable_regular_index && _partition_range_is_simple) {
             _uses_secondary_indexing = true;
         } else if (!allow_filtering && !type.is_delete() && !type.is_update()) {
@@ -455,6 +1206,84 @@ statement_restrictions::statement_restrictions(data_dictionary::database db,
     if (_uses_secondary_indexing && !(for_view || allow_filtering)) {
         validate_secondary_index_selections(selects_only_static_columns);
     }
+
+    if (_check_indexes) {
+        auto cf = db.find_column_family(_schema);
+        auto& sim = cf.get_index_manager();
+        std::tie(_idx_opt, _idx_restrictions) = do_find_idx(sim);
+    }
+
+    calculate_column_defs_for_filtering_and_erase_restrictions_used_for_index(db);
+
+    if (pk_restrictions_need_filtering()) {
+        auto partition_key_filter = expr::conjunction{
+            .children = _single_column_partition_key_restrictions
+                    | std::ranges::views::values
+                    | std::ranges::to<std::vector>(),
+        };
+        _partition_level_filter = expr::make_conjunction(std::move(_partition_level_filter), std::move(partition_key_filter));
+    }
+
+    if (ck_restrictions_need_filtering()) {
+        auto clustering_key_filter = expr::conjunction{
+            .children = _single_column_clustering_key_restrictions
+                    | std::ranges::views::values
+                    | std::ranges::to<std::vector>(),
+        };
+        _clustering_row_level_filter = expr::make_conjunction(std::move(_clustering_row_level_filter), std::move(clustering_key_filter));
+    }
+
+    auto check_column_kind = [] (column_kind kind, const expr::single_column_restrictions_map::value_type& v) -> bool {
+        return v.first->kind == kind;
+    };
+
+    auto make_column_kind_checker = [&] (column_kind kind) {
+        return std::bind_front(check_column_kind, kind);
+    };
+
+    auto static_columns_filter = expr::conjunction{
+        .children = _single_column_nonprimary_key_restrictions
+                | std::ranges::views::filter(make_column_kind_checker(column_kind::static_column))
+                | std::ranges::views::values
+                | std::ranges::to<std::vector>(),
+    };
+
+    _partition_level_filter = expr::make_conjunction(std::move(_partition_level_filter), std::move(static_columns_filter));
+
+    auto regular_columns_filter = expr::conjunction{
+        .children = _single_column_nonprimary_key_restrictions
+                | std::ranges::views::filter(make_column_kind_checker(column_kind::regular_column))
+                | std::ranges::views::values
+                | std::ranges::to<std::vector>(),
+    };
+
+    _clustering_row_level_filter = expr::make_conjunction(std::move(_clustering_row_level_filter), std::move(regular_columns_filter));
+
+    auto multi_column_restrictions = expr::conjunction{
+        .children = expr::boolean_factors(_clustering_columns_restrictions)
+                | std::ranges::views::filter(contains_multi_column_restriction)
+                | std::ranges::to<std::vector>()
+    };
+
+    _clustering_row_level_filter = expr::make_conjunction(std::move(_clustering_row_level_filter), std::move(multi_column_restrictions));
+
+    if (uses_secondary_indexing()) {
+        auto& index_opt = _idx_opt;
+        if (!index_opt) {
+            throw std::runtime_error("No index found.");
+        }
+
+        const auto& im = index_opt->metadata();
+        sstring index_table_name = im.name() + "_index";
+        schema_ptr view_schema = db.find_schema(schema->ks_name(), index_table_name);
+        _view_schema = view_schema;
+
+        if (im.local()) {
+            prepare_indexed_local(*view_schema);
+        } else {
+            prepare_indexed_global(*view_schema);
+        }
+    }
 }
 
 bool
@@ -464,7 +1293,7 @@ statement_restrictions::clustering_key_restrictions_has_IN() const {
 
 bool
 statement_restrictions::clustering_key_restrictions_has_only_eq() const {
-    return expr::has_only_eq_binops(_clustering_columns_restrictions);
+    return has_only_eq_binops(_clustering_columns_restrictions);
 }
 
 bool
@@ -488,17 +1317,17 @@ statement_restrictions::get_restrictions(column_kind kind) const {
 
 bool
 statement_restrictions::has_clustering_columns_restriction() const {
-    return !expr::is_empty_restriction(_clustering_columns_restrictions);
+    return !is_empty_restriction(_clustering_columns_restrictions);
 }
 
 bool
 statement_restrictions::has_non_primary_key_restriction() const {
-    return !expr::is_empty_restriction(_nonprimary_key_restrictions);
+    return !is_empty_restriction(_nonprimary_key_restrictions);
 }
 
 bool
 statement_restrictions::ck_restrictions_need_filtering() const {
-    if (expr::is_empty_restriction(_clustering_columns_restrictions)) {
+    if (is_empty_restriction(_clustering_columns_restrictions)) {
         return false;
     }
 
@@ -537,29 +1366,48 @@ int statement_restrictions::score(const secondary_index::index& index) const {
     return 1;
 }
 
-std::pair<std::optional<secondary_index::index>, expr::expression> statement_restrictions::find_idx(const secondary_index::secondary_index_manager& sim) const {
+std::pair<std::optional<secondary_index::index>, expr::expression> statement_restrictions::do_find_idx(const secondary_index::secondary_index_manager& sim) const {
+    if (!_uses_secondary_indexing) {
+        return {std::nullopt, expr::conjunction({})};
+    }
+
     std::optional<secondary_index::index> chosen_index;
     int chosen_index_score = 0;
     expr::expression chosen_index_restrictions = expr::conjunction({});
 
-    for (const auto& index : sim.list_indexes()) {
-        auto cdef = _schema->get_column_definition(to_bytes(index.target_column()));
-        for (const expr::expression& restriction : index_restrictions()) {
-            if (has_partition_token(restriction, *_schema) || contains_multi_column_restriction(restriction)) {
-                continue;
-            }
-
-            expr::single_column_restrictions_map rmap = expr::get_single_column_restrictions_map(restriction);
-            const auto found = rmap.find(cdef);
-            if (found != rmap.end() && is_supported_by(found->second, index)
-                && score(index) > chosen_index_score) {
-                chosen_index = index;
-                chosen_index_score = score(index);
-                chosen_index_restrictions = restriction;
-            }
+    // Several indexes may be usable for this query. When their score is tied,
+    // let's pick one by order of the columns mentioned in the restriction
+    // expression. This specific order isn't important (and maybe in the
+    // future we could plan a better order based on the specificity of each
+    // index), but it is critical that two coordinators - or the same
+    // coordinator over time - must choose the same index for the same query.
+    // Otherwise, paging can break (see issue #7969).
+    for (const expr::expression& restriction : index_restrictions()) {
+        if (has_partition_token(restriction, *_schema) || contains_multi_column_restriction(restriction)) {
+            continue;
         }
+        expr::for_each_expression<expr::column_value>(restriction, [&](const expr::column_value& cval) {
+            auto& cdef = cval.col;
+            expr::expression col_restrictions = expr::conjunction {
+                .children = extract_single_column_restrictions_for_column(restriction, *cdef)
+            };
+            for (const auto& index : sim.list_indexes()) {
+                if (cdef->name_as_text() == index.target_column() &&
+                        is_supported_by(col_restrictions, index) &&
+                        score(index) > chosen_index_score) {
+                    chosen_index = index;
+                    chosen_index_score = score(index);
+                    chosen_index_restrictions = restriction;
+                }
+            }
+        });
     }
     return {chosen_index, chosen_index_restrictions};
+}
+
+std::pair<std::optional<secondary_index::index>, expr::expression>
+statement_restrictions::find_idx(const secondary_index::secondary_index_manager& sim) const {
+    return {_idx_opt, _idx_restrictions};
 }
 
 bool statement_restrictions::has_eq_restriction_on_column(const column_definition& column) const {
@@ -567,17 +1415,19 @@ bool statement_restrictions::has_eq_restriction_on_column(const column_definitio
         return false;
     }
 
-    return expr::has_eq_restriction_on_column(column, *_where);
+    return restrictions::has_eq_restriction_on_column(column, *_where);
 }
 
 std::vector<const column_definition*> statement_restrictions::get_column_defs_for_filtering(data_dictionary::database db) const {
+    return _column_defs_for_filtering;
+}
+
+void statement_restrictions::calculate_column_defs_for_filtering_and_erase_restrictions_used_for_index(data_dictionary::database db) {
     std::vector<const column_definition*> column_defs_for_filtering;
     if (need_filtering()) {
         std::optional<secondary_index::index> opt_idx;
         if (_check_indexes) {
-            auto cf = db.find_column_family(_schema);
-            auto& sim = cf.get_index_manager();
-            opt_idx = std::get<0>(find_idx(sim));
+            opt_idx = _idx_opt;
         }
         auto column_uses_indexing = [&opt_idx] (const column_definition* cdef, const expr::expression* single_col_restr) {
             return opt_idx && single_col_restr && is_supported_by(*single_col_restr, *opt_idx);
@@ -593,6 +1443,8 @@ std::vector<const column_definition*> statement_restrictions::get_column_defs_fo
                 }
                 if (!column_uses_indexing(cdef, single_col_restr)) {
                     column_defs_for_filtering.emplace_back(cdef);
+                } else {
+                    _single_column_partition_key_restrictions.erase(it);
                 }
             }
         }
@@ -602,35 +1454,41 @@ std::vector<const column_definition*> statement_restrictions::get_column_defs_fo
                     num_clustering_prefix_columns_that_need_not_be_filtered();
             for (auto&& cdef : expr::get_sorted_column_defs(_clustering_columns_restrictions)) {
                 const expr::expression* single_col_restr = nullptr;
-                auto it = _single_column_partition_key_restrictions.find(cdef);
-                if (it != _single_column_partition_key_restrictions.end()) {
+                auto it = _single_column_clustering_key_restrictions.find(cdef);
+                if (it != _single_column_clustering_key_restrictions.end()) {
                     single_col_restr = &it->second;
                 }
                 if (cdef->id >= first_filtering_id && !column_uses_indexing(cdef, single_col_restr)) {
                     column_defs_for_filtering.emplace_back(cdef);
+                } else {
+                    _single_column_clustering_key_restrictions.erase(it);
                 }
             }
         }
-        for (auto&& [cdef, cur_restr] : _single_column_nonprimary_key_restrictions) {
+        for (auto it = _single_column_nonprimary_key_restrictions.begin(); it != _single_column_nonprimary_key_restrictions.end();) {
+            auto&& [cdef, cur_restr] = *it;
             if (!column_uses_indexing(cdef, &cur_restr)) {
                 column_defs_for_filtering.emplace_back(cdef);
+                ++it;
+            } else {
+                it = _single_column_nonprimary_key_restrictions.erase(it);
             }
         }
     }
-    return column_defs_for_filtering;
+    _column_defs_for_filtering = std::move(column_defs_for_filtering);
 }
 
 void statement_restrictions::add_restriction(const expr::binary_operator& restr, schema_ptr schema, bool allow_filtering, bool for_view) {
     if (restr.op == expr::oper_t::IS_NOT) {
         // Handle IS NOT NULL restrictions separately
         add_is_not_restriction(restr, schema, for_view);
-    } else if (expr::is_multi_column(restr)) {
+    } else if (is_multi_column(restr)) {
         // Multi column restrictions are only allowed on clustering columns
         add_multi_column_clustering_key_restriction(restr);
     } else if (has_partition_token(restr, *_schema)) {
         // Token always restricts the partition key
         add_token_partition_key_restriction(restr);
-    } else if (expr::is_single_column_restriction(restr)) {
+    } else if (is_single_column_restriction(restr)) {
         const column_definition* def = get_the_only_column(restr).col;
         if (def->is_partition_key()) {
             add_single_column_parition_key_restriction(restr, schema, allow_filtering, for_view);
@@ -673,9 +1531,9 @@ void statement_restrictions::add_single_column_parition_key_restriction(const ex
     }
     if (has_token_restrictions()) {
         throw exceptions::invalid_request_exception(
-                format("Columns \"{}\" cannot be restricted by both a normal relation and a token relation",
+                seastar::format("Columns \"{}\" cannot be restricted by both a normal relation and a token relation",
                        fmt::join(expr::get_sorted_column_defs(_partition_key_restrictions) |
-                                 boost::adaptors::transformed([](auto* p) {
+                                 std::views::transform([](auto* p) {
                                    return maybe_column_definition{p};
                                  }),
                                  ", ")));
@@ -688,9 +1546,9 @@ void statement_restrictions::add_single_column_parition_key_restriction(const ex
 void statement_restrictions::add_token_partition_key_restriction(const expr::binary_operator& restr) {
     if (!partition_key_restrictions_is_empty() && !has_token_restrictions()) {
         throw exceptions::invalid_request_exception(
-                format("Columns \"{}\" cannot be restricted by both a normal relation and a token relation",
+                seastar::format("Columns \"{}\" cannot be restricted by both a normal relation and a token relation",
                         fmt::join(expr::get_sorted_column_defs(_partition_key_restrictions) |
-                                  boost::adaptors::transformed([](auto* p) {
+                                  std::views::transform([](auto* p) {
                                     return maybe_column_definition{p};
                                   }),
                                   ", ")));
@@ -707,7 +1565,7 @@ void statement_restrictions::add_single_column_clustering_key_restriction(const 
             "Mixing single column relations and multi column relations on clustering columns is not allowed");
     }
 
-    const column_definition* new_column = expr::get_the_only_column(restr).col;
+    const column_definition* new_column = get_the_only_column(restr).col;
     const column_definition* last_column = expr::get_last_column_def(_clustering_columns_restrictions);
 
     if (last_column != nullptr && !allow_filtering) {
@@ -728,7 +1586,7 @@ void statement_restrictions::add_single_column_clustering_key_restriction(const 
 }
 
 void statement_restrictions::add_multi_column_clustering_key_restriction(const expr::binary_operator& restr) {
-    if (expr::is_empty_restriction(_clustering_columns_restrictions)) {
+    if (is_empty_restriction(_clustering_columns_restrictions)) {
         _clustering_columns_restrictions = restr;
         return;
     }
@@ -799,7 +1657,7 @@ void statement_restrictions::process_partition_key_restrictions(bool for_view, b
     // components must have a EQ. Only the last partition key component can be in IN relation.
     if (has_token_restrictions()) {
         _is_key_range = true;
-    } else if (expr::is_empty_restriction(_partition_key_restrictions)) {
+    } else if (is_empty_restriction(_partition_key_restrictions)) {
         _is_key_range = true;
         _uses_secondary_indexing = _has_queriable_pk_index;
     }
@@ -823,11 +1681,11 @@ bool statement_restrictions::has_partition_key_unrestricted_components() const {
 }
 
 bool statement_restrictions::partition_key_restrictions_is_empty() const {
-    return expr::is_empty_restriction(_partition_key_restrictions);
+    return is_empty_restriction(_partition_key_restrictions);
 }
 
 bool statement_restrictions::partition_key_restrictions_is_all_eq() const {
-    return expr::has_only_eq_binops(_partition_key_restrictions);
+    return has_only_eq_binops(_partition_key_restrictions);
 }
 
 size_t statement_restrictions::partition_key_restrictions_size() const {
@@ -835,9 +1693,9 @@ size_t statement_restrictions::partition_key_restrictions_size() const {
 }
 
 bool statement_restrictions::pk_restrictions_need_filtering() const {
-     return !expr::is_empty_restriction(_partition_key_restrictions)
+     return !is_empty_restriction(_partition_key_restrictions)
          && !has_token_restrictions()
-         && (has_partition_key_unrestricted_components() || expr::has_slice_or_needs_filtering(_partition_key_restrictions));
+         && (has_partition_key_unrestricted_components() || has_slice_or_needs_filtering(_partition_key_restrictions));
 }
 
 size_t statement_restrictions::clustering_columns_restrictions_size() const {
@@ -845,7 +1703,7 @@ size_t statement_restrictions::clustering_columns_restrictions_size() const {
 }
 
 bool statement_restrictions::clustering_key_restrictions_need_filtering() const {
-    if (expr::contains_multi_column_restriction(_clustering_columns_restrictions)) {
+    if (contains_multi_column_restriction(_clustering_columns_restrictions)) {
         return false;
     }
 
@@ -873,8 +1731,8 @@ bool statement_restrictions::clustering_columns_restrictions_have_supporting_ind
         const secondary_index::secondary_index_manager& index_manager,
         expr::allow_local_index allow_local) const {
     // Single column restrictions can be handled by the existing code
-    if (!expr::contains_multi_column_restriction(_clustering_columns_restrictions)) {
-        return expr::index_supports_some_column(_clustering_columns_restrictions, index_manager, allow_local);
+    if (!contains_multi_column_restriction(_clustering_columns_restrictions)) {
+        return index_supports_some_column(_clustering_columns_restrictions, index_manager, allow_local);
     }
 
     // Multi column restrictions have to be handled separately
@@ -951,7 +1809,7 @@ bool statement_restrictions::parition_key_restrictions_have_supporting_index(con
         return false;
     }
 
-    return expr::index_supports_some_column(_partition_key_restrictions, index_manager, allow_local);
+    return index_supports_some_column(_partition_key_restrictions, index_manager, allow_local);
 }
 
 void statement_restrictions::process_clustering_columns_restrictions(bool for_view, bool allow_filtering) {
@@ -959,7 +1817,7 @@ void statement_restrictions::process_clustering_columns_restrictions(bool for_vi
         return;
     }
 
-    if (find_binop(_clustering_columns_restrictions, expr::is_on_collection)
+    if (find_binop(_clustering_columns_restrictions, is_on_collection)
         && !_has_queriable_ck_index && !allow_filtering) {
         throw exceptions::invalid_request_exception(
             "Cannot restrict clustering columns by a CONTAINS relation without a secondary index or filtering");
@@ -991,10 +1849,10 @@ dht::partition_range_vector partition_ranges_from_token(const expr::expression& 
                                                         const query_options& options,
                                                         const schema& table_schema) {
     auto values = possible_partition_token_values(ex, options, table_schema);
-    if (values == expr::value_set(expr::value_list{})) {
+    if (values == value_set(value_list{})) {
         return {};
     }
-    const auto bounds = expr::to_range(values);
+    const auto bounds = to_range(values);
     const auto start_token = bounds.start() ? bounds.start()->value().with_linearized([] (bytes_view bv) { return dht::token::from_bytes(bv); })
             : dht::minimum_token();
     auto end_token = bounds.end() ? bounds.end()->value().with_linearized([] (bytes_view bv) { return dht::token::from_bytes(bv); })
@@ -1062,8 +1920,9 @@ dht::partition_range_vector partition_ranges_from_singles(
         }
     }
     cartesian_product cp(column_values);
-    dht::partition_range_vector ranges(product_size);
-    std::transform(cp.begin(), cp.end(), ranges.begin(), std::bind_front(range_from_bytes, std::ref(schema)));
+    dht::partition_range_vector ranges;
+    ranges.reserve(product_size);
+    std::transform(cp.begin(), cp.end(), std::back_inserter(ranges), std::bind_front(range_from_bytes, std::ref(schema)));
     return ranges;
 }
 
@@ -1140,13 +1999,14 @@ bool starts_before_start(
     const auto len1 = r1.start()->value().representation().size();
     const auto len2 = r2.start()->value().representation().size();
     if (len1 == len2) { // The values truly are equal.
+        // (a)>=(1) starts before (a)>(1)
         return r1.start()->is_inclusive() && !r2.start()->is_inclusive();
     } else if (len1 < len2) { // r1 start is a prefix of r2 start.
         // (a)>=(1) starts before (a,b)>=(1,1), but (a)>(1) doesn't.
         return r1.start()->is_inclusive();
     } else { // r2 start is a prefix of r1 start.
         // (a,b)>=(1,1) starts before (a)>(1) but after (a)>=(1).
-        return r2.start()->is_inclusive();
+        return !r2.start()->is_inclusive();
     }
 }
 
@@ -1171,6 +2031,7 @@ bool starts_before_or_at_end(
     const auto len1 = r1.start()->value().representation().size();
     const auto len2 = r2.end()->value().representation().size();
     if (len1 == len2) { // The values truly are equal.
+        // (a)>=(1) starts at end of (a)<=(1)
         return r1.start()->is_inclusive() && r2.end()->is_inclusive();
     } else if (len1 < len2) { // r1 start is a prefix of r2 end.
         // a>=(1) starts before (a,b)<=(1,1) ends, but (a)>(1) doesn't.
@@ -1202,6 +2063,7 @@ bool ends_before_end(
     const auto len1 = r1.end()->value().representation().size();
     const auto len2 = r2.end()->value().representation().size();
     if (len1 == len2) { // The values truly are equal.
+        // (a)<(1) ends before (a)<=(1) ends
         return !r1.end()->is_inclusive() && r2.end()->is_inclusive();
     } else if (len1 < len2) { // r1 end is a prefix of r2 end.
         // (a)<(1) ends before (a,b)<=(1,1), but (a)<=(1) doesn't.
@@ -1217,7 +2079,10 @@ std::optional<query::clustering_range> intersection(
         const query::clustering_range& r1,
         const query::clustering_range& r2,
         const clustering_key_prefix::prefix_equal_tri_compare& cmp) {
-    // Assume r1's start is to the left of r2's start.
+    // If needed, swap r1 and r2 so that r1's start is to the left of r2's
+    // start. Note that to avoid infinite recursion (#18688) the function
+    // starts_before_start() must never return true for both (r1,r2) and
+    // (r2,r1) - in other words, it must be a *strict* partial order.
     if (starts_before_start(r2, r1, cmp)) {
         return intersection(r2, r1, cmp);
     }
@@ -1257,9 +2122,9 @@ struct multi_column_range_accumulator {
     const clustering_key_prefix::prefix_equal_tri_compare prefix3cmp = get_unreversed_tri_compare(*schema);
 
     void operator()(const binary_operator& binop) {
+        auto& lhs = expr::as<tuple_constructor>(binop.lhs);
         if (is_compare(binop.op)) {
             auto opt_values = expr::get_tuple_elements(expr::evaluate(binop.rhs, options), *type_of(binop.rhs));
-            auto& lhs = expr::as<tuple_constructor>(binop.lhs);
             std::vector<managed_bytes> values(lhs.elements.size());
             for (size_t i = 0; i < lhs.elements.size(); ++i) {
                 auto& col = expr::as<column_value>(lhs.elements.at(i));
@@ -1273,7 +2138,19 @@ struct multi_column_range_accumulator {
             utils::chunked_vector<std::vector<managed_bytes_opt>> tuple_elems;
             if (tup.is_value()) {
                 tuple_elems = expr::get_list_of_tuples_elements(tup, *type_of(binop.rhs));
-            }
+            }   
+            for(size_t i = 0; i < tuple_elems.size(); ++i) {
+                if(tuple_elems[i].size() != lhs.elements.size()) {
+                    throw exceptions::invalid_request_exception(format("Expected {} elements in value tuple, but got {}",
+                    lhs.elements.size(), tuple_elems[i].size()));
+                }
+                for(size_t j = 0; j < lhs.elements.size(); ++j) {
+                    auto& col = expr::as<column_value>(lhs.elements.at(j));
+                    statements::request_validations::check_not_null(
+                            tuple_elems[i][j],
+                            "Invalid null value in condition for column {}", col.col->name_as_text());
+                }
+            }   
             process_in_values(std::move(tuple_elems));
         } else {
             on_internal_error(rlogger, format("multi_column_range_accumulator: unexpected atom {}", binop));
@@ -1393,12 +2270,10 @@ std::vector<query::clustering_range> get_multi_column_clustering_bounds(
     return acc.ranges;
 }
 
-/// Reverses the range if the type is reversed.  Why don't we have nonwrapping_interval::reverse()??
+/// Reverses the range if the type is reversed.  Why don't we have interval::reverse()??
 query::clustering_range reverse_if_reqd(query::clustering_range r, const abstract_type& t) {
     return t.is_reversed() ? query::clustering_range(r.end(), r.start()) : std::move(r);
 }
-
-constexpr bool inclusive = true;
 
 /// Calculates clustering bounds for the single-column case.
 std::vector<query::clustering_range> get_single_column_clustering_bounds(
@@ -1421,7 +2296,7 @@ std::vector<query::clustering_range> get_single_column_clustering_bounds(
             product_size *= list->size();
             prior_column_values.push_back(std::move(*list));
             error_if_exceeds_clustering_key_limit(product_size, size_limit);
-        } else if (auto last_range = std::get_if<nonwrapping_interval<managed_bytes>>(&values)) {
+        } else if (auto last_range = std::get_if<interval<managed_bytes>>(&values)) {
             // Must be the last column in the prefix, since it's neither EQ nor IN.
             std::vector<query::clustering_range> ck_ranges;
             if (prior_column_values.empty()) {
@@ -1491,7 +2366,7 @@ static std::vector<query::clustering_range> get_index_v1_token_range_clustering_
     token_column_bigint.type = long_type;
     expression new_token_restrictions = replace_column_def(token_restriction, &token_column_bigint);
 
-    std::variant<value_list, nonwrapping_range<managed_bytes>> values =
+    std::variant<value_list, interval<managed_bytes>> values =
         possible_column_values(&token_column_bigint, new_token_restrictions, options);
 
     return std::visit(overloaded_functor {
@@ -1505,7 +2380,7 @@ static std::vector<query::clustering_range> get_index_v1_token_range_clustering_
 
             return ck_ranges;
         },
-        [](const nonwrapping_interval<managed_bytes>& range) {
+        [](const interval<managed_bytes>& range) {
             auto int64_from_be_bytes = [](const managed_bytes& int_bytes) -> int64_t {
                 if (int_bytes.size() != 8) {
                     throw std::runtime_error("token restriction value should be 8 bytes");
@@ -1710,7 +2585,7 @@ std::vector<query::clustering_range> statement_restrictions::get_clustering_boun
     if (_clustering_prefix_restrictions.empty()) {
         return {query::clustering_range::make_open_ended_both_sides()};
     }
-    if (find_binop(_clustering_prefix_restrictions[0], expr::is_multi_column)) {
+    if (find_binop(_clustering_prefix_restrictions[0], is_multi_column)) {
         bool all_natural = true, all_reverse = true; ///< Whether column types are reversed or natural.
         for (auto& r : _clustering_prefix_restrictions) { // TODO: move to constructor, do only once.
             using namespace expr;
@@ -1777,8 +2652,8 @@ bool statement_restrictions::need_filtering() const {
         // Can't calculate the token value, so a naive base-table query must be filtered.  Same for any index tables,
         // except if there's only one restriction supported by an index.
         return !(npart == 1 && _has_queriable_pk_index &&
-                 expr::is_empty_restriction(_clustering_columns_restrictions) &&
-                 expr::is_empty_restriction(_nonprimary_key_restrictions));
+                 is_empty_restriction(_clustering_columns_restrictions) &&
+                 is_empty_restriction(_nonprimary_key_restrictions));
     }
     if (pk_restrictions_need_filtering()) {
         // We most likely cannot calculate token(s).  Neither base-table nor index-table queries can avoid filtering.
@@ -1793,7 +2668,7 @@ bool statement_restrictions::need_filtering() const {
     if (nreg == 1) { // Single non-key restriction supported by an index.
         // Will the index-table query require filtering?  That depends on whether its clustering key is restricted to a
         // continuous range.  Recall that this clustering key is (token, pk, ck) of the base table.
-        if (npart == 0 && expr::is_empty_restriction(_clustering_columns_restrictions)) {
+        if (npart == 0 && is_empty_restriction(_clustering_columns_restrictions)) {
             return false; // No clustering key restrictions => whole partitions.
         }
         return !token_known(*this) || clustering_key_restrictions_need_filtering()
@@ -1832,22 +2707,11 @@ bool statement_restrictions::need_filtering() const {
     return clustering_key_restrictions_need_filtering();
 }
 
-void statement_restrictions::validate_secondary_index_selections(bool selects_only_static_columns) {
+void statement_restrictions::validate_secondary_index_selections(bool selects_only_static_columns) const {
     if (key_is_in_relation()) {
         throw exceptions::invalid_request_exception(
             "Index cannot be used if the partition key is restricted with IN clause. This query would require filtering instead.");
     }
-}
-
-const expr::single_column_restrictions_map& statement_restrictions::get_single_column_partition_key_restrictions() const {
-    return _single_column_partition_key_restrictions;
-}
-
-/**
- * @return clustering key restrictions split into single column restrictions (e.g. for filtering support).
- */
-const expr::single_column_restrictions_map& statement_restrictions::get_single_column_clustering_key_restrictions() const {
-    return _single_column_clustering_key_restrictions;
 }
 
 void statement_restrictions::prepare_indexed_global(const schema& idx_tbl_schema) {
@@ -1877,14 +2741,27 @@ void statement_restrictions::prepare_indexed_global(const schema& idx_tbl_schema
         (*_idx_tbl_ck_prefix)[pos] = replace_column_def(e, &idx_tbl_schema.clustering_column_at(pos));
     }
 
+    if (std::ranges::any_of(*_idx_tbl_ck_prefix | std::views::drop(1), is_empty_restriction)) {
+        // If the partition key is not fully restricted, the index clustering key is of no use.
+        (*_idx_tbl_ck_prefix) = std::vector<expr::expression>();
+        return;
+    }
+
     add_clustering_restrictions_to_idx_ck_prefix(idx_tbl_schema);
+
+    auto pk_expressions = (*_idx_tbl_ck_prefix)
+            | std::views::drop(1)   // skip the token restriction
+            | std::views::take(_schema->partition_key_size()) // take only the partition key restrictions
+            | std::views::transform(expr::as<expr::binary_operator>) // we know it's an EQ
+            | std::views::transform(std::mem_fn(&expr::binary_operator::rhs)) // "solve" for the column value
+            | std::ranges::to<std::vector>();
+
+    auto token_func = make_shared<cql3::functions::token_fct>(_schema);
 
     (*_idx_tbl_ck_prefix)[0] = binary_operator(
             column_value(token_column),
             oper_t::EQ,
-            // TODO: This should be a unique marker whose value we set at execution time.  There is currently no
-            // handy mechanism for doing that in query_options.
-            expr::constant::make_null(token_column->type));
+            expr::function_call{.func = std::move(token_func), .args = std::move(pk_expressions)});
 }
 
 void statement_restrictions::prepare_indexed_local(const schema& idx_tbl_schema) {
@@ -1914,7 +2791,7 @@ void statement_restrictions::prepare_indexed_local(const schema& idx_tbl_schema)
 
 void statement_restrictions::add_clustering_restrictions_to_idx_ck_prefix(const schema& idx_tbl_schema) {
     for (const auto& e : _clustering_prefix_restrictions) {
-        if (find_binop(_clustering_prefix_restrictions[0], expr::is_multi_column)) {
+        if (find_binop(_clustering_prefix_restrictions[0], is_multi_column)) {
             // TODO: We could handle single-element tuples, eg. `(c)>=(123)`.
             break;
         }
@@ -1933,12 +2810,12 @@ void statement_restrictions::add_clustering_restrictions_to_idx_ck_prefix(const 
 // need filtering but c2 does so num_prefix_columns_that_need_not_be_filtered
 // will be 1.
 unsigned int statement_restrictions::num_clustering_prefix_columns_that_need_not_be_filtered() const {
-    if (expr::contains_multi_column_restriction(_clustering_columns_restrictions)) {
+    if (contains_multi_column_restriction(_clustering_columns_restrictions)) {
         return 0;
     }
 
-    expr::single_column_restrictions_map column_restrictions =
-        expr::get_single_column_restrictions_map(_clustering_columns_restrictions);
+    single_column_restrictions_map column_restrictions =
+        get_single_column_restrictions_map(_clustering_columns_restrictions);
 
     // Restrictions currently need filtering in three cases:
     // 1. any of them is a CONTAINS restriction
@@ -1946,7 +2823,7 @@ unsigned int statement_restrictions::num_clustering_prefix_columns_that_need_not
     // 3. a SLICE restriction isn't on a last place
     column_id position = 0;
     unsigned int count = 0;
-    for (const auto& restriction : column_restrictions | boost::adaptors::map_values) {
+    for (const auto& restriction : column_restrictions | std::views::values) {
         if (find_needs_filtering(restriction)
             || position != get_the_only_column(restriction).col->id) {
             return count;
@@ -1966,25 +2843,6 @@ std::vector<query::clustering_range> statement_restrictions::get_global_index_cl
         on_internal_error(
                 rlogger, "statement_restrictions::get_global_index_clustering_ranges called with unprepared index");
     }
-    std::vector<managed_bytes> pk_value(_schema->partition_key_size());
-    for (const auto& e : _partition_range_restrictions) {
-        const auto col = expr::as<column_value>(find(e, oper_t::EQ)->lhs).col;
-        const auto vals = std::get<value_list>(possible_column_values(col, e, options));
-        if (vals.empty()) { // Case of C=1 AND C=2.
-            return {};
-        }
-        pk_value[_schema->position(*col)] = std::move(vals[0]);
-    }
-    std::vector<bytes> pkv_linearized(pk_value.size());
-    std::transform(pk_value.cbegin(), pk_value.cend(), pkv_linearized.begin(),
-                   [] (const managed_bytes& mb) { return to_bytes(mb); });
-    auto& token_column = idx_tbl_schema.clustering_column_at(0);
-    bytes token_bytes = token_column.get_computation().compute_value(*_schema, pkv_linearized);
-
-    // WARNING: We must not yield to another fiber from here until the function's end, lest this RHS be
-    // overwritten.
-    const_cast<expr::expression&>(expr::as<binary_operator>((*_idx_tbl_ck_prefix)[0]).rhs) =
-            expr::constant(raw_value::make_value(token_bytes), token_column.type);
 
     // Multi column restrictions are not added to _idx_tbl_ck_prefix, they are handled later by filtering.
     return get_single_column_clustering_bounds(options, idx_tbl_schema, *_idx_tbl_ck_prefix);
@@ -2052,6 +2910,20 @@ void statement_restrictions::validate_primary_key(const query_options& options) 
 
 const std::unordered_set<const column_definition*> statement_restrictions::get_not_null_columns() const {
     return _not_null_columns;
+}
+
+statement_restrictions
+analyze_statement_restrictions(
+        data_dictionary::database db,
+        schema_ptr schema,
+        statements::statement_type type,
+        const expr::expression& where_clause,
+        prepare_context& ctx,
+        bool selects_only_static_columns,
+        bool for_view,
+        bool allow_filtering,
+        check_indexes do_check_indexes) {
+    return statement_restrictions(db, std::move(schema), type, where_clause, ctx, selects_only_static_columns, for_view, allow_filtering, do_check_indexes);
 }
 
 } // namespace restrictions

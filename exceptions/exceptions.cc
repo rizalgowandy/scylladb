@@ -5,19 +5,16 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
-#include <sstream>
-
 #include "exceptions.hh"
-#include "log.hh"
+
+#include "bytes.hh"
+#include <seastar/core/format.hh>
+#include <seastar/util/log.hh>
 
 namespace exceptions {
-
-std::ostream& operator<<(std::ostream& os, exception_code ec) {
-    return os << static_cast<int32_t>(ec);
-}
 
 truncate_exception::truncate_exception(std::exception_ptr ep)
     : request_execution_exception(exceptions::exception_code::TRUNCATE_ERROR, format("Error during truncate: {}", ep))
@@ -50,9 +47,9 @@ const std::unordered_map<exception_code, sstring>& exception_map() {
 }
 
 template<typename... Args>
-static inline sstring prepare_message(const char* fmt, Args&&... args) noexcept {
+static inline sstring prepare_message(fmt::format_string<Args...> fmt, Args&&... args) noexcept {
     try {
-        return format(fmt, std::forward<Args>(args)...);
+        return seastar::format(fmt, std::forward<Args>(args)...);
     } catch (...) {
         return sstring();
     }
@@ -63,8 +60,8 @@ unavailable_exception::unavailable_exception(db::consistency_level cl, int32_t r
         cl, required, alive)
     {}
 
-request_timeout_exception::request_timeout_exception(exception_code code, const sstring& ks, const sstring& cf, db::consistency_level consistency, int32_t received, int32_t block_for) noexcept
-    : cassandra_exception{code, prepare_message("Operation timed out for {}.{} - received only {} responses from {} CL={}.", ks, cf, received, block_for, consistency)}
+read_write_timeout_exception::read_write_timeout_exception(exception_code code, const sstring& ks, const sstring& cf, db::consistency_level consistency, int32_t received, int32_t block_for) noexcept
+    : request_timeout_exception{code, prepare_message("Operation timed out for {}.{} - received only {} responses from {} CL={}.", ks, cf, received, block_for, consistency)}
     , consistency{consistency}
     , received{received}
     , block_for{block_for}

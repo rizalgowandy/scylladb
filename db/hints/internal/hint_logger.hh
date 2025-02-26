@@ -4,12 +4,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #pragma once
 
 // Scylla includes.
-#include "log.hh"
+#include "utils/log.hh"
 
 namespace db::hints {
 namespace internal {

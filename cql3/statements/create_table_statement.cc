@@ -5,14 +5,14 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 
+#include "utils/assert.hh"
 #include <inttypes.h>
 #include <boost/regex.hpp>
 
-#include <boost/range/adaptor/map.hpp>
 #include <boost/range/algorithm/adjacent_find.hpp>
 #include <seastar/core/coroutine.hh>
 
@@ -23,8 +23,8 @@
 #include "auth/resource.hh"
 #include "auth/service.hh"
 #include "schema/schema_builder.hh"
-#include "db/extensions.hh"
 #include "data_dictionary/data_dictionary.hh"
+#include "service/raft/raft_group0_client.hh"
 #include "types/user.hh"
 #include "gms/feature_service.hh"
 #include "service/migration_manager.hh"
@@ -60,6 +60,7 @@ future<> create_table_statement::check_access(query_processor& qp, const service
 std::vector<column_definition> create_table_statement::get_columns() const
 {
     std::vector<column_definition> column_defs;
+    column_defs.reserve(_columns.size());
     for (auto&& col : _columns) {
         column_kind kind = column_kind::regular_column;
         if (_static_columns.contains(col.first)) {
@@ -71,26 +72,26 @@ std::vector<column_definition> create_table_statement::get_columns() const
 }
 
 future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>>
-create_table_statement::prepare_schema_mutations(query_processor& qp, api::timestamp_type ts) const {
-    ::shared_ptr<cql_transport::event::schema_change> ret;
+create_table_statement::prepare_schema_mutations(query_processor& qp, const query_options&, api::timestamp_type ts) const {
     std::vector<mutation> m;
 
     try {
         m = co_await service::prepare_new_column_family_announcement(qp.proxy(), get_cf_meta_data(qp.db()), ts);
-
-        using namespace cql_transport;
-        ret = ::make_shared<event::schema_change>(
-            event::schema_change::change_type::CREATED,
-            event::schema_change::target_type::TABLE,
-            keyspace(),
-            column_family());
     } catch (const exceptions::already_exists_exception& e) {
         if (!_if_not_exists) {
             co_return coroutine::exception(std::current_exception());
         }
     }
 
-    co_return std::make_tuple(std::move(ret), std::move(m), std::vector<sstring>());
+    // If an IF NOT EXISTS clause was used and resource was already created
+    // we shouldn't emit created event. However it interacts badly with
+    // concurrent clients creating resources. The client seeing no create event
+    // assumes resource already previously existed and proceeds with its logic
+    // which may depend on that resource. But it may send requests to nodes which
+    // are not yet aware of new schema or client's metadata may be outdated.
+    // To force synchronization always emit the event (see
+    // github.com/scylladb/scylladb/issues/16909).
+    co_return std::make_tuple(created_event(), std::move(m), std::vector<sstring>());
 }
 
 /**
@@ -122,12 +123,12 @@ void create_table_statement::apply_properties_to(schema_builder& builder, const 
         addColumnMetadataFromAliases(cfmd, Collections.singletonList(valueAlias), defaultValidator, ColumnDefinition.Kind.COMPACT_VALUE);
 #endif
 
-    _properties->apply_to_builder(builder, _properties->make_schema_extensions(db.extensions()));
+    _properties->apply_to_builder(builder, _properties->make_schema_extensions(db.extensions()), db, keyspace());
 }
 
 void create_table_statement::add_column_metadata_from_aliases(schema_builder& builder, std::vector<bytes> aliases, const std::vector<data_type>& types, column_kind kind) const
 {
-    assert(aliases.size() == types.size());
+    SCYLLA_ASSERT(aliases.size() == types.size());
     for (size_t i = 0; i < aliases.size(); i++) {
         if (!aliases[i].empty()) {
             builder.with_column(aliases[i], types[i], kind);
@@ -142,15 +143,17 @@ create_table_statement::prepare(data_dictionary::database db, cql_stats& stats) 
     abort();
 }
 
-future<> create_table_statement::grant_permissions_to_creator(const service::client_state& cs) const {
-    return do_with(auth::make_data_resource(keyspace(), column_family()), [&cs](const auth::resource& r) {
-        return auth::grant_applicable_permissions(
+future<> create_table_statement::grant_permissions_to_creator(const service::client_state& cs, service::group0_batch& mc) const {
+    auto resource = auth::make_data_resource(keyspace(), column_family());
+    try {
+        co_await auth::grant_applicable_permissions(
                 *cs.get_auth_service(),
                 *cs.user(),
-                r).handle_exception_type([](const auth::unsupported_authorization_operation&) {
-            // Nothing.
-        });
-    });
+                resource,
+                mc);
+    } catch (const auth::unsupported_authorization_operation&) {
+        // Nothing.
+    }
 }
 
 create_table_statement::raw_statement::raw_statement(cf_name name, bool if_not_exists)
@@ -181,13 +184,29 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
     if (_properties.properties()->get_synchronous_updates_flag()) {
         throw exceptions::invalid_request_exception(format("The synchronous_updates option is only applicable to materialized views, not to base tables"));
     }
+    std::vector<sstring> stmt_warnings;
+    auto stmt_warning = [&] (sstring msg) {
+        if (this_shard_id() == 0) {
+            mylogger.warn("{}: {}", cf_name, msg);
+        }
+        stmt_warnings.emplace_back(std::move(msg));
+    };
     std::optional<sstring> warning = check_restricted_table_properties(db, std::nullopt, keyspace(), column_family(), *_properties.properties());
     if (warning) {
+        // FIXME: should this warning be returned to the caller?
+        // See https://github.com/scylladb/scylladb/issues/20945
         mylogger.warn("{}", *warning);
     }
     const bool has_default_ttl = _properties.properties()->get_default_time_to_live() > 0;
 
     auto stmt = ::make_shared<create_table_statement>(*_cf_name, _properties.properties(), _if_not_exists, _static_columns, _properties.properties()->get_id());
+
+    bool ks_uses_tablets;
+    try {
+        ks_uses_tablets = db.find_keyspace(keyspace()).get_replication_strategy().uses_tablets();
+    } catch (const data_dictionary::no_such_keyspace& e) {
+        throw exceptions::invalid_request_exception("Cannot create a table in a non-existent keyspace: " + keyspace());
+    }
 
     std::optional<std::map<bytes, data_type>> defined_multi_cell_columns;
     for (auto&& entry : _definitions) {
@@ -198,6 +217,10 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
             throw exceptions::invalid_request_exception("Cannot set default_time_to_live on a table with counters");
         }
 
+        if (ks_uses_tablets && pt.is_counter()) {
+            throw exceptions::invalid_request_exception(format("Cannot use the 'counter' type for table {}.{}: Counters are not yet supported with tablets", keyspace(), cf_name));
+        }
+
         if (pt.get_type()->is_multi_cell()) {
             if (pt.get_type()->is_user_type()) {
                 // check for multi-cell types (non-frozen UDTs or collections) inside a non-frozen UDT
@@ -205,13 +228,9 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
                 for (auto&& inner: type->all_types()) {
                     if (inner->is_multi_cell()) {
                         // a nested non-frozen UDT should have already been rejected when defining the type
-                        assert(inner->is_collection());
+                        SCYLLA_ASSERT(inner->is_collection());
                         throw exceptions::invalid_request_exception("Non-frozen UDTs with nested non-frozen collections are not supported");
                     }
-                }
-
-                if (!db.features().nonfrozen_udts) {
-                    throw exceptions::invalid_request_exception("Non-frozen UDT support is not enabled");
                 }
             }
 
@@ -229,6 +248,12 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
     }
 
     stmt->_use_compact_storage = _properties.use_compact_storage();
+    if (stmt->_use_compact_storage) {
+        if (!db.get_config().enable_create_table_with_compact_storage()) {
+            throw exceptions::invalid_request_exception("Support for the deprecated feature of 'CREATE TABLE WITH COMPACT STORAGE' is disabled and will eventually be removed in a future version.  To enable, set the 'enable_create_table_with_compact_storage' config option to 'true'.");
+        }
+        stmt_warning("CREATE TABLE WITH COMPACT STORAGE is deprecated and will eventually be removed in a future version.");
+    }
 
     auto& key_aliases = _key_aliases[0];
     std::vector<data_type> key_types;
@@ -332,8 +357,8 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
 #endif
         } else {
             if (stmt->_columns.size() > 1) {
-                throw exceptions::invalid_request_exception(format("COMPACT STORAGE with composite PRIMARY KEY allows no more than one column not part of the PRIMARY KEY (got: {})",
-                    fmt::join(stmt->_columns | boost::adaptors::map_keys, ", ")));
+                throw exceptions::invalid_request_exception(seastar::format("COMPACT STORAGE with composite PRIMARY KEY allows no more than one column not part of the PRIMARY KEY (got: {})",
+                    fmt::join(stmt->_columns | std::views::keys, ", ")));
             }
 #if 0
             Map.Entry<ColumnIdentifier, AbstractType> lastEntry = stmt.columns.entrySet().iterator().next();
@@ -379,7 +404,7 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
         }
     }
 
-    return std::make_unique<prepared_statement>(stmt);
+    return std::make_unique<prepared_statement>(audit_info(), stmt, std::move(stmt_warnings));
 }
 
 data_type create_table_statement::raw_statement::get_type_and_remove(column_map_type& columns, ::shared_ptr<column_identifier> t)
@@ -453,6 +478,9 @@ std::optional<sstring> check_restricted_table_properties(
     // Evaluate whether the strategy to evaluate was explicitly passed
     auto cs = (strategy) ? strategy : current_strategy;
 
+    if (cs == sstables::compaction_strategy_type::in_memory) {
+        throw exceptions::configuration_exception(format("{} has been deprecated.", sstables::compaction_strategy::name(*cs)));
+    }
     if (cs == sstables::compaction_strategy_type::time_window) {
         std::map<sstring, sstring> options = (strategy) ? cfprops.get_compaction_type_options() : (*schema)->compaction_strategy_options();
         sstables::time_window_compaction_strategy_options twcs_options(options);
@@ -494,6 +522,18 @@ std::optional<sstring> check_restricted_table_properties(
         }
    }
     return std::nullopt;
+}
+
+::shared_ptr<schema_altering_statement::event_t> create_table_statement::created_event() const {
+    return make_shared<event_t>(
+            event_t::change_type::CREATED,
+            event_t::target_type::TABLE,
+            keyspace(),
+            column_family());
+}
+
+audit::statement_category create_table_statement::raw_statement::category() const {
+    return audit::statement_category::DDL;
 }
 
 }

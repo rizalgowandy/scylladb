@@ -2,6 +2,7 @@ add_library(sstables STATIC)
 target_sources(sstables
   PRIVATE
     compress.cc
+    checksummed_data_source.cc
     integrity_checked_file_impl.cc
     kl/reader.cc
     metadata_collector.cc
@@ -31,8 +32,9 @@ target_link_libraries(sstables
   PRIVATE
     readers
     tracing
+    absl::headers
     libdeflate::libdeflate
     ZLIB::ZLIB)
 
-check_headers(check-headers streaming
+check_headers(check-headers sstables
   GLOB_RECURSE ${CMAKE_CURRENT_SOURCE_DIR}/*.hh)

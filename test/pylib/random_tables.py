@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2022-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 """This module provides helper classes to manage CQL tables, perform random schema changes,
 and verify expected current schema.
@@ -40,7 +40,8 @@ from typing import Optional, Type, List, Set, Union, TYPE_CHECKING
 if TYPE_CHECKING:
     from cassandra.cluster import Session as CassandraSession            # type: ignore
     from test.pylib.manager_client import ManagerClient
-from test.pylib.util import get_available_host, read_barrier
+from test.pylib.rest_client import get_host_api_address, read_barrier
+from test.pylib.util import get_available_host
 
 
 logger = logging.getLogger('random_tables')
@@ -249,23 +250,39 @@ class RandomTable():
         await self.manager.cql.run_async(f"DROP INDEX {self.keyspace}.{name}")
         self.removed_indexes.add(name)
 
+    async def enable_cdc(self) -> None:
+        assert self.manager.cql is not None
+        await self.manager.cql.run_async(f"ALTER TABLE {self.full_name} WITH cdc = {{ 'enabled' : true }}")
+
+    async def disable_cdc(self) -> None:
+        assert self.manager.cql is not None
+        await self.manager.cql.run_async(f"ALTER TABLE {self.full_name} WITH cdc = {{ 'enabled' : false }}")
+
     def __str__(self):
         return self.full_name
 
 
 class RandomTables():
     """A list of managed random tables"""
+
     def __init__(self, test_name: str, manager: ManagerClient, keyspace: str,
-                 replication_factor: int):
+                 replication_factor: int,
+                 dc_replication_factor: dict[str, int] = None,
+                 enable_tablets: None | bool = None):
+        keyspace_query = f"CREATE KEYSPACE IF NOT EXISTS {keyspace} WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', 'replication_factor' : {replication_factor}}}"
+        if enable_tablets is not None:
+            enable_tablets = str(enable_tablets).lower()
+            keyspace_query += f" AND TABLETS = {{'enabled': {enable_tablets} }}"
         self.test_name = test_name
         self.manager = manager
         self.keyspace = keyspace
         self.tables: List[RandomTable] = []
         self.removed_tables: List[RandomTable] = []
         assert self.manager.cql is not None
-        self.manager.cql.execute(f"CREATE KEYSPACE {keyspace} WITH REPLICATION = "
-                                 "{ 'class' : 'NetworkTopologyStrategy', "
-                                 f"'replication_factor' : {replication_factor} }}")
+        if dc_replication_factor is not None:
+            for key, val in dc_replication_factor.items():
+                keyspace_query = keyspace_query[:-1] + f",'{key}': {val}}}"
+        self.manager.cql.execute(keyspace_query)
 
     async def add_tables(self, ntables: int = 1, ncolumns: int = 5, if_not_exists: bool = False) -> None:
         """Add random tables to the list.
@@ -284,6 +301,12 @@ class RandomTables():
         await table.create(if_not_exists)
         self.tables.append(table)
         return table
+
+    async def add_udt(self, name: str, cmd: str) -> None:
+        await self.manager.cql.run_async(f"CREATE TYPE {self.keyspace}.{name} {cmd}")
+
+    async def drop_udt(self, name) -> None:
+        await self.manager.cql.run_async(f"DROP TYPE {self.keyspace}.{name}")
 
     def __getitem__(self, pos: int) -> RandomTable:
         return self.tables[pos]
@@ -337,7 +360,7 @@ class RandomTables():
             # Issue a read barrier on some node and then keep using that node to do the queries.
             # This ensures that the queries return recent data (at least all data committed
             # when `verify_schema` was called).
-            await read_barrier(cql, host)
+            await read_barrier(self.manager.api, get_host_api_address(host))
 
         res1 = {row.table_name for row in await cql.run_async(cql_stmt1, host=host)}
         assert not tables - res1, f"Tables {tables - res1} not present"

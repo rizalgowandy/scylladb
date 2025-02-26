@@ -35,9 +35,6 @@ i3en instances
 ^^^^^^^^^^^^^^
 i3en instances have up to 4x the networking bandwidth of i3 instances, enabling up to 100 Gbps of sustained network bandwidth. 
 
-i3en support is available for ScyllaDB Enterprise 2019.1.1 and higher and ScyllaDB Open Source 3.1 and higher. 
-
-
 ===========================  ===========  ============  =====================
 Model	                     vCPU         Mem (GB)      Storage (NVMe SSD)
 ===========================  ===========  ============  =====================
@@ -70,8 +67,6 @@ See `Amazon EC2 I3en Instances <https://aws.amazon.com/ec2/instance-types/i3en/>
 
 i4i instances
 ^^^^^^^^^^^^^^
-i4i support is available for ScyllaDB Open Source 5.0 and later and ScyllaDB Enterprise 2021.1.10 and later.
-
 ===========================  ===========  ============  =====================
 Model	                     vCPU         Mem (GB)      Storage (NVMe SSD)
 ===========================  ===========  ============  =====================
@@ -115,7 +110,7 @@ Google Compute Engine (GCE)
 -----------------------------------
 
 Pick a zone where Haswell CPUs are found. Local SSD performance offers, according to Google, less than 1 ms of latency and up to 680,000 read IOPS and 360,000 write IOPS.
-Image with NVMe disk interface is recommended, CentOS 7 for ScyllaDB Enterprise 2020.1 and older, and Ubuntu 20 for 2021.1 and later.  
+Image with NVMe disk interface is recommended.
 (`More info <https://cloud.google.com/compute/docs/disks/local-ssd>`_)
 
 Recommended instances types are `n1-highmem <https://cloud.google.com/compute/docs/general-purpose-machines#n1_machines>`_ and `n2-highmem <https://cloud.google.com/compute/docs/general-purpose-machines#n2_machines>`_
@@ -180,7 +175,7 @@ Recommended instances types are `n1-highmem <https://cloud.google.com/compute/do
    * - n2-highmem-32
      - 32
      - 256
-     - 6,000
+     - 9,000
    * - n2-highmem-48
      - 48
      - 384

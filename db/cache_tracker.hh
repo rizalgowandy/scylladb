@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -26,7 +26,7 @@ namespace cache {
 
 class autoupdating_underlying_reader;
 class cache_streamed_mutation;
-class cache_flat_mutation_reader;
+class cache_mutation_reader;
 class read_context;
 class lsa_manager;
 
@@ -38,7 +38,7 @@ public:
     friend class row_cache;
     friend class cache::read_context;
     friend class cache::autoupdating_underlying_reader;
-    friend class cache::cache_flat_mutation_reader;
+    friend class cache::cache_mutation_reader;
     struct stats {
         uint64_t partition_hits;
         uint64_t partition_misses;

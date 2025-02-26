@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #pragma once
 
@@ -13,7 +13,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/distributed.hh>
 #include <seastar/core/abort_source.hh>
-#include "log.hh"
+#include "utils/log.hh"
 #include "seastarx.hh"
 #include <boost/program_options.hpp>
 
@@ -35,7 +35,9 @@ extern logging::logger startlog;
 
 class bad_configuration_error : public std::exception {};
 
-std::set<gms::inet_address> get_seeds_from_db_config(const db::config& cfg, gms::inet_address broadcast_address);
+[[nodiscard]] std::set<gms::inet_address> get_seeds_from_db_config(const db::config& cfg,
+                                                                   gms::inet_address broadcast_address,
+                                                                   bool fail_on_lookup_error);
 
 class service_set {
 public:

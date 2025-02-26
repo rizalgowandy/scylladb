@@ -3,19 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "index_entry.hh"
-#include <vector>
 #include <seastar/core/future.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/shared_future.hh>
 #include <seastar/coroutine/maybe_yield.hh>
-#include "utils/loading_shared_values.hh"
-#include "utils/chunked_vector.hh"
+#include "utils/assert.hh"
 #include "utils/bptree.hh"
 #include "utils/lru.hh"
 #include "utils/lsa/weak_ptr.hh"
@@ -60,7 +59,7 @@ private:
                 // Live entry_ptr should keep the entry alive, except when the entry failed on loading.
                 // In that case, entry_ptr holders are not supposed to use the pointer, so it's safe
                 // to nullify those entry_ptrs.
-                assert(!ready());
+                SCYLLA_ASSERT(!ready());
             }
         }
 
@@ -209,7 +208,7 @@ public:
             return with_allocator(_region.allocator(), [&] {
                 auto it_and_flag = _cache.emplace(key, this, key);
                 entry &cp = *it_and_flag.first;
-                assert(it_and_flag.second);
+                SCYLLA_ASSERT(it_and_flag.second);
                 try {
                     return share(cp);
                 } catch (...) {
@@ -224,7 +223,7 @@ public:
         return futurize_invoke(loader, key).then_wrapped([this, key, ptr = std::move(ptr)] (auto&& f) mutable {
             entry& e = ptr.get_entry();
             try {
-                partition_index_page&& page = f.get0();
+                partition_index_page&& page = f.get();
                 e.promise()->set_value();
                 e.set_page(std::move(page));
                 _stats.used_bytes += e.size_in_allocator();
@@ -249,20 +248,42 @@ public:
     // Evicts all unreferenced entries.
     future<> evict_gently() {
         auto i = _cache.begin();
-        while (i != _cache.end()) {
+        std::optional<partition_index_page> partial_page;
+        auto clear_on_exception = defer([&] {
             with_allocator(_region.allocator(), [&] {
-                if (i->is_referenced()) {
-                    ++i;
-                } else {
-                    _lru.remove(*i);
-                    on_evicted(*i);
-                    i = i.erase(key_less_comparator());
-                }
+                partial_page.reset();
             });
-            if (need_preempt() && i != _cache.end()) {
-                auto key = i->key();
-                co_await coroutine::maybe_yield();
-                i = _cache.lower_bound(key);
+        });
+        while (partial_page || i != _cache.end()) {
+            if (partial_page) {
+                auto preempted = with_allocator(_region.allocator(), [&] {
+                    while (!partial_page->empty()) {
+                        partial_page->clear_one_entry();
+                        if (need_preempt()) {
+                            return true;
+                        }
+                    }
+                    partial_page.reset();
+                    return false;
+                });
+                if (preempted) {
+                    auto key = (i != _cache.end()) ? std::optional(i->key()) : std::nullopt;
+                    co_await coroutine::maybe_yield();
+                    i = key ? _cache.lower_bound(*key) : _cache.end();
+                }
+            } else {
+                with_allocator(_region.allocator(), [&] {
+                    if (i->is_referenced()) {
+                        ++i;
+                    } else {
+                        _lru.remove(*i);
+                        on_evicted(*i);
+                        if (i->ready()) {
+                            partial_page = std::move(i->page());
+                        }
+                        i = i.erase(key_less_comparator());
+                    }
+                });
             }
         }
     }

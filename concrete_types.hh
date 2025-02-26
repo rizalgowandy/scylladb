@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -15,6 +15,7 @@
 #include "types/map.hh"
 #include "types/set.hh"
 #include "types/tuple.hh"
+#include "types/vector.hh"
 #include "types/user.hh"
 #include "utils/big_decimal.hh"
 
@@ -80,17 +81,17 @@ struct duration_type_impl final : public concrete_type<cql_duration> {
 
 struct timestamp_type_impl final : public simple_type_impl<db_clock::time_point> {
     timestamp_type_impl();
-    static db_clock::time_point from_sstring(sstring_view s);
+    static db_clock::time_point from_string_view(std::string_view s);
 };
 
 struct simple_date_type_impl final : public simple_type_impl<uint32_t> {
     simple_date_type_impl();
-    static uint32_t from_sstring(sstring_view s);
+    static uint32_t from_string_view(std::string_view s);
 };
 
 struct time_type_impl final : public simple_type_impl<int64_t> {
     time_type_impl();
-    static int64_t from_sstring(sstring_view s);
+    static int64_t from_string_view(std::string_view s);
 };
 
 struct string_type_impl : public concrete_type<sstring> {
@@ -122,7 +123,7 @@ sstring timestamp_to_json_string(const timestamp_date_base_class& t, const bytes
 
 struct timeuuid_type_impl final : public concrete_type<utils::UUID> {
     timeuuid_type_impl();
-    static utils::UUID from_sstring(sstring_view s);
+    static utils::UUID from_string_view(std::string_view s);
 };
 
 struct varint_type_impl final : public concrete_type<utils::multiprecision_int> {
@@ -131,13 +132,12 @@ struct varint_type_impl final : public concrete_type<utils::multiprecision_int> 
 
 struct inet_addr_type_impl final : public concrete_type<seastar::net::inet_address> {
     inet_addr_type_impl();
-    static sstring to_sstring(const seastar::net::inet_address& addr);
-    static seastar::net::inet_address from_sstring(sstring_view s);
+    static seastar::net::inet_address from_string_view(std::string_view s);
 };
 
 struct uuid_type_impl final : public concrete_type<utils::UUID> {
     uuid_type_impl();
-    static utils::UUID from_sstring(sstring_view s);
+    static utils::UUID from_string_view(std::string_view s);
 };
 
 template <typename Func> using visit_ret_type = std::invoke_result_t<Func, const ascii_type_impl&>;
@@ -171,11 +171,12 @@ template <typename Func> concept CanHandleAllTypes = requires(Func f) {
     { f(*static_cast<const utf8_type_impl*>(nullptr)) }        -> std::same_as<visit_ret_type<Func>>;
     { f(*static_cast<const uuid_type_impl*>(nullptr)) }        -> std::same_as<visit_ret_type<Func>>;
     { f(*static_cast<const varint_type_impl*>(nullptr)) }      -> std::same_as<visit_ret_type<Func>>;
+    { f(*static_cast<const vector_type_impl*>(nullptr)) }      -> std::same_as<visit_ret_type<Func>>;
 };
 
 template<typename Func>
 requires CanHandleAllTypes<Func>
-static inline visit_ret_type<Func> visit(const abstract_type& t, Func&& f) {
+inline visit_ret_type<Func> visit(const abstract_type& t, Func&& f) {
     switch (t.get_kind()) {
     case abstract_type::kind::ascii:
         return f(*static_cast<const ascii_type_impl*>(&t));
@@ -233,6 +234,8 @@ static inline visit_ret_type<Func> visit(const abstract_type& t, Func&& f) {
         return f(*static_cast<const uuid_type_impl*>(&t));
     case abstract_type::kind::varint:
         return f(*static_cast<const varint_type_impl*>(&t));
+    case abstract_type::kind::vector:
+        return f(*static_cast<const vector_type_impl*>(&t));
     }
     __builtin_unreachable();
 }

@@ -3,14 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "serializer.hh"
 #include "schema/schema.hh"
-#include "db/extensions.hh"
 
 namespace db {
 
@@ -28,7 +27,7 @@ public:
         return ser::serialize_to_buffer<bytes>(_tags);
     }
     static std::map<sstring, sstring> deserialize(bytes_view buffer) {
-        return ser::deserialize_from_buffer(buffer, boost::type<std::map<sstring, sstring>>());
+        return ser::deserialize_from_buffer(buffer, std::type_identity<std::map<sstring, sstring>>());
     }
     const std::map<sstring, sstring>& tags() const {
         return _tags;

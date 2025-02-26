@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -21,7 +21,6 @@
 
 #include <seastar/util/indirect.hh>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 #include <set>
 #include <optional>
@@ -70,12 +69,11 @@ public:
 
     virtual future<> check_access(query_processor& qp, const service::client_state& state) const override;
 
-    future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>> prepare_schema_mutations(query_processor& qp, api::timestamp_type) const override;
-
+    future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>> prepare_schema_mutations(query_processor& qp, const query_options& options, api::timestamp_type) const override;
 
     virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats) override;
 
-    virtual future<> grant_permissions_to_creator(const service::client_state&) const override;
+    virtual future<> grant_permissions_to_creator(const service::client_state&, service::group0_batch&) const override;
 
     schema_ptr get_cf_meta_data(const data_dictionary::database) const;
 
@@ -88,6 +86,8 @@ private:
     void apply_properties_to(schema_builder& builder, const data_dictionary::database) const;
 
     void add_column_metadata_from_aliases(schema_builder& builder, std::vector<bytes> aliases, const std::vector<data_type>& types, column_kind kind) const;
+
+    ::shared_ptr<event_t> created_event() const;
 };
 
 class create_table_statement::raw_statement : public raw::cf_statement {
@@ -121,6 +121,8 @@ public:
     void add_key_aliases(const std::vector<::shared_ptr<column_identifier>> aliases);
 
     void add_column_alias(::shared_ptr<column_identifier> alias);
+protected:
+    virtual audit::statement_category category() const override;
 };
 
 std::optional<sstring> check_restricted_table_properties(

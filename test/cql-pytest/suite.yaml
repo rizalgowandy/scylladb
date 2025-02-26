@@ -1,4 +1,0 @@
-type: Python
-pool_size: 4
-dirties_cluster:
-  - test_native_transport

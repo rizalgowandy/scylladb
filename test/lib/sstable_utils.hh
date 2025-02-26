@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -13,7 +13,6 @@
 #include "sstables/sstables.hh"
 #include "sstables/shared_sstable.hh"
 #include "sstables/index_reader.hh"
-#include "sstables/binary_search.hh"
 #include "sstables/writer.hh"
 #include "compaction/compaction_manager.hh"
 #include "replica/memtable-sstable.hh"
@@ -45,10 +44,6 @@ public:
 
     summary& _summary() {
         return _sst->_components->summary;
-    }
-
-    future<temporary_buffer<char>> data_read(reader_permit permit, uint64_t pos, size_t len) {
-        return _sst->data_read(pos, len, std::move(permit));
     }
 
     std::unique_ptr<index_reader> make_index_reader(reader_permit permit) {
@@ -92,10 +87,6 @@ public:
         return _sst->read_statistics();
     }
 
-    statistics& get_statistics() {
-        return _sst->_components->statistics;
-    }
-
     future<> read_summary() noexcept {
         return _sst->read_summary();
     }
@@ -104,33 +95,8 @@ public:
         return _sst->read_summary_entry(i);
     }
 
-    summary& get_summary() {
-        return _sst->_components->summary;
-    }
-
-    summary move_summary() {
-        return std::move(_sst->_components->summary);
-    }
-
-    future<> read_toc() noexcept {
-        return _sst->read_toc();
-    }
-
     auto& get_components() {
         return _sst->_recognized_components;
-    }
-
-    template <typename T>
-    int binary_search(const dht::i_partitioner& p, const T& entries, const key& sk) {
-        return sstables::binary_search(p, entries, sk);
-    }
-
-    void change_generation_number(sstables::generation_type generation) {
-        _sst->_generation = generation;
-    }
-
-    void change_dir(sstring dir) {
-        _sst->_storage->change_dir_for_test(dir);
     }
 
     void set_data_file_size(uint64_t size) {
@@ -145,11 +111,13 @@ public:
         _sst->_run_identifier = identifier;
     }
 
-    future<> store() {
+    future<> store(sstring dir, sstables::generation_type generation) {
+        _sst->_generation = generation;
+        co_await _sst->_storage->change_dir_for_test(dir);
         _sst->_recognized_components.erase(component_type::Index);
         _sst->_recognized_components.erase(component_type::Data);
-        return seastar::async([sst = _sst] {
-            sst->open_sstable();
+        co_await seastar::async([sst = _sst] {
+            sst->open_sstable("test");
             sst->write_statistics();
             sst->write_compression();
             sst->write_filter();
@@ -184,8 +152,9 @@ public:
         _sst->_shards.push_back(this_shard_id());
     }
 
-    void rewrite_toc_without_scylla_component() {
-        _sst->_recognized_components.erase(component_type::Scylla);
+    void rewrite_toc_without_component(component_type component) {
+        SCYLLA_ASSERT(component != component_type::TOC);
+        _sst->_recognized_components.erase(component);
         remove_file(_sst->filename(component_type::TOC)).get();
         _sst->_storage->open(*_sst);
         _sst->seal_sstable(false).get();
@@ -204,12 +173,42 @@ public:
     }
 
     static future<> create_links(const sstable& sst, const sstring& dir) {
-        return sst._storage->create_links(sst, dir);
+        return sst._storage->create_links(sst, std::filesystem::path(dir));
     }
 
     future<> move_to_new_dir(sstring new_dir, generation_type new_generation) {
         co_await _sst->_storage->move(*_sst, std::move(new_dir), new_generation, nullptr);
         _sst->_generation = std::move(new_generation);
+    }
+
+    void create_bloom_filter(uint64_t estimated_partitions, double max_false_pos_prob = 0.1) {
+        _sst->_components->filter = utils::i_filter::get_filter(estimated_partitions, max_false_pos_prob, utils::filter_format::m_format);
+        _sst->_total_reclaimable_memory.reset();
+    }
+
+    void write_filter() {
+        _sst->_recognized_components.insert(component_type::Filter);
+        _sst->write_filter();
+    }
+
+    size_t total_reclaimable_memory_size() const {
+        return _sst->total_reclaimable_memory_size();
+    }
+
+    size_t reclaim_memory_from_components() {
+        return _sst->reclaim_memory_from_components();
+    }
+
+    void reload_reclaimed_components() {
+        _sst->reload_reclaimed_components().get();
+    }
+
+    const utils::filter_ptr& get_filter() const {
+        return _sst->_components->filter;
+    }
+
+    void set_digest(std::optional<uint32_t> digest) {
+        _sst->_components->digest = digest;
     }
 };
 
@@ -232,13 +231,13 @@ future<compaction_result> compact_sstables(test_env& env, sstables::compaction_d
                  std::function<shared_sstable()> creator, sstables::compaction_sstable_replacer_fn replacer = sstables::replacer_fn_no_op(),
                  can_purge_tombstones can_purge = can_purge_tombstones::yes);
 
-shared_sstable make_sstable_easy(test_env& env, flat_mutation_reader_v2 rd, sstable_writer_config cfg,
+shared_sstable make_sstable_easy(test_env& env, mutation_reader rd, sstable_writer_config cfg,
         sstables::generation_type gen, const sstable::version_types version = sstables::get_highest_sstable_version(), int expected_partition = 1, gc_clock::time_point = gc_clock::now());
 shared_sstable make_sstable_easy(test_env& env, lw_shared_ptr<replica::memtable> mt, sstable_writer_config cfg,
         sstables::generation_type gen, const sstable::version_types v = sstables::get_highest_sstable_version(), int estimated_partitions = 1, gc_clock::time_point = gc_clock::now());
 
 
-inline shared_sstable make_sstable_easy(test_env& env, flat_mutation_reader_v2 rd, sstable_writer_config cfg,
+inline shared_sstable make_sstable_easy(test_env& env, mutation_reader rd, sstable_writer_config cfg,
         const sstable::version_types version = sstables::get_highest_sstable_version(), int expected_partition = 1) {
     return make_sstable_easy(env, std::move(rd), std::move(cfg), env.new_generation(), version, expected_partition);
 }
@@ -248,3 +247,4 @@ inline shared_sstable make_sstable_easy(test_env& env, lw_shared_ptr<replica::me
 }
 
 lw_shared_ptr<replica::memtable> make_memtable(schema_ptr s, const std::vector<mutation>& muts);
+std::vector<replica::memtable*> active_memtables(replica::table& t);

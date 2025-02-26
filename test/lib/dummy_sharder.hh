@@ -3,17 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <boost/range/adaptor/map.hpp>
 #include "dht/token.hh"
 #include "dht/token-sharding.hh"
 
 // Shards tokens such that tokens are owned by shards in a round-robin manner.
-class dummy_sharder : public dht::sharder {
+class dummy_sharder : public dht::static_sharder {
     std::vector<dht::token> _tokens;
 
 public:
@@ -23,9 +22,9 @@ public:
     // ordered associative container (std::map) that has dht::token as keys.
     // Values will be ignored.
     template <typename T>
-    dummy_sharder(const dht::sharder& sharding, const std::map<dht::token, T>& something_by_token)
-        : sharder(sharding)
-        , _tokens(boost::copy_range<std::vector<dht::token>>(something_by_token | boost::adaptors::map_keys)) {
+    dummy_sharder(const dht::static_sharder& sharding, const std::map<dht::token, T>& something_by_token)
+        : dht::static_sharder(sharding)
+        , _tokens(something_by_token | std::views::keys | std::ranges::to<std::vector>()) {
     }
 
     virtual unsigned shard_of(const dht::token& t) const override;

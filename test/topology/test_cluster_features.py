@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2023-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 """
 Tests the cluster feature functionality.
@@ -130,6 +130,8 @@ async def test_joining_old_node_fails(manager: ManagerClient) -> None:
     servers = await manager.running_servers()
     await change_support_for_test_feature_and_restart(manager, servers, enable=True)
 
+    await manager.servers_see_each_other(servers)
+
     # Workaround for scylladb/python-driver#230 - the driver might not
     # reconnect after all nodes are stopped at once.
     cql = await reconnect_driver(manager)
@@ -199,7 +201,6 @@ async def test_partial_upgrade_can_be_finished_with_removenode(manager: ManagerC
 
     # Remove the last node
     await manager.server_stop(servers[-1].server_id)
-    await manager.server_not_sees_other_server(servers[0].ip_addr, servers[-1].ip_addr)
     await manager.remove_node(servers[0].server_id, servers[-1].server_id)
 
     # The feature should eventually become enabled

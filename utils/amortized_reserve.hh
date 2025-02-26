@@ -3,14 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <concepts>
 #include <vector>
-#include <memory>
 
 /// Represents a container which can preallocate space for future insertions
 /// which can be used to reduce the number of overall memory re-allocation and item movement.

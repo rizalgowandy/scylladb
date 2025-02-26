@@ -3,23 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
 #include <boost/test/unit_test.hpp>
-#include <boost/range/adaptor/map.hpp>
 
-#include "replica/database.hh"
-#include "types/user.hh"
-#include "db/view/view_builder.hh"
-
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
-#include "types/set.hh"
-#include "types/list.hh"
+#include "test/lib/eventually.hh"
+
+BOOST_AUTO_TEST_SUITE(view_schema_ckey_test)
 
 using namespace std::literals::chrono_literals;
 
@@ -32,7 +29,7 @@ SEASTAR_TEST_CASE(test_delete_single_column_in_view_clustering_key) {
 
         e.execute_cql("insert into cf (a, b, c, d) values (0, 0, 0, 0)").get();
         eventually([&] {
-        auto msg = e.execute_cql("select a, d, b, c from mv").get0();
+        auto msg = e.execute_cql("select a, d, b, c from mv").get();
         assert_that(msg).is_rows()
             .with_size(1)
             .with_row({ {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(0)} });
@@ -40,7 +37,7 @@ SEASTAR_TEST_CASE(test_delete_single_column_in_view_clustering_key) {
 
         e.execute_cql("delete c from cf where a = 0 and b = 0").get();
         eventually([&] {
-        auto msg = e.execute_cql("select a, d, b, c from mv").get0();
+        auto msg = e.execute_cql("select a, d, b, c from mv").get();
         assert_that(msg).is_rows()
             .with_size(1)
             .with_row({ {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(0)}, { } });
@@ -48,7 +45,7 @@ SEASTAR_TEST_CASE(test_delete_single_column_in_view_clustering_key) {
 
         e.execute_cql("delete d from cf where a = 0 and b = 0").get();
         eventually([&] {
-        auto msg = e.execute_cql("select a, d, b from mv").get0();
+        auto msg = e.execute_cql("select a, d, b from mv").get();
         assert_that(msg).is_rows()
             .with_size(0);
         });
@@ -73,7 +70,7 @@ SEASTAR_TEST_CASE(test_clustering_key_eq_restrictions) {
             e.execute_cql("insert into cf (a, b, c, d) values (1, 1, 1, 0)").get();
 
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(0)} },
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -83,7 +80,7 @@ SEASTAR_TEST_CASE(test_clustering_key_eq_restrictions) {
 
             e.execute_cql("update cf set d = 1 where a = 1 and b = 0 and c = 0").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(0)} },
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -93,7 +90,7 @@ SEASTAR_TEST_CASE(test_clustering_key_eq_restrictions) {
 
             e.execute_cql("update cf set d = 1 where a = 0 and b = 1 and c = 0").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(1)} },
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -103,7 +100,7 @@ SEASTAR_TEST_CASE(test_clustering_key_eq_restrictions) {
 
             e.execute_cql("delete from cf where a = 0 and b = 0 and c = 0").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(1)} },
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -113,7 +110,7 @@ SEASTAR_TEST_CASE(test_clustering_key_eq_restrictions) {
 
             e.execute_cql("delete from cf where a = 1 and b = 1 and c = 0").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(1)} },
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -122,7 +119,7 @@ SEASTAR_TEST_CASE(test_clustering_key_eq_restrictions) {
 
             e.execute_cql("delete from cf where a in (0, 1) and b = 1").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_size(0);
             });
 
@@ -150,7 +147,7 @@ SEASTAR_TEST_CASE(test_clustering_key_slice_restrictions) {
             e.execute_cql("insert into cf (a, b, c, d) values (1, 2, 1, 0)").get();
 
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(0)} },
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -160,7 +157,7 @@ SEASTAR_TEST_CASE(test_clustering_key_slice_restrictions) {
 
             e.execute_cql("update cf set d = 1 where a = 1 and b = 0 and c = 0").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(0)} },
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -170,7 +167,7 @@ SEASTAR_TEST_CASE(test_clustering_key_slice_restrictions) {
 
             e.execute_cql("update cf set d = 1 where a = 0 and b = 1 and c = 0").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(1)} },
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -180,7 +177,7 @@ SEASTAR_TEST_CASE(test_clustering_key_slice_restrictions) {
 
             e.execute_cql("delete from cf where a = 0 and b = 0 and c = 0").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(1)} },
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -190,7 +187,7 @@ SEASTAR_TEST_CASE(test_clustering_key_slice_restrictions) {
 
             e.execute_cql("delete from cf where a = 1 and b = 1 and c = 0").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(1)} },
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -199,7 +196,7 @@ SEASTAR_TEST_CASE(test_clustering_key_slice_restrictions) {
 
             e.execute_cql("delete from cf where a in (0, 1) and b >= 1 and b <= 4").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_size(0);
             });
 
@@ -228,7 +225,7 @@ SEASTAR_TEST_CASE(test_clustering_key_in_restrictions) {
             e.execute_cql("insert into cf (a, b, c, d) values (1, 2, 1, 0)").get();
 
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(0)} },
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -238,7 +235,7 @@ SEASTAR_TEST_CASE(test_clustering_key_in_restrictions) {
 
             eventually([&] {
             e.execute_cql("update cf set d = 1 where a = 1 and b = 0 and c = 0").get();
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(0)} },
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -248,7 +245,7 @@ SEASTAR_TEST_CASE(test_clustering_key_in_restrictions) {
 
             e.execute_cql("update cf set d = 1 where a = 0 and b = 1 and c = 0").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(1)} },
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -258,7 +255,7 @@ SEASTAR_TEST_CASE(test_clustering_key_in_restrictions) {
 
             e.execute_cql("delete from cf where a = 0 and b = 0 and c = 0").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(1)} },
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -268,7 +265,7 @@ SEASTAR_TEST_CASE(test_clustering_key_in_restrictions) {
 
             e.execute_cql("delete from cf where a = 1 and b = 1 and c = 0").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(1)} },
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -277,7 +274,7 @@ SEASTAR_TEST_CASE(test_clustering_key_in_restrictions) {
 
             e.execute_cql("delete from cf where a in (0, 1) and b >= 1 and b <= 4").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_size(0);
             });
 
@@ -306,7 +303,7 @@ SEASTAR_TEST_CASE(test_clustering_key_multi_column_restrictions) {
             e.execute_cql("insert into cf (a, b, c, d) values (1, 1, 1, 0)").get();
 
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(0)} },
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -316,7 +313,7 @@ SEASTAR_TEST_CASE(test_clustering_key_multi_column_restrictions) {
 
             e.execute_cql("update cf set d = 1 where a = 1 and b = 0 and c = 0").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(0)} },
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -326,7 +323,7 @@ SEASTAR_TEST_CASE(test_clustering_key_multi_column_restrictions) {
 
             e.execute_cql("update cf set d = 1 where a = 0 and b = 1 and c = 0").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(1)} },
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -336,7 +333,7 @@ SEASTAR_TEST_CASE(test_clustering_key_multi_column_restrictions) {
 
             e.execute_cql("delete from cf where a = 0 and b = 0 and c = 0").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(1)} },
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -346,7 +343,7 @@ SEASTAR_TEST_CASE(test_clustering_key_multi_column_restrictions) {
 
             e.execute_cql("delete from cf where a = 1 and b = 1 and c = 0").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(1)} },
                             { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -355,7 +352,7 @@ SEASTAR_TEST_CASE(test_clustering_key_multi_column_restrictions) {
 
             e.execute_cql("delete from cf where a in (0, 1)").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_size(0);
             });
 
@@ -384,7 +381,7 @@ SEASTAR_TEST_CASE(test_clustering_key_filtering_restrictions) {
             e.execute_cql("insert into cf (a, b, c, d) values (1, 1, 1, 0)").get();
 
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                         { {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
                         { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -394,7 +391,7 @@ SEASTAR_TEST_CASE(test_clustering_key_filtering_restrictions) {
 
             e.execute_cql("update cf set d = 1 where a = 1 and b = 0 and c = 0").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                         { {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
                         { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -404,7 +401,7 @@ SEASTAR_TEST_CASE(test_clustering_key_filtering_restrictions) {
 
             e.execute_cql("update cf set d = 1 where a = 0 and b = 1 and c = 1").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                         { {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
                         { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(1)} },
@@ -414,7 +411,7 @@ SEASTAR_TEST_CASE(test_clustering_key_filtering_restrictions) {
 
             e.execute_cql("delete from cf where a = 0 and b = 0 and c = 0").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                         { {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
                         { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(1)} },
@@ -424,7 +421,7 @@ SEASTAR_TEST_CASE(test_clustering_key_filtering_restrictions) {
 
             e.execute_cql("delete from cf where a = 1 and b = 1 and c = 1").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                         { {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
                         { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(1)} },
@@ -433,7 +430,7 @@ SEASTAR_TEST_CASE(test_clustering_key_filtering_restrictions) {
 
             e.execute_cql("delete from cf where a in (0, 1)").get();
             eventually([&] {
-            auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c, d from vcf").get();
             assert_that(msg).is_rows().with_size(0);
             });
 
@@ -458,12 +455,12 @@ SEASTAR_TEST_CASE(test_no_clustering_key_1) {
         // view, it also works as expected:
         e.execute_cql("insert into cf (a, b, c) values (1, 2, 3)").get();
         BOOST_TEST_PASSPOINT();
-        auto msg = e.execute_cql("select * from cf").get0();
+        auto msg = e.execute_cql("select * from cf").get();
         assert_that(msg).is_rows().with_size(1)
                 .with_row({{int32_type->decompose(1)}, {int32_type->decompose(2)}, {int32_type->decompose(3)}});
         BOOST_TEST_PASSPOINT();
         eventually([&] {
-            auto msg = e.execute_cql("select * from mv").get0();
+            auto msg = e.execute_cql("select * from mv").get();
             assert_that(msg).is_rows().with_size(1)
                     .with_row({{int32_type->decompose(1)}, {int32_type->decompose(2)}});
         });
@@ -485,14 +482,16 @@ SEASTAR_TEST_CASE(test_no_clustering_key_2) {
         // view, it also works as expected:
         e.execute_cql("insert into cf (a, b, c) values (1, 2, 3)").get();
         BOOST_TEST_PASSPOINT();
-        auto msg = e.execute_cql("select * from cf").get0();
+        auto msg = e.execute_cql("select * from cf").get();
         assert_that(msg).is_rows().with_size(1)
                 .with_row({{int32_type->decompose(1)}, {int32_type->decompose(2)}, {int32_type->decompose(3)}});
         BOOST_TEST_PASSPOINT();
         eventually([&] {
-            auto msg = e.execute_cql("select * from mv where a = 1 and b = 2").get0();
+            auto msg = e.execute_cql("select * from mv where a = 1 and b = 2").get();
             assert_that(msg).is_rows().with_size(1)
                     .with_row({{int32_type->decompose(1)}, {int32_type->decompose(2)}});
         });
     });
 }
+
+BOOST_AUTO_TEST_SUITE_END()

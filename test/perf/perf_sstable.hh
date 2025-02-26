@@ -3,13 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include <seastar/util/closeable.hh>
+#include <seastar/core/seastar.hh>
 
+#include "sstables/sstable_set.hh"
 #include "sstables/sstables.hh"
 #include "compaction/compaction_manager.hh"
 #include "compaction/time_window_compaction_strategy.hh"
@@ -22,7 +25,6 @@
 #include <boost/accumulators/framework/features.hpp>
 #include <boost/accumulators/statistics/mean.hpp>
 #include <boost/accumulators/statistics/error_of_mean.hpp>
-#include <boost/range/irange.hpp>
 
 using namespace sstables;
 
@@ -128,28 +130,66 @@ private:
     std::vector<shared_sstable> _sst;
 
     schema_ptr create_schema(sstables::compaction_strategy_type type) {
-        std::vector<schema::column> columns;
-
+        schema_builder builder("ks", "perf-test", generate_legacy_id("ks", "perf-test"));
+        builder.with_column("name", utf8_type, column_kind::partition_key);
         for (unsigned i = 0; i < _cfg.num_columns; ++i) {
-            columns.push_back(schema::column{ to_bytes(format("column{:04d}", i)), utf8_type });
+            builder.with_column(to_bytes(format("column{:04d}", i)), utf8_type);
         }
-
-        schema_builder builder(make_shared_schema(generate_legacy_id("ks", "perf-test"), "ks", "perf-test",
-            // partition key
-            {{"name", utf8_type}},
-            // clustering key
-            {},
-            // regular columns
-            { columns },
-            // static columns
-            {},
-            // regular column name type
-            utf8_type,
-            // comment
-            "Perf tests"
-        ));
+        builder.set_comment("Perf tests");
         builder.set_compaction_strategy(type);
         return builder.build(schema_builder::compact_storage::no);
+    }
+
+    using clk = std::chrono::steady_clock;
+    static auto now() {
+        return clk::now();
+    }
+
+    enum class sst_reader {
+        full_scan,
+        partitioned,
+    };
+
+    future<double> do_streaming(sst_reader reader_type) {
+        const auto start = perf_sstable_test_env::now();
+
+        // mimic the behavior of sstable_streamer::stream_sstable_mutations()
+        auto sst_set = make_lw_shared<sstables::sstable_set>(sstables::make_partitioned_sstable_set(s, false));
+        // stream all previously loaded sstables
+        for (auto& sst : _sst) {
+            sst_set->insert(sst);
+        }
+        // do not compact when performing streaming, as we focus on the read
+        // performance
+        auto reader = mutation_reader{nullptr};
+        if (reader_type == sst_reader::full_scan) {
+            reader = sst_set->make_full_scan_reader(s,
+                                                    _env.make_reader_permit(),
+                                                    tracing::trace_state_ptr{},
+                                                    default_read_monitor_generator());
+        } else {
+            const auto full_partition_range = dht::partition_range::make_open_ended_both_sides();
+            auto& slice = s->full_slice();
+            reader = sst_set->make_range_sstable_reader(s,
+                                                        _env.make_reader_permit(),
+                                                        full_partition_range,
+                                                        slice,
+                                                        tracing::trace_state_ptr{},
+                                                        streamed_mutation::forwarding::no,
+                                                        mutation_reader::forwarding::no);
+        }
+        auto frag_stream = mutation_fragment_v1_stream{std::move(reader)};
+        size_t num_partitions_processed = 0;
+        while (auto frag = co_await frag_stream()) {
+            if (frag->is_partition_start()) {
+                ++num_partitions_processed;
+            }
+            auto frozen_frag = freeze(*s, *frag);
+        }
+
+        const auto end = perf_sstable_test_env::now();
+        const auto duration = std::chrono::duration<double>(end - start).count();
+        co_return num_partitions_processed / duration;
     }
 
 public:
@@ -165,7 +205,7 @@ public:
     }
 
     future<> fill_memtable() {
-        auto idx = boost::irange(0, int(_cfg.partitions / _cfg.sstables));
+        auto idx = std::views::iota(0, int(_cfg.partitions / _cfg.sstables));
         auto local_keys = tests::generate_partition_keys(int(_cfg.partitions / _cfg.sstables), s, local_shard_only::yes, tests::key_size{_cfg.key_size, _cfg.key_size});
         return do_for_each(idx.begin(), idx.end(), [this, local_keys = std::move(local_keys)] (auto iteration) {
             auto mut = mutation(this->s, local_keys.at(iteration));
@@ -179,15 +219,19 @@ public:
     }
 
     future<> load_sstables(unsigned iterations) {
-        _sst.push_back(_env.make_sstable(s, this->dir()));
-        return _sst.back()->load(s->get_sharder());
+        std::filesystem::path sst_dir_path{this->dir()};
+        auto dir = co_await open_directory(sst_dir_path.native());
+        auto h = dir.list_directory([&](directory_entry de) -> future<> {
+            std::filesystem::path sst_path = sst_dir_path / de.name.begin();
+            auto entry = parse_path(sst_path, s->ks_name(), s->cf_name());
+            if (entry.component == component_type::TOC) {
+                auto sst = _env.make_sstable(s, this->dir(), entry.generation, entry.version);
+                co_await sst->load(s->get_sharder());
+                _sst.push_back(sst);
+            }
+        });
+        co_await h.done();
     }
-
-    using clk = std::chrono::steady_clock;
-    static auto now() {
-        return clk::now();
-    }
-
 
     // Mappers below
     future<double> flush_memtable(int idx) {
@@ -240,17 +284,17 @@ public:
                 descriptor.replacer = sstables::replacer_fn_no_op();
                 auto cdata = compaction_manager::create_compaction_data();
                 compaction_progress_monitor progress_monitor;
-                auto ret = sstables::compact_sstables(std::move(descriptor), cdata, cf->as_table_state(), progress_monitor).get0();
+                auto ret = sstables::compact_sstables(std::move(descriptor), cdata, cf->try_get_table_state_with_static_sharding(), progress_monitor).get();
                 auto end = perf_sstable_test_env::now();
 
                 auto partitions_per_sstable = _cfg.partitions / _cfg.sstables;
                 if (_cfg.compaction_strategy != sstables::compaction_strategy_type::time_window) {
-                    assert(ret.new_sstables.size() == 1);
+                    SCYLLA_ASSERT(ret.new_sstables.size() == 1);
                 }
                 auto total_keys_written = std::accumulate(ret.new_sstables.begin(), ret.new_sstables.end(), uint64_t(0), [] (uint64_t n, const sstables::shared_sstable& sst) {
                     return n + sst->get_estimated_key_count();
                 });
-                assert(total_keys_written >= partitions_per_sstable);
+                SCYLLA_ASSERT(total_keys_written >= partitions_per_sstable);
 
                 auto duration = std::chrono::duration<double>(end - start).count();
                 return total_keys_written / duration;
@@ -276,7 +320,7 @@ public:
             auto total = make_lw_shared<size_t>(0);
             auto done = make_lw_shared<bool>(false);
             return do_until([done] { return *done; }, [this, done, total, &r] {
-                return read_mutation_from_flat_mutation_reader(r).then([this, done, total] (mutation_opt m) {
+                return read_mutation_from_mutation_reader(r).then([this, done, total] (mutation_opt m) {
                     if (!m) {
                         *done = true;
                     } else {
@@ -295,6 +339,14 @@ public:
             });
         });
     }
+
+    future<double> full_scan_streaming(int idx) {
+        return do_streaming(sst_reader::full_scan);
+    }
+
+    future<double> partitioned_streaming(int idx) {
+        return do_streaming(sst_reader::partitioned);
+    }
 };
 
 // The function func should carry on with the test, and return the number of partitions processed.
@@ -303,9 +355,9 @@ template <typename Func>
 future<> time_runs(unsigned iterations, unsigned parallelism, distributed<perf_sstable_test_env>& dt, Func func) {
     using namespace boost::accumulators;
     auto acc = make_lw_shared<accumulator_set<double, features<tag::mean, tag::error_of<tag::mean>>>>();
-    auto idx = boost::irange(0, int(iterations));
+    auto idx = std::views::iota(0, int(iterations));
     return do_for_each(idx.begin(), idx.end(), [parallelism, acc, &dt, func] (auto iter) {
-        auto idx = boost::irange(0, int(parallelism));
+        auto idx = std::views::iota(0, int(parallelism));
         return parallel_for_each(idx.begin(), idx.end(), [&dt, func, acc] (auto idx) {
             return dt.map_reduce(adder<double>(), func, std::move(idx)).then([acc] (double result) {
                 auto& a = *acc;

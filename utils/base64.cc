@@ -3,13 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "base64.hh"
 
-#include <ctype.h>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 
 // Arrays for quickly converting to and from an integer between 0 and 63,
 // and the character used in base64 encoding to represent it.

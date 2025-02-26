@@ -3,46 +3,52 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "utils/to_string.hh"
+#include "utils/user_provided_param.hh"
 
-namespace std {
-
-std::ostream& operator<<(std::ostream& os, const std::strong_ordering& order) {
+auto fmt::formatter<std::strong_ordering>::format(std::strong_ordering order, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
     if (order > 0) {
-        os << "gt";
+        return fmt::format_to(ctx.out(), "gt");
     } else if (order < 0) {
-        os << "lt";
+        return fmt::format_to(ctx.out(), "lt");
     } else {
-        os << "eq";
+        return fmt::format_to(ctx.out(), "eq");
     }
-    return os;
 }
 
-std::ostream& operator<<(std::ostream& os, const std::weak_ordering& order) {
+auto fmt::formatter<std::weak_ordering>::format(std::weak_ordering order, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
     if (order > 0) {
-        os << "gt";
+        return fmt::format_to(ctx.out(), "gt");
     } else if (order < 0) {
-        os << "lt";
+        return fmt::format_to(ctx.out(), "lt");
     } else {
-        os << "eq";
+        return fmt::format_to(ctx.out(), "eq");
     }
-    return os;
 }
 
-std::ostream& operator<<(std::ostream& os, const std::partial_ordering& order) {
+auto fmt::formatter<std::partial_ordering>::format(std::partial_ordering order, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
     if (order == std::partial_ordering::unordered) {
-        os << "unordered";
+        return fmt::format_to(ctx.out(), "unordered");
     } else if (order > 0) {
-        os << "gt";
+        return fmt::format_to(ctx.out(), "gt");
     } else if (order < 0) {
-        os << "lt";
+        return fmt::format_to(ctx.out(), "lt");
     } else {
-        os << "eq";
+        return fmt::format_to(ctx.out(), "eq");
     }
-    return os;
 }
 
-} // namespace std
+auto fmt::formatter<utils::optional_param_flags_set>::format(const utils::optional_param_flags_set& flags, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    auto ret = fmt::format_to(ctx.out(), "{}", flags.contains(utils::optional_param_flag::user_provided) ? "user-provided" : "implicit");
+    if (flags.contains(utils::optional_param_flag::force)) {
+        ret = fmt::format_to(ctx.out(), ",force");
+    }
+    return ret;
+}

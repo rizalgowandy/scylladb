@@ -3,8 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
+
+#include <algorithm>
 
 #include "querier.hh"
 #include "mutation_query.hh"
@@ -15,14 +17,18 @@
 #include "test/lib/exception_utils.hh"
 #include "db/config.hh"
 
+#include <fmt/ranges.h>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
+#include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/closeable.hh>
 
-#include <boost/range/algorithm/sort.hpp>
 #include "readers/from_mutations_v2.hh"
 #include "readers/empty_v2.hh"
+
+BOOST_AUTO_TEST_SUITE(querier_cache_test)
 
 using namespace std::chrono_literals;
 
@@ -62,7 +68,7 @@ public:
 
 class test_querier_cache {
 public:
-    using bound = range_bound<std::size_t>;
+    using bound = interval_bound<std::size_t>;
 
     static const size_t max_reader_buffer_size = 8 * 1024;
 
@@ -96,7 +102,7 @@ private:
             mutations.emplace_back(std::move(mut));
         }
 
-        boost::sort(mutations, [] (const mutation& a, const mutation& b) {
+        std::ranges::sort(mutations, [] (const mutation& a, const mutation& b) {
             return a.decorated_key().tri_compare(*a.schema(), b.decorated_key()) < 0;
         });
 
@@ -104,10 +110,10 @@ private:
     }
 
     template <typename Querier>
-    Querier make_querier(const dht::partition_range& range) {
+    Querier make_querier(const dht::partition_range& range, db::timeout_clock::time_point timeout) {
         return Querier(_mutation_source,
             _s.schema(),
-            _sem.make_tracking_only_permit(_s.schema().get(), "make-querier", db::no_timeout, {}),
+            _sem.make_tracking_only_permit(_s.schema(), "make-querier", timeout, {}),
             range,
             _s.schema()->full_slice(),
             nullptr);
@@ -158,7 +164,7 @@ public:
         , _cache(is_user_semaphore ? std::move(is_user_semaphore) : [] (const reader_concurrency_semaphore&) { return true; }, entry_ttl)
         , _mutations(make_mutations(_s, external_make_value))
         , _mutation_source([this] (schema_ptr schema, reader_permit permit, const dht::partition_range& range) {
-            auto rd = make_flat_mutation_reader_from_mutations_v2(schema, std::move(permit), _mutations, range);
+            auto rd = make_mutation_reader_from_mutations_v2(schema, std::move(permit), _mutations, range);
             rd.set_max_buffer_size(max_reader_buffer_size);
             return rd;
         }) {
@@ -212,11 +218,11 @@ public:
 
     template <typename Querier>
     entry_info produce_first_page_and_save_querier(void(query::querier_cache::*insert_mem_ptr)(query_id, Querier&&, tracing::trace_state_ptr), unsigned key,
-            const dht::partition_range& range, const query::partition_slice& slice, uint64_t row_limit) {
+            const dht::partition_range& range, const query::partition_slice& slice, uint64_t row_limit, db::timeout_clock::time_point timeout = db::no_timeout) {
         const auto cache_key = make_cache_key(key);
 
-        auto querier = make_querier<Querier>(range);
-        auto dk_ck = querier.consume_page(dummy_result_builder{}, row_limit, std::numeric_limits<uint32_t>::max(), gc_clock::now()).get0();
+        auto querier = make_querier<Querier>(range, timeout);
+        auto dk_ck = querier.consume_page(dummy_result_builder{}, row_limit, std::numeric_limits<uint32_t>::max(), gc_clock::now()).get();
         auto&& dk = dk_ck.first;
         auto&& ck = dk_ck.second;
         auto permit = querier.permit();
@@ -284,27 +290,29 @@ public:
     }
 
     entry_info produce_first_page_and_save_mutation_querier(unsigned key, const dht::partition_range& range,
-            const query::partition_slice& slice, uint64_t row_limit = 5) {
-        return produce_first_page_and_save_querier<query::querier>(&query::querier_cache::insert_mutation_querier, key, range, slice, row_limit);
+            const query::partition_slice& slice, uint64_t row_limit = 5, db::timeout_clock::time_point timeout = db::no_timeout) {
+        return produce_first_page_and_save_querier<query::querier>(&query::querier_cache::insert_mutation_querier, key, range, slice, row_limit, timeout);
     }
 
-    entry_info produce_first_page_and_save_mutation_querier(unsigned key, const dht::partition_range& range, uint64_t row_limit = 5) {
-        return produce_first_page_and_save_mutation_querier(key, range, make_default_slice(), row_limit);
+    entry_info produce_first_page_and_save_mutation_querier(unsigned key, const dht::partition_range& range, uint64_t row_limit = 5,
+            db::timeout_clock::time_point timeout = db::no_timeout) {
+        return produce_first_page_and_save_mutation_querier(key, range, make_default_slice(), row_limit, timeout);
     }
 
     // Singular overload
-    entry_info produce_first_page_and_save_mutation_querier(unsigned key, std::size_t i, uint64_t row_limit = 5) {
+    entry_info produce_first_page_and_save_mutation_querier(unsigned key, std::size_t i, uint64_t row_limit = 5,
+            db::timeout_clock::time_point timeout = db::no_timeout) {
         return produce_first_page_and_save_mutation_querier(key, make_singular_partition_range(i), _s.schema()->full_slice(), row_limit);
     }
 
     // Use the whole range
-    entry_info produce_first_page_and_save_mutation_querier(unsigned key) {
-        return produce_first_page_and_save_mutation_querier(key, make_default_partition_range(), _s.schema()->full_slice());
+    entry_info produce_first_page_and_save_mutation_querier(unsigned key, db::timeout_clock::time_point timeout = db::no_timeout) {
+        return produce_first_page_and_save_mutation_querier(key, make_default_partition_range(), _s.schema()->full_slice(), 5, timeout);
     }
 
     // For tests testing just one insert-lookup.
-    entry_info produce_first_page_and_save_mutation_querier() {
-        return produce_first_page_and_save_mutation_querier(1);
+    entry_info produce_first_page_and_save_mutation_querier(db::timeout_clock::time_point timeout = db::no_timeout) {
+        return produce_first_page_and_save_mutation_querier(1, timeout);
     }
 
     test_querier_cache& assert_cache_lookup_data_querier(unsigned lookup_key,
@@ -331,9 +339,10 @@ public:
     test_querier_cache& assert_cache_lookup_mutation_querier(unsigned lookup_key,
             const schema& lookup_schema,
             const dht::partition_range& lookup_range,
-            const query::partition_slice& lookup_slice) {
+            const query::partition_slice& lookup_slice,
+            db::timeout_clock::time_point timeout = db::no_timeout) {
 
-        auto querier_opt = _cache.lookup_mutation_querier(make_cache_key(lookup_key), lookup_schema, lookup_range, lookup_slice, get_semaphore(), nullptr, db::no_timeout);
+        auto querier_opt = _cache.lookup_mutation_querier(make_cache_key(lookup_key), lookup_schema, lookup_range, lookup_slice, get_semaphore(), nullptr, timeout);
         if (querier_opt) {
             querier_opt->close().get();
         }
@@ -648,7 +657,7 @@ SEASTAR_THREAD_TEST_CASE(test_resources_based_cache_eviction) {
 
         BOOST_REQUIRE(env.local_db().has_schema("querier_cache", "test"));
 
-        auto insert_id = env.prepare("INSERT INTO querier_cache.test (pk, ck, value) VALUES (?, ?, ?);").get0();
+        auto insert_id = env.prepare("INSERT INTO querier_cache.test (pk, ck, value) VALUES (?, ?, ?);").get();
         auto pk = cql3::raw_value::make_value(serialized(0));
         for (int i = 0; i < 100; ++i) {
             auto ck = cql3::raw_value::make_value(serialized(i));
@@ -688,7 +697,7 @@ SEASTAR_THREAD_TEST_CASE(test_resources_based_cache_eviction) {
         BOOST_CHECK_EQUAL(db.get_querier_cache_stats().resource_based_evictions, 0);
 
         // Drain all resources of the semaphore
-        auto sponge_permit = semaphore.make_tracking_only_permit(s.get(), "sponge", db::no_timeout, {});
+        auto sponge_permit = semaphore.make_tracking_only_permit(s, "sponge", db::no_timeout, {});
         auto consumed_resources = sponge_permit.consume_resources(semaphore.available_resources());
 
         auto cmd2 = query::read_command(s->id(),
@@ -737,13 +746,13 @@ SEASTAR_THREAD_TEST_CASE(test_immediate_evict_on_insert) {
     test_querier_cache t;
 
     auto& sem = t.get_semaphore();
-    auto permit1 = sem.obtain_permit(t.get_schema().get(), get_name(), 0, db::no_timeout, {}).get0();
+    auto permit1 = sem.obtain_permit(t.get_schema(), get_name(), 0, db::no_timeout, {}).get();
 
     auto resources = permit1.consume_resources(reader_resources(sem.available_resources().count, 0));
 
     BOOST_CHECK_EQUAL(sem.available_resources().count, 0);
 
-    auto fut = sem.obtain_permit(t.get_schema().get(), get_name(), 1, db::no_timeout, {});
+    auto fut = sem.obtain_permit(t.get_schema(), get_name(), 1, db::no_timeout, {});
 
     BOOST_CHECK_EQUAL(sem.get_stats().waiters, 1);
 
@@ -759,9 +768,9 @@ SEASTAR_THREAD_TEST_CASE(test_immediate_evict_on_insert) {
 }
 
 SEASTAR_THREAD_TEST_CASE(test_unique_inactive_read_handle) {
-    reader_concurrency_semaphore sem1(reader_concurrency_semaphore::no_limits{}, "sem1");
+    reader_concurrency_semaphore sem1(reader_concurrency_semaphore::no_limits{}, "sem1", reader_concurrency_semaphore::register_metrics::no);
     auto stop_sem1 = deferred_stop(sem1);
-    reader_concurrency_semaphore sem2(reader_concurrency_semaphore::no_limits{}, ""); // to see the message for an unnamed semaphore
+    reader_concurrency_semaphore sem2(reader_concurrency_semaphore::no_limits{}, "", reader_concurrency_semaphore::register_metrics::no); // to see the message for an unnamed semaphore
     auto stop_sem2 = deferred_stop(sem2);
 
     auto schema = schema_builder("ks", "cf")
@@ -769,8 +778,8 @@ SEASTAR_THREAD_TEST_CASE(test_unique_inactive_read_handle) {
         .with_column("v", int32_type)
         .build();
 
-    auto sem1_h1 = sem1.register_inactive_read(make_empty_flat_reader_v2(schema, sem1.make_tracking_only_permit(schema.get(), get_name(), db::no_timeout, {})));
-    auto sem2_h1 = sem2.register_inactive_read(make_empty_flat_reader_v2(schema, sem2.make_tracking_only_permit(schema.get(), get_name(), db::no_timeout, {})));
+    auto sem1_h1 = sem1.register_inactive_read(make_empty_flat_reader_v2(schema, sem1.make_tracking_only_permit(schema, get_name(), db::no_timeout, {})));
+    auto sem2_h1 = sem2.register_inactive_read(make_empty_flat_reader_v2(schema, sem2.make_tracking_only_permit(schema, get_name(), db::no_timeout, {})));
 
     // Sanity check that lookup still works with empty handle.
     BOOST_REQUIRE(!sem1.unregister_inactive_read(reader_concurrency_semaphore::inactive_read_handle{}));
@@ -784,7 +793,7 @@ SEASTAR_THREAD_TEST_CASE(test_unique_inactive_read_handle) {
 }
 
 SEASTAR_THREAD_TEST_CASE(test_semaphore_mismatch) {
-    reader_concurrency_semaphore other_sem(reader_concurrency_semaphore::no_limits{}, "other_semaphore");
+    reader_concurrency_semaphore other_sem(reader_concurrency_semaphore::no_limits{}, "other_semaphore", reader_concurrency_semaphore::register_metrics::no);
     auto stop_sem1 = deferred_stop(other_sem);
 
     bool is_user_semaphore = true;
@@ -833,3 +842,70 @@ SEASTAR_THREAD_TEST_CASE(test_semaphore_mismatch) {
             .no_evictions();
     }
 }
+
+#if SEASTAR_DEBUG
+static const std::chrono::seconds ttl_timeout_test_timeout = 4s;
+#else
+static const std::chrono::seconds ttl_timeout_test_timeout = 1s;
+#endif
+
+SEASTAR_THREAD_TEST_CASE(test_timeout_not_sticky_on_insert) {
+    test_querier_cache t;
+
+    const auto entry = t.produce_first_page_and_save_mutation_querier(db::timeout_clock::now() + ttl_timeout_test_timeout);
+
+    sleep(ttl_timeout_test_timeout * 2).get();
+
+    t.assert_cache_lookup_mutation_querier(entry.key, *t.get_schema(), entry.expected_range, entry.expected_slice)
+        .no_misses()
+        .no_drops()
+        .no_evictions();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_ttl_not_sticky_on_lookup) {
+    test_querier_cache t(ttl_timeout_test_timeout);
+
+    auto& sem = t.get_semaphore();
+    auto permit1 = sem.obtain_permit(t.get_schema(), get_name(), 1024, db::no_timeout, {}).get();
+
+    const auto entry = t.produce_first_page_and_save_mutation_querier();
+
+    const auto new_timeout = db::timeout_clock::now() + 900s;
+
+    t.assert_cache_lookup_mutation_querier(entry.key, *t.get_schema(), entry.expected_range, entry.expected_slice, new_timeout)
+        .no_misses()
+        .no_drops()
+        .no_evictions();
+
+    BOOST_REQUIRE(entry.permit.timeout() == new_timeout);
+
+    sleep(ttl_timeout_test_timeout * 2).get();
+
+    // check_abort() will throw if the permit timed out due to sticky TTL during the above sleep.
+    BOOST_REQUIRE_NO_THROW(entry.permit.check_abort());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_timeout_is_applied_on_lookup) {
+    test_querier_cache t;
+
+    auto& sem = t.get_semaphore();
+    auto permit1 = sem.obtain_permit(t.get_schema(), get_name(), 1024, db::no_timeout, {}).get();
+
+    const auto entry = t.produce_first_page_and_save_mutation_querier();
+
+    const auto new_timeout = db::timeout_clock::now() + ttl_timeout_test_timeout;
+
+    t.assert_cache_lookup_mutation_querier(entry.key, *t.get_schema(), entry.expected_range, entry.expected_slice, new_timeout)
+        .no_misses()
+        .no_drops()
+        .no_evictions();
+
+    BOOST_REQUIRE(entry.permit.timeout() == new_timeout);
+    BOOST_REQUIRE_NO_THROW(entry.permit.check_abort());
+
+    sleep(ttl_timeout_test_timeout * 2).get();
+
+    BOOST_REQUIRE_THROW(entry.permit.check_abort(), seastar::named_semaphore_timed_out);
+}
+
+BOOST_AUTO_TEST_SUITE_END()

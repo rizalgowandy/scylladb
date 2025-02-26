@@ -3,14 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "redis/mutation_utils.hh"
 #include "types/types.hh"
 #include "service/storage_proxy.hh"
 #include "schema/schema.hh"
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include "redis/keyspace_utils.hh"
 #include "redis/options.hh"
 #include "mutation/mutation.hh"

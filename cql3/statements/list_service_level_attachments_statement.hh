@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -11,7 +11,6 @@
 #include <seastar/core/sstring.hh>
 
 #include "cql3/statements/service_level_statement.hh"
-#include "service/qos/qos_common.hh"
 
 namespace cql3 {
 namespace statements {

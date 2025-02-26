@@ -3,13 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "auth/roles-metadata.hh"
 
-#include <boost/algorithm/cxx11/any_of.hpp>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
 
@@ -25,31 +24,31 @@ namespace roles_table {
 
 std::string_view creation_query() {
     static const sstring instance = fmt::format(
-            "CREATE TABLE {} ("
+            "CREATE TABLE {}.{} ("
             "  {} text PRIMARY KEY,"
             "  can_login boolean,"
             "  is_superuser boolean,"
             "  member_of set<text>,"
             "  salted_hash text"
             ")",
-            qualified_name,
+            meta::legacy::AUTH_KS,
+            name,
             role_col_name);
 
     return instance;
 }
 
-constexpr std::string_view qualified_name("system_auth.roles");
+} // namespace roles_table
 
-}
-
-}
+} // namespace meta
 
 future<bool> default_role_row_satisfies(
         cql3::query_processor& qp,
         std::function<bool(const cql3::untyped_result_set_row&)> p,
         std::optional<std::string> rolename) {
-    static const sstring query = format("SELECT * FROM {} WHERE {} = ?",
-            meta::roles_table::qualified_name,
+    const sstring query = seastar::format("SELECT * FROM {}.{} WHERE {} = ?",
+            get_auth_ks_name(qp),
+            meta::roles_table::name,
             meta::roles_table::role_col_name);
 
     for (auto cl : { db::consistency_level::ONE, db::consistency_level::QUORUM }) {
@@ -69,7 +68,7 @@ future<bool> any_nondefault_role_row_satisfies(
         cql3::query_processor& qp,
         std::function<bool(const cql3::untyped_result_set_row&)> p,
         std::optional<std::string> rolename) {
-    static const sstring query = format("SELECT * FROM {}", meta::roles_table::qualified_name);
+    const sstring query = seastar::format("SELECT * FROM {}.{}", get_auth_ks_name(qp), meta::roles_table::name);
 
     auto results = co_await qp.execute_internal(query, db::consistency_level::QUORUM
         , internal_distributed_query_state(), cql3::query_processor::cache_internal::no
@@ -79,7 +78,7 @@ future<bool> any_nondefault_role_row_satisfies(
     }
     static const sstring col_name = sstring(meta::roles_table::role_col_name);
 
-    co_return boost::algorithm::any_of(*results, [&](const cql3::untyped_result_set_row& row) {
+    co_return std::ranges::any_of(*results, [&](const cql3::untyped_result_set_row& row) {
         auto superuser = rolename ? std::string_view(*rolename) : meta::DEFAULT_SUPERUSER_NAME;
         const bool is_nondefault = row.get_as<sstring>(col_name) != superuser;
         return is_nondefault && p(row);

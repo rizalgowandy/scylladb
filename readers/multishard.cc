@@ -3,10 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <boost/range/algorithm/heap_algorithm.hpp>
+#include "utils/assert.hh"
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/util/closeable.hh>
@@ -14,11 +14,10 @@
 #include "dht/sharder.hh"
 #include "readers/empty_v2.hh"
 #include "readers/evictable.hh"
-#include "readers/flat_mutation_reader_v2.hh"
+#include "readers/mutation_reader.hh"
 #include "readers/foreign.hh"
 #include "readers/multishard.hh"
 #include "readers/mutation_source.hh"
-#include "readers/queue.hh"
 #include "schema/schema_registry.hh"
 #include "locator/abstract_replication_strategy.hh"
 
@@ -27,12 +26,12 @@ extern logger mrlog;
 namespace {
 
 struct remote_fill_buffer_result_v2 {
-    foreign_ptr<std::unique_ptr<const flat_mutation_reader_v2::tracked_buffer>> buffer;
+    foreign_ptr<std::unique_ptr<const mutation_reader::tracked_buffer>> buffer;
     bool end_of_stream = false;
 
     remote_fill_buffer_result_v2() = default;
-    remote_fill_buffer_result_v2(flat_mutation_reader_v2::tracked_buffer&& buffer, bool end_of_stream)
-        : buffer(make_foreign(std::make_unique<const flat_mutation_reader_v2::tracked_buffer>(std::move(buffer))))
+    remote_fill_buffer_result_v2(mutation_reader::tracked_buffer&& buffer, bool end_of_stream)
+        : buffer(make_foreign(std::make_unique<const mutation_reader::tracked_buffer>(std::move(buffer))))
         , end_of_stream(end_of_stream) {
     }
 };
@@ -40,13 +39,13 @@ struct remote_fill_buffer_result_v2 {
 }
 
 /// See make_foreign_reader() for description.
-class foreign_reader : public flat_mutation_reader_v2::impl {
+class foreign_reader : public mutation_reader::impl {
     template <typename T>
     using foreign_unique_ptr = foreign_ptr<std::unique_ptr<T>>;
 
-    using fragment_buffer = flat_mutation_reader_v2::tracked_buffer;
+    using fragment_buffer = mutation_reader::tracked_buffer;
 
-    foreign_unique_ptr<flat_mutation_reader_v2> _reader;
+    foreign_unique_ptr<mutation_reader> _reader;
     foreign_unique_ptr<future<>> _read_ahead_future;
     streamed_mutation::forwarding _fwd_sm;
 
@@ -57,7 +56,7 @@ class foreign_reader : public flat_mutation_reader_v2::impl {
     // and move it to the background (save it's future but don't wait on it
     // now). If all works well read-aheads complete by the next operation and
     // we don't have to wait on the remote reader filling its buffer.
-    template <typename Operation, typename Result = futurize_t<std::result_of_t<Operation()>>>
+    template <typename Operation, typename Result = futurize_t<std::invoke_result_t<Operation>>>
     Result forward_operation(Operation op) {
         reader_permit::awaits_guard awaits_guard{_permit};
         return smp::submit_to(_reader.get_owner_shard(), [reader = _reader.get(),
@@ -77,12 +76,12 @@ class foreign_reader : public flat_mutation_reader_v2::impl {
                 return exec_op_and_read_ahead();
             }
         }).then([this] (auto fut_and_result) {
-            _read_ahead_future = std::get<0>(std::move(fut_and_result));
+            _read_ahead_future = std::get<0>(std::move(fut_and_result)); // NOLINT(bugprone-use-after-move)
             static_assert(std::tuple_size<decltype(fut_and_result)>::value <= 2);
             if constexpr (std::tuple_size<decltype(fut_and_result)>::value == 1) {
                 return make_ready_future<>();
             } else {
-                auto result = std::get<1>(std::move(fut_and_result));
+                auto result = std::get<1>(std::move(fut_and_result)); // NOLINT(bugprone-use-after-move)
                 return make_ready_future<decltype(result)>(std::move(result));
             }
         }).finally([awaits_guard = std::move(awaits_guard)] { });
@@ -90,7 +89,7 @@ class foreign_reader : public flat_mutation_reader_v2::impl {
 public:
     foreign_reader(schema_ptr schema,
             reader_permit permit,
-            foreign_unique_ptr<flat_mutation_reader_v2> reader,
+            foreign_unique_ptr<mutation_reader> reader,
             streamed_mutation::forwarding fwd_sm = streamed_mutation::forwarding::no);
 
     // this is captured.
@@ -108,7 +107,7 @@ public:
 
 foreign_reader::foreign_reader(schema_ptr schema,
         reader_permit permit,
-        foreign_unique_ptr<flat_mutation_reader_v2> reader,
+        foreign_unique_ptr<mutation_reader> reader,
         streamed_mutation::forwarding fwd_sm)
     : impl(std::move(schema), std::move(permit))
     , _reader(std::move(reader))
@@ -186,28 +185,40 @@ future<> foreign_reader::close() noexcept {
     });
 }
 
-flat_mutation_reader_v2 make_foreign_reader(schema_ptr schema,
+mutation_reader make_foreign_reader(schema_ptr schema,
             reader_permit permit,
-            foreign_ptr<std::unique_ptr<flat_mutation_reader_v2>> reader,
+            foreign_ptr<std::unique_ptr<mutation_reader>> reader,
             streamed_mutation::forwarding fwd_sm) {
     if (reader.get_owner_shard() == this_shard_id()) {
         return std::move(*reader);
     }
-    return make_flat_mutation_reader_v2<foreign_reader>(std::move(schema), std::move(permit), std::move(reader), fwd_sm);
+    return make_mutation_reader<foreign_reader>(std::move(schema), std::move(permit), std::move(reader), fwd_sm);
 }
 
 template <typename... Arg>
-static void require(bool condition, const char* msg, const Arg&... arg) {
+static void require(bool condition, fmt::format_string<Arg...> fmt, Arg&&... arg) {
     if (!condition) {
-        on_internal_error(mrlog, format(msg, arg...));
+        on_internal_error(mrlog, seastar::format(fmt, std::forward<Arg>(arg)...)) ;
     }
 }
 
 // Encapsulates all data and logic that is local to the remote shard the
 // reader lives on.
-class evictable_reader_v2 : public flat_mutation_reader_v2::impl {
+class evictable_reader_v2 : public mutation_reader::impl {
 public:
     using auto_pause = bool_class<class auto_pause_tag>;
+
+    class auto_pause_disable_guard {
+        evictable_reader_v2& _reader;
+    public:
+        auto_pause_disable_guard(evictable_reader_v2& reader) : _reader(reader) {
+            _reader._auto_pause = auto_pause::no;
+        }
+        ~auto_pause_disable_guard() {
+            _reader._auto_pause = auto_pause::yes;
+            _reader.pause();
+        }
+    };
 
 private:
     auto_pause _auto_pause;
@@ -228,16 +239,16 @@ private:
     std::optional<dht::partition_range> _range_override;
     std::optional<query::partition_slice> _slice_override;
 
-    flat_mutation_reader_v2_opt _reader;
+    mutation_reader_opt _reader;
 
 private:
-    void do_pause(flat_mutation_reader_v2 reader);
-    void maybe_pause(flat_mutation_reader_v2 reader);
-    flat_mutation_reader_v2_opt try_resume();
+    void do_pause(mutation_reader reader) noexcept;
+    void maybe_pause(mutation_reader reader) noexcept;
+    mutation_reader_opt try_resume();
     void update_next_position();
     void adjust_partition_slice();
-    flat_mutation_reader_v2 recreate_reader();
-    future<flat_mutation_reader_v2> resume_or_create_reader();
+    mutation_reader recreate_reader();
+    future<mutation_reader> resume_or_create_reader();
     void validate_partition_start(const partition_start& ps);
     void validate_position_in_partition(position_in_partition_view pos) const;
     void examine_first_fragments(mutation_fragment_v2_opt& mf1, mutation_fragment_v2_opt& mf2, mutation_fragment_v2_opt& mf3);
@@ -246,7 +257,7 @@ public:
     evictable_reader_v2(
             auto_pause ap,
             mutation_source ms,
-            flat_mutation_reader_v2_opt reader,
+            mutation_reader_opt reader,
             schema_ptr schema,
             reader_permit permit,
             const dht::partition_range& pr,
@@ -281,12 +292,12 @@ public:
     }
 };
 
-void evictable_reader_v2::do_pause(flat_mutation_reader_v2 reader) {
-    assert(!_irh);
+void evictable_reader_v2::do_pause(mutation_reader reader) noexcept {
+    SCYLLA_ASSERT(!_irh);
     _irh = _permit.semaphore().register_inactive_read(std::move(reader));
 }
 
-void evictable_reader_v2::maybe_pause(flat_mutation_reader_v2 reader) {
+void evictable_reader_v2::maybe_pause(mutation_reader reader) noexcept {
     if (_auto_pause) {
         do_pause(std::move(reader));
     } else {
@@ -294,7 +305,7 @@ void evictable_reader_v2::maybe_pause(flat_mutation_reader_v2 reader) {
     }
 }
 
-flat_mutation_reader_v2_opt evictable_reader_v2::try_resume() {
+mutation_reader_opt evictable_reader_v2::try_resume() {
     if (auto reader_opt = _permit.semaphore().unregister_inactive_read(std::move(_irh))) {
         return std::move(*reader_opt);
     }
@@ -335,21 +346,16 @@ void evictable_reader_v2::update_next_position() {
 }
 
 void evictable_reader_v2::adjust_partition_slice() {
-    const auto reversed = _ps.options.contains(query::partition_slice::option::reversed);
-    _slice_override = reversed ? query::legacy_reverse_slice_to_native_reverse_slice(*_schema, _ps) : _ps;
+    _slice_override = _ps;
 
     auto ranges = _slice_override->default_row_ranges();
     query::trim_clustering_row_ranges_to(*_schema, ranges, _next_position_in_partition);
 
     _slice_override->clear_ranges();
     _slice_override->set_range(*_schema, _last_pkey->key(), std::move(ranges));
-
-    if (reversed) {
-        _slice_override = query::native_reverse_slice_to_legacy_reverse_slice(*_schema, std::move(*_slice_override));
-    }
 }
 
-flat_mutation_reader_v2 evictable_reader_v2::recreate_reader() {
+mutation_reader evictable_reader_v2::recreate_reader() {
     const dht::partition_range* range = _pr;
     const query::partition_slice* slice = &_ps;
 
@@ -401,7 +407,7 @@ flat_mutation_reader_v2 evictable_reader_v2::recreate_reader() {
             _fwd_mr);
 }
 
-future<flat_mutation_reader_v2> evictable_reader_v2::resume_or_create_reader() {
+future<mutation_reader> evictable_reader_v2::resume_or_create_reader() {
     if (_reader) {
         co_return std::move(*_reader);
     }
@@ -474,14 +480,7 @@ void evictable_reader_v2::validate_position_in_partition(position_in_partition_v
             pos);
 
     if (_slice_override && pos.region() == partition_region::clustered) {
-        const auto reversed = _ps.options.contains(query::partition_slice::option::reversed);
-        std::optional<query::partition_slice> native_slice;
-        if (reversed) {
-            native_slice = query::legacy_reverse_slice_to_native_reverse_slice(*_schema, *_slice_override);
-        }
-        auto& slice = reversed ? *native_slice : *_slice_override;
-
-        const auto ranges = slice.row_ranges(*_schema, _last_pkey->key());
+        const auto ranges = _slice_override->row_ranges(*_schema, _last_pkey->key());
         const bool any_contains = std::any_of(ranges.begin(), ranges.end(), [this, &pos] (const query::clustering_range& cr) {
             // TODO: somehow avoid this copy
             auto range = position_range(cr);
@@ -496,7 +495,7 @@ void evictable_reader_v2::validate_position_in_partition(position_in_partition_v
                 any_contains,
                 "{}(): validation failed, expected clustering fragment that is included in the slice {}, but got {}",
                 __FUNCTION__,
-                slice,
+                *_slice_override,
                 pos);
     }
 }
@@ -540,7 +539,7 @@ void evictable_reader_v2::examine_first_fragments(mutation_fragment_v2_opt& mf1,
 evictable_reader_v2::evictable_reader_v2(
         auto_pause ap,
         mutation_source ms,
-        flat_mutation_reader_v2_opt reader,
+        mutation_reader_opt reader,
         schema_ptr schema,
         reader_permit permit,
         const dht::partition_range& pr,
@@ -648,8 +647,17 @@ future<> evictable_reader_v2::fast_forward_to(const dht::partition_range& pr) {
         co_return;
     }
     if (auto reader_opt = try_resume()) {
-        co_await reader_opt->fast_forward_to(pr);
-        _range_override.reset();
+        std::exception_ptr ex;
+        try {
+            co_await reader_opt->fast_forward_to(pr);
+            _range_override.reset();
+        } catch (...) {
+            ex = std::current_exception();
+        }
+        if (ex) {
+            co_await reader_opt->close();
+            std::rethrow_exception(std::move(ex));
+        }
         maybe_pause(std::move(*reader_opt));
     }
 }
@@ -661,7 +669,7 @@ void evictable_reader_handle_v2::evictable_reader_handle_v2::pause() {
     _r->pause();
 }
 
-flat_mutation_reader_v2 make_auto_paused_evictable_reader_v2(
+mutation_reader make_auto_paused_evictable_reader_v2(
         mutation_source ms,
         schema_ptr schema,
         reader_permit permit,
@@ -669,11 +677,11 @@ flat_mutation_reader_v2 make_auto_paused_evictable_reader_v2(
         const query::partition_slice& ps,
         tracing::trace_state_ptr trace_state,
         mutation_reader::forwarding fwd_mr) {
-    return make_flat_mutation_reader_v2<evictable_reader_v2>(evictable_reader_v2::auto_pause::yes, std::move(ms), std::nullopt, std::move(schema), std::move(permit), pr, ps,
+    return make_mutation_reader<evictable_reader_v2>(evictable_reader_v2::auto_pause::yes, std::move(ms), std::nullopt, std::move(schema), std::move(permit), pr, ps,
             std::move(trace_state), fwd_mr);
 }
 
-std::pair<flat_mutation_reader_v2, evictable_reader_handle_v2> make_manually_paused_evictable_reader_v2(
+std::pair<mutation_reader, evictable_reader_handle_v2> make_manually_paused_evictable_reader_v2(
         mutation_source ms,
         schema_ptr schema,
         reader_permit permit,
@@ -684,10 +692,15 @@ std::pair<flat_mutation_reader_v2, evictable_reader_handle_v2> make_manually_pau
     auto reader = std::make_unique<evictable_reader_v2>(evictable_reader_v2::auto_pause::no, std::move(ms), std::nullopt, std::move(schema), std::move(permit), pr, ps,
             std::move(trace_state), fwd_mr);
     auto handle = evictable_reader_handle_v2(*reader.get());
-    return std::pair(flat_mutation_reader_v2(std::move(reader)), handle);
+    return std::pair(mutation_reader(std::move(reader)), handle);
 }
 
 namespace {
+
+struct buffer_fill_hint {
+    size_t size;
+    dht::token stop_token;
+};
 
 // A special-purpose shard reader.
 //
@@ -695,10 +708,10 @@ namespace {
 // supports read-ahead (background fill_buffer() calls).
 // This reader is not for general use, it was designed to serve the
 // multishard_combining_reader.
-// Although it implements the flat_mutation_reader_v2:impl interface it cannot be
-// wrapped into a flat_mutation_reader_v2, as it needs to be managed by a shared
+// Although it implements the mutation_reader:impl interface it cannot be
+// wrapped into a mutation_reader, as it needs to be managed by a shared
 // pointer.
-class shard_reader_v2 : public flat_mutation_reader_v2::impl {
+class shard_reader_v2 : public mutation_reader::impl {
 private:
     shared_ptr<reader_lifecycle_policy_v2> _lifecycle_policy;
     const unsigned _shard;
@@ -710,7 +723,8 @@ private:
     foreign_ptr<std::unique_ptr<evictable_reader_v2>> _reader;
 
 private:
-    future<> do_fill_buffer();
+    future<remote_fill_buffer_result_v2> fill_reader_buffer(evictable_reader_v2& reader, std::optional<buffer_fill_hint> hint);
+    future<> do_fill_buffer(std::optional<buffer_fill_hint> hint);
 
 public:
     shard_reader_v2(
@@ -740,7 +754,10 @@ public:
     const mutation_fragment_v2& peek_buffer() const {
         return buffer().front();
     }
-    virtual future<> fill_buffer() override;
+    future<> fill_buffer(std::optional<buffer_fill_hint> hint);
+    virtual future<> fill_buffer() override {
+        return fill_buffer(std::nullopt);
+    }
     virtual future<> next_partition() override;
     virtual future<> fast_forward_to(const dht::partition_range& pr) override;
     virtual future<> fast_forward_to(position_range) override;
@@ -773,7 +790,7 @@ future<> shard_reader_v2::close() noexcept {
             }
 
             auto irh = std::move(*_reader).inactive_read_handle();
-            return with_closeable(flat_mutation_reader_v2(_reader.release()), [this] (flat_mutation_reader_v2& reader) mutable {
+            return with_closeable(mutation_reader(_reader.release()), [this] (mutation_reader& reader) mutable {
                 auto permit = reader.permit();
                 const auto& schema = *reader.schema();
 
@@ -785,7 +802,7 @@ future<> shard_reader_v2::close() noexcept {
                 }
 
                 return unconsumed_fragments;
-            }).then([this, irh = std::move(irh)] (flat_mutation_reader_v2::tracked_buffer&& buf) mutable {
+            }).then([this, irh = std::move(irh)] (mutation_reader::tracked_buffer&& buf) mutable {
                 return _lifecycle_policy->destroy_reader({std::move(irh), std::move(buf)});
             });
         });
@@ -794,7 +811,40 @@ future<> shard_reader_v2::close() noexcept {
     }
 }
 
-future<> shard_reader_v2::do_fill_buffer() {
+future<remote_fill_buffer_result_v2> shard_reader_v2::fill_reader_buffer(evictable_reader_v2& reader, std::optional<buffer_fill_hint> hint) {
+    evictable_reader_v2::auto_pause_disable_guard auto_pause_guard{reader};
+    reader_permit::need_cpu_guard ncpu_guard{reader.permit()};
+
+    co_await reader.fill_buffer();
+
+    if (!hint) {
+        co_return remote_fill_buffer_result_v2(reader.detach_buffer(), reader.is_end_of_stream());
+    }
+
+    mutation_reader::tracked_buffer buffer(reader.permit());
+    size_t buffer_size = 0;
+
+    auto drain_buffer_and_check_hint = [&] {
+        bool reached_stop_token = false;
+        while (!reader.is_buffer_empty()) {
+            auto mf = reader.pop_mutation_fragment();
+            reached_stop_token |= mf.is_partition_start() && mf.as_partition_start().key().token() >= hint->stop_token;
+            buffer.push_back(std::move(mf));
+            buffer_size += buffer.back().memory_usage();
+        }
+        // Finish reading if reader is EOS or we read enough.
+        // We read enough if we read at least max_buffer_size_in_bytes and we also fulfilled the hint.
+        return reader.is_end_of_stream() || ((reached_stop_token || buffer_size >= hint->size) && buffer_size >= max_buffer_size_in_bytes);
+    };
+
+    while (!drain_buffer_and_check_hint()) {
+        co_await reader.fill_buffer();
+    }
+
+    co_return remote_fill_buffer_result_v2(std::move(buffer), reader.is_end_of_stream());
+}
+
+future<> shard_reader_v2::do_fill_buffer(std::optional<buffer_fill_hint> hint) {
     struct reader_and_buffer_fill_result {
         foreign_ptr<std::unique_ptr<evictable_reader_v2>> reader;
         remote_fill_buffer_result_v2 result;
@@ -802,7 +852,7 @@ future<> shard_reader_v2::do_fill_buffer() {
 
     auto res = co_await std::invoke([&] () -> future<remote_fill_buffer_result_v2> {
         if (!_reader) {
-            reader_and_buffer_fill_result res = co_await smp::submit_to(_shard, coroutine::lambda([this, gs = global_schema_ptr(_schema)] () -> future<reader_and_buffer_fill_result> {
+            reader_and_buffer_fill_result res = co_await smp::submit_to(_shard, coroutine::lambda([this, gs = global_schema_ptr(_schema), hint] () -> future<reader_and_buffer_fill_result> {
                 auto ms = mutation_source([lifecycle_policy = _lifecycle_policy.get()] (
                             schema_ptr s,
                             reader_permit permit,
@@ -845,9 +895,7 @@ future<> shard_reader_v2::do_fill_buffer() {
 
                 try {
                     tracing::trace(_trace_state, "Creating shard reader on shard: {}", this_shard_id());
-                    reader_permit::need_cpu_guard ncpu_guard{rreader->permit()};
-                    co_await rreader->fill_buffer();
-                    auto res = remote_fill_buffer_result_v2(rreader->detach_buffer(), rreader->is_end_of_stream());
+                    auto res = co_await fill_reader_buffer(*rreader, hint);
                     co_return reader_and_buffer_fill_result{std::move(rreader), std::move(res)};
                 } catch (...) {
                     ex = std::current_exception();
@@ -858,10 +906,8 @@ future<> shard_reader_v2::do_fill_buffer() {
             _reader = std::move(res.reader);
             co_return std::move(res.result);
         } else {
-            co_return co_await smp::submit_to(_shard, coroutine::lambda([this] () -> future<remote_fill_buffer_result_v2>  {
-                reader_permit::need_cpu_guard ncpu_guard{_reader->permit()};
-                co_await _reader->fill_buffer();
-                co_return remote_fill_buffer_result_v2(_reader->detach_buffer(), _reader->is_end_of_stream());
+            co_return co_await smp::submit_to(_shard, coroutine::lambda([this, hint] () -> future<remote_fill_buffer_result_v2>  {
+                return fill_reader_buffer(*_reader, hint);
             }));
         }
     });
@@ -874,7 +920,7 @@ future<> shard_reader_v2::do_fill_buffer() {
     _end_of_stream = res.end_of_stream;
 }
 
-future<> shard_reader_v2::fill_buffer() {
+future<> shard_reader_v2::fill_buffer(std::optional<buffer_fill_hint> hint) {
     // FIXME: want to move this to the inner scopes but it makes clang miscompile the code.
     reader_permit::awaits_guard guard(_permit);
     if (_read_ahead) {
@@ -884,7 +930,7 @@ future<> shard_reader_v2::fill_buffer() {
     if (!is_buffer_empty()) {
         co_return;
     }
-    co_await do_fill_buffer();
+    co_await do_fill_buffer(hint);
 }
 
 future<> shard_reader_v2::next_partition() {
@@ -940,13 +986,13 @@ void shard_reader_v2::read_ahead() {
         return;
     }
 
-    _read_ahead.emplace(do_fill_buffer());
+    _read_ahead.emplace(do_fill_buffer(std::nullopt));
 }
 
 } // anonymous namespace
 
 // See make_multishard_combining_reader() for description.
-class multishard_combining_reader_v2 : public flat_mutation_reader_v2::impl {
+class multishard_combining_reader_v2 : public mutation_reader::impl {
     struct shard_and_token {
         shard_id shard;
         dht::token token;
@@ -968,6 +1014,9 @@ class multishard_combining_reader_v2 : public flat_mutation_reader_v2::impl {
     bool _crossed_shards;
     unsigned _concurrency = 1;
 
+    multishard_reader_buffer_hint _buffer_hint = multishard_reader_buffer_hint::no;
+    read_ahead _read_ahead = read_ahead::yes;
+
     void on_partition_range_change(const dht::partition_range& pr);
     bool maybe_move_to_next_shard(const dht::token* const t = nullptr);
     future<> handle_empty_reader_buffer();
@@ -982,7 +1031,9 @@ public:
             const dht::partition_range& pr,
             const query::partition_slice& ps,
             tracing::trace_state_ptr trace_state,
-            mutation_reader::forwarding fwd_mr);
+            mutation_reader::forwarding fwd_mr,
+            multishard_reader_buffer_hint buffer_hint,
+            read_ahead read_ahead);
 
     // this is captured.
     multishard_combining_reader_v2(const multishard_combining_reader_v2&) = delete;
@@ -1002,7 +1053,7 @@ void multishard_combining_reader_v2::on_partition_range_change(const dht::partit
     _shard_selection_min_heap.reserve(_sharder.shard_count());
 
     auto token = pr.start() ? pr.start()->value().token() : dht::minimum_token();
-    _current_shard = _sharder.shard_of(token);
+    _current_shard = _sharder.shard_for_reads(token);
 
     auto sharder = dht::ring_position_range_sharder(_sharder, pr);
 
@@ -1013,7 +1064,7 @@ void multishard_combining_reader_v2::on_partition_range_change(const dht::partit
     // We stop earlier if the sharder has no ranges for the remaining shards.
     for (next = sharder.next(*_schema); next && next->shard != _current_shard; next = sharder.next(*_schema)) {
         _shard_selection_min_heap.push_back(shard_and_token{next->shard, next->ring_range.start()->value().token()});
-        boost::push_heap(_shard_selection_min_heap);
+        std::ranges::push_heap(_shard_selection_min_heap, std::less<shard_and_token>{});
     }
 }
 
@@ -1022,13 +1073,13 @@ bool multishard_combining_reader_v2::maybe_move_to_next_shard(const dht::token* 
         return false;
     }
 
-    boost::pop_heap(_shard_selection_min_heap);
+    std::ranges::pop_heap(_shard_selection_min_heap, std::less<shard_and_token>{});
     const auto next_shard = _shard_selection_min_heap.back().shard;
     _shard_selection_min_heap.pop_back();
 
     if (t) {
         _shard_selection_min_heap.push_back(shard_and_token{_current_shard, *t});
-        boost::push_heap(_shard_selection_min_heap);
+        std::ranges::push_heap(_shard_selection_min_heap, std::less<shard_and_token>{});
     }
 
     _crossed_shards = true;
@@ -1052,7 +1103,7 @@ future<> multishard_combining_reader_v2::handle_empty_reader_buffer() {
         // If we crossed shards and the next reader has an empty buffer we
         // double concurrency so the next time we cross shards we will have
         // more chances of hitting the reader's buffer.
-        if (_crossed_shards) {
+        if (_crossed_shards && _read_ahead == read_ahead::yes) {
             _concurrency = std::min(_concurrency * 2, _sharder.shard_count());
 
             // Read ahead shouldn't change the min selection heap so we work on a local copy.
@@ -1062,13 +1113,18 @@ future<> multishard_combining_reader_v2::handle_empty_reader_buffer() {
             // background. They will be brought to the foreground when we move
             // to their respective shard.
             for (unsigned i = 1; i < _concurrency && !shard_selection_min_heap_copy.empty(); ++i) {
-                boost::pop_heap(shard_selection_min_heap_copy);
+                std::ranges::pop_heap(shard_selection_min_heap_copy, std::less<shard_and_token>{});
                 const auto next_shard = shard_selection_min_heap_copy.back().shard;
                 shard_selection_min_heap_copy.pop_back();
                 _shard_readers[next_shard]->read_ahead();
             }
         }
-        return reader.fill_buffer();
+        std::optional<buffer_fill_hint> hint;
+        if (_buffer_hint) {
+            hint.emplace(max_buffer_size_in_bytes - buffer_size(),
+                    _shard_selection_min_heap.empty() ? dht::maximum_token() : _shard_selection_min_heap.front().token);
+        }
+        return reader.fill_buffer(std::move(hint));
     }
 }
 
@@ -1081,8 +1137,25 @@ multishard_combining_reader_v2::multishard_combining_reader_v2(
         const dht::partition_range& pr,
         const query::partition_slice& ps,
         tracing::trace_state_ptr trace_state,
-        mutation_reader::forwarding fwd_mr)
-    : impl(std::move(s), std::move(permit)), _keep_alive_sharder(std::move(keep_alive_sharder)), _sharder(sharder) {
+        mutation_reader::forwarding fwd_mr,
+        multishard_reader_buffer_hint buffer_hint,
+        read_ahead read_ahead)
+    : impl(std::move(s), std::move(permit)), _keep_alive_sharder(std::move(keep_alive_sharder)), _sharder(sharder),
+            _buffer_hint(buffer_hint), _read_ahead(read_ahead) {
+
+    // The permit of the multishard reader is destroyed after the permits of its child readers.
+    // Therefore its semaphore resources won't be automatically released
+    // until children acquire their own resources.
+    //
+    // This creates a dependency (an edge in the "resource allocation graph"),
+    // where the semaphore used by the multishard reader depends on the semaphores used by children.
+    // When such dependencies create a cycle, and permits are acquired by different reads
+    // in just the right order, a deadlock will happen.
+    //
+    // One way to prevent the deadlock is to avoid the resource dependency by ensuring
+    // that the resources of multishard reader are released before the children attempt to acquire theirs.
+    // We do this here.
+    _permit.release_base_resources();
 
     on_partition_range_change(pr);
 
@@ -1138,7 +1211,7 @@ future<> multishard_combining_reader_v2::close() noexcept {
     });
 }
 
-flat_mutation_reader_v2 make_multishard_combining_reader_v2(
+mutation_reader make_multishard_combining_reader_v2(
         shared_ptr<reader_lifecycle_policy_v2> lifecycle_policy,
         schema_ptr schema,
         locator::effective_replication_map_ptr erm,
@@ -1146,13 +1219,15 @@ flat_mutation_reader_v2 make_multishard_combining_reader_v2(
         const dht::partition_range& pr,
         const query::partition_slice& ps,
         tracing::trace_state_ptr trace_state,
-        mutation_reader::forwarding fwd_mr) {
+        mutation_reader::forwarding fwd_mr,
+        multishard_reader_buffer_hint buffer_hint,
+        read_ahead read_ahead) {
     auto& sharder = erm->get_sharder(*schema);
-    return make_flat_mutation_reader_v2<multishard_combining_reader_v2>(sharder, std::any(std::move(erm)), std::move(lifecycle_policy),
-            std::move(schema), std::move(permit), pr, ps, std::move(trace_state), fwd_mr);
+    return make_mutation_reader<multishard_combining_reader_v2>(sharder, std::any(std::move(erm)), std::move(lifecycle_policy),
+            std::move(schema), std::move(permit), pr, ps, std::move(trace_state), fwd_mr, buffer_hint, read_ahead);
 }
 
-flat_mutation_reader_v2 make_multishard_combining_reader_v2_for_tests(
+mutation_reader make_multishard_combining_reader_v2_for_tests(
         const dht::sharder& sharder,
         shared_ptr<reader_lifecycle_policy_v2> lifecycle_policy,
         schema_ptr schema,
@@ -1160,7 +1235,9 @@ flat_mutation_reader_v2 make_multishard_combining_reader_v2_for_tests(
         const dht::partition_range& pr,
         const query::partition_slice& ps,
         tracing::trace_state_ptr trace_state,
-        mutation_reader::forwarding fwd_mr) {
-    return make_flat_mutation_reader_v2<multishard_combining_reader_v2>(sharder, std::any(),
-            std::move(lifecycle_policy), std::move(schema), std::move(permit), pr, ps, std::move(trace_state), fwd_mr);
+        mutation_reader::forwarding fwd_mr,
+        multishard_reader_buffer_hint buffer_hint,
+        read_ahead read_ahead) {
+    return make_mutation_reader<multishard_combining_reader_v2>(sharder, std::any(),
+            std::move(lifecycle_policy), std::move(schema), std::move(permit), pr, ps, std::move(trace_state), fwd_mr, buffer_hint, read_ahead);
 }

@@ -3,14 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <seastar/util/noncopyable_function.hh>
-
-#include "feed_writers.hh"
+#include "readers/mutation_reader.hh"
 
 namespace mutation_writer {
 
@@ -27,6 +25,6 @@ struct segregate_config {
 // streams that honor it.
 // This is useful for scrub compaction to split sstables containing out-of-order
 // and/or duplicate partitions into sstables that honor the partition ordering.
-future<> segregate_by_partition(flat_mutation_reader_v2 producer, segregate_config cfg, reader_consumer_v2 consumer);
+future<> segregate_by_partition(mutation_reader producer, segregate_config cfg, reader_consumer_v2 consumer);
 
 } // namespace mutation_writer

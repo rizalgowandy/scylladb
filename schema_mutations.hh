@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -137,3 +137,6 @@ public:
     friend std::ostream& operator<<(std::ostream&, const schema_mutations&);
 };
 
+template <> struct fmt::formatter<schema_mutations> : fmt::formatter<string_view> {
+    auto format(const schema_mutations&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

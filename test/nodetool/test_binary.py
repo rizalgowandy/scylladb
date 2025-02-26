@@ -1,10 +1,10 @@
 #
 # Copyright 2023-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
-from rest_api_mock import expected_request
+from test.nodetool.rest_api_mock import expected_request
 
 
 def test_disablebinary(nodetool):
@@ -18,10 +18,10 @@ def test_enablebinary(nodetool):
 
 
 def test_statusbinary(nodetool):
-    out = nodetool("statusbinary", expected_requests=[
+    res = nodetool("statusbinary", expected_requests=[
         expected_request("GET", "/storage_service/native_transport", response=False)])
-    assert out == "not running\n"
+    assert res.stdout == "not running\n"
 
-    out = nodetool("statusbinary", expected_requests=[
+    res = nodetool("statusbinary", expected_requests=[
         expected_request("GET", "/storage_service/native_transport", response=True)])
-    assert out == "running\n"
+    assert res.stdout == "running\n"

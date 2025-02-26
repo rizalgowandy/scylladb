@@ -5,13 +5,12 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 
 #include "cql3/statements/strongly_consistent_modification_statement.hh"
 
-#include <boost/range/adaptors.hpp>
 #include <optional>
 
 #include <seastar/core/future.hh>
@@ -21,7 +20,6 @@
 #include "cql3/attributes.hh"
 #include "cql3/expr/expression.hh"
 #include "cql3/expr/evaluate.hh"
-#include "cql3/operation.hh"
 #include "cql3/query_processor.hh"
 #include "cql3/values.hh"
 #include "timeout_config.hh"

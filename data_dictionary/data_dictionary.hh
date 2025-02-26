@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -87,6 +87,7 @@ private:
     keyspace(const impl* ops, const void* keyspace);
 public:
     bool is_internal() const;
+    bool uses_tablets() const;
     lw_shared_ptr<keyspace_metadata> metadata() const;
     const user_types_metadata& user_types() const;
     const locator::abstract_replication_strategy& get_replication_strategy() const;
@@ -120,11 +121,12 @@ public:
     schema_ptr find_indexed_table(std::string_view ks_name, std::string_view index_name) const;
     sstring get_available_index_name(std::string_view ks_name, std::string_view table_name,
                                                std::optional<sstring> index_name_root) const;
-    schema_ptr get_cdc_base_table(sstring_view ks_name, std::string_view table_name) const;
+    schema_ptr get_cdc_base_table(std::string_view ks_name, std::string_view table_name) const;
     schema_ptr get_cdc_base_table(const schema&) const;
     const db::extensions& extensions() const;
     const gms::feature_service& features() const;
     replica::database& real_database() const; // For transition; remove
+    replica::database* real_database_ptr() const;
 };
 
 }

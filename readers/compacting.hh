@@ -3,14 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "gc_clock.hh"
-#include "readers/flat_mutation_reader_fwd.hh"
-#include "timestamp.hh"
+#include "readers/mutation_reader_fwd.hh"
+#include "compaction/compaction_garbage_collector.hh"
 
 namespace dht {
 class decorated_key;
@@ -33,7 +33,7 @@ class tombstone_gc_state;
 /// reader supports it
 /// Intra-partition forwarding: `fast_forward_to(position_range)` is supported
 /// if the source reader supports it
-flat_mutation_reader_v2 make_compacting_reader(flat_mutation_reader_v2 source, gc_clock::time_point compaction_time,
-        std::function<api::timestamp_type(const dht::decorated_key&)> get_max_purgeable,
+mutation_reader make_compacting_reader(mutation_reader source, gc_clock::time_point compaction_time,
+        max_purgeable_fn get_max_purgeable,
         const tombstone_gc_state& gc_state,
         streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no);

@@ -3,8 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
+
+#pragma once
 
 #include <boost/program_options.hpp>
 #include <seastar/core/app-template.hh>
@@ -81,13 +83,13 @@ public:
 };
 
 class operation {
-    std::string _name;
+    std::vector<std::string> _name = {};
     std::vector<std::string> _aliases;
     std::string _summary;
     std::string _description;
     std::vector<operation_option> _options;
     std::vector<operation_option> _positional_options;
-
+    std::vector<operation> _suboperations;
 public:
     operation(
             std::string name,
@@ -95,13 +97,18 @@ public:
             std::string summary,
             std::string description,
             std::vector<operation_option> options = {},
-            std::vector<operation_option> positional_options = {})
-        : _name(std::move(name))
+            std::vector<operation_option> positional_options = {},
+            std::vector<operation> suboperations = {})
+        : _name({std::move(name)})
         , _aliases(std::move(aliases))
         , _summary(std::move(summary))
         , _description(std::move(description))
         , _options(std::move(options))
-        , _positional_options(std::move(positional_options)) {
+        , _positional_options(std::move(positional_options))
+        , _suboperations(std::move(suboperations)) {
+        for (auto& op: _suboperations) {
+            op.set_superoperation_name(_name[0]);
+        }
     }
 
     operation(
@@ -109,19 +116,29 @@ public:
             std::string summary,
             std::string description,
             std::vector<operation_option> options = {},
-            std::vector<operation_option> positional_options = {})
-        : operation(std::move(name), {}, std::move(summary), std::move(description), std::move(options), std::move(positional_options))
+            std::vector<operation_option> positional_options = {},
+            std::vector<operation> suboperations = {})
+        : operation(std::move(name), {}, std::move(summary), std::move(description), std::move(options), std::move(positional_options), std::move(suboperations))
     {}
 
-    const std::string& name() const { return _name; }
-    const std::vector<std::string> aliases() const { return _aliases; }
+    const std::string& name() const { return _name[0]; }
+    const std::vector<std::string>& fullname() const { return _name; }
+    const std::vector<std::string>& aliases() const { return _aliases; }
     const std::string& summary() const { return _summary; }
     const std::string& description() const { return _description; }
     const std::vector<operation_option>& options() const { return _options; }
     const std::vector<operation_option>& positional_options() const { return _positional_options; }
+    const std::vector<operation>& suboperations() const { return _suboperations; }
 
     // Does the name or any of the aliases matches the provided name?
     bool matches(std::string_view name) const;
+private:
+    void set_superoperation_name(std::string& name) {
+        _name.push_back(name);
+        for (auto& op: _suboperations) {
+            op.set_superoperation_name(name);
+        }
+    }
 };
 
 inline bool operator<(const operation& a, const operation& b) {
@@ -140,6 +157,9 @@ struct db_config_and_extensions {
 };
 
 class tool_app_template {
+public:
+    static const std::vector<std::pair<const char*, const char*>> help_arguments;
+
 public:
     struct config {
         sstring name;

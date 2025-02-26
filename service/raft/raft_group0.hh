@@ -3,14 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #pragma once
 
+#include "service/raft/join_node.hh"
 #include "service/raft/raft_group_registry.hh"
 #include "service/raft/discovery.hh"
 #include "service/raft/group0_fwd.hh"
 #include "gms/feature.hh"
+#include "utils/updateable_value.hh"
 
 namespace cql3 { class query_processor; }
 
@@ -20,9 +22,14 @@ namespace gms { class gossiper; class feature_service; }
 
 namespace service {
 
+extern const char* const raft_upgrade_doc;
+
 class migration_manager;
 class raft_group0_client;
 class storage_service;
+
+struct can_vote_tag {};
+using can_vote = bool_class<can_vote_tag>;
 
 // Wrapper for `discovery` which persists the learned peers on disk.
 class persistent_discovery {
@@ -99,6 +106,7 @@ class raft_group0 {
     gms::feature_service& _feat;
     db::system_keyspace& _sys_ks;
     raft_group0_client& _client;
+    seastar::scheduling_group _sg;
 
     // Status of leader discovery. Initially there is no group 0,
     // and the variant contains no state. During initial cluster
@@ -114,8 +122,7 @@ class raft_group0 {
 
     // Status of the raft group0 for monitoring.
     enum class status_for_monitoring : uint8_t {
-        // Raft is disabled.
-        disabled = 0,
+        unused = 0,
         normal = 1,
         aborted = 2
     } _status_for_monitoring;
@@ -124,11 +131,11 @@ class raft_group0 {
     future<> leadership_monitor_fiber();
     future<> _leadership_monitor = make_ready_future<>();
     abort_source _leadership_monitor_as;
+    utils::updateable_value_source<bool> _leadership_observable;
 
 public:
     // Passed to `setup_group0` when replacing a node.
     struct replace_info {
-        gms::inet_address ip_addr;
         raft::server_id raft_id;
     };
 
@@ -139,19 +146,24 @@ public:
         gms::gossiper& gs,
         gms::feature_service& feat,
         db::system_keyspace& sys_ks,
-        raft_group0_client& client);
+        raft_group0_client& client,
+        seastar::scheduling_group sg);
 
     // Initialises RPC verbs on all shards.
     // Call after construction but before using the object.
     future<> start();
 
-    // Return true if Raft is enabled (but not necessarily having
-    // an active group 0 - e.g. in case we haven't completed an
-    // upgrade of a heterogeneous cluster yet.
-    bool is_raft_enabled() const { return _raft_gr.is_enabled(); }
-
     // Call before destroying the object.
     future<> abort();
+
+    // Run the discovery algorithm.
+    //
+    // Discovers an existing group 0 cluster or elects a server (called a 'leader')
+    // responsible for creating a new group 0 cluster if one doesn't exist
+    // (in particular, we may become that leader).
+    //
+    // See 'raft-in-scylla.md', 'Establishing group 0 in a fresh cluster'.
+    future<group0_info> discover_group0(const std::vector<gms::inet_address>& seeds, cql3::query_processor& qp);
 
     // Call during the startup procedure, after gossiping has started.
     //
@@ -166,7 +178,8 @@ public:
     //
     // Also make sure to call `finish_setup_after_join` after the node has joined the cluster and entered NORMAL state.
     future<> setup_group0(db::system_keyspace&, const std::unordered_set<gms::inet_address>& initial_contact_nodes, shared_ptr<group0_handshaker> handshaker,
-                          std::optional<replace_info>, service::storage_service& ss, cql3::query_processor& qp, service::migration_manager& mm, bool topology_change_enabled);
+                          std::optional<replace_info>, service::storage_service& ss, cql3::query_processor& qp, service::migration_manager& mm, bool topology_change_enabled,
+                          const join_node_request_params& params);
 
     // Call during the startup procedure before networking is enabled.
     //
@@ -177,7 +190,7 @@ public:
     //
     // Cannot be called twice.
     //
-    future<> setup_group0_if_exist(db::system_keyspace&, service::storage_service& ss, cql3::query_processor& qp, service::migration_manager& mm, bool topology_change_enabled);
+    future<> setup_group0_if_exist(db::system_keyspace&, service::storage_service& ss, cql3::query_processor& qp, service::migration_manager& mm);
 
     // Call at the end of the startup procedure, after the node entered NORMAL state.
     // `setup_group0()` must have finished earlier.
@@ -210,13 +223,19 @@ public:
     //
     // Assumes we've finished the startup procedure (`setup_group0()` finished earlier).
     // `wait_for_raft` must've also been called earlier and returned `true`.
-    future<> become_nonvoter();
+    future<> become_nonvoter(abort_source& as, std::optional<raft_timeout> timeout = std::nullopt);
 
-    // Make the given server, other than us, a non-voter in group 0.
+    // Set the voter status of the given server, other than us, in group 0.
     //
     // Assumes we've finished the startup procedure (`setup_group0()` finished earlier).
     // `wait_for_raft` must've also been called earlier and returned `true`.
-    future<> make_nonvoter(raft::server_id);
+    future<> set_voter_status(raft::server_id, can_vote, abort_source&, std::optional<raft_timeout> timeout = std::nullopt);
+
+    // Set the voter status of the given servers, other than us, in group 0.
+    //
+    // Assumes we've finished the startup procedure (`setup_group0()` finished earlier).
+    // `wait_for_raft` must've also been called earlier and returned `true`.
+    future<> set_voters_status(const std::unordered_set<raft::server_id>&, can_vote, abort_source&, std::optional<raft_timeout> timeout = std::nullopt);
 
     // Remove ourselves from group 0.
     //
@@ -256,7 +275,11 @@ public:
     // It is meant to be used as a fallback when a proper handshake procedure
     // cannot be used (e.g. when completing the upgrade or group0 procedures
     // or when joining an old cluster which does not support JOIN_NODE RPC).
-    shared_ptr<group0_handshaker> make_legacy_handshaker(bool can_vote);
+    shared_ptr<group0_handshaker> make_legacy_handshaker(can_vote can_vote);
+
+    // Waits until all upgrade to raft group 0 finishes and all nodes switched
+    // to use_post_raft_procedures.
+    future<> wait_for_all_nodes_to_finish_upgrade(abort_source& as);
 
     raft_group0_client& client() {
         return _client;
@@ -268,10 +291,25 @@ public:
         return _raft_gr.group0();
     }
 
+    // Returns a wrapper for the group0_server() with timeouts support.
+    raft_server_with_timeouts group0_server_with_timeouts() {
+        return _raft_gr.group0_with_timeouts();
+    }
+
+    // Hold shutdown gate to be waited during shutdown
+    gate::holder hold_group0_gate() {
+        return _shutdown_gate.hold();
+    }
+
     // Returns true after the group 0 server has been started.
     bool joined_group0() const;
 
-    const raft_address_map& address_map() const;
+    utils::observer<bool> observe_leadership(std::function<void(bool)>);
+
+    // Returns scheduling group group0 is configured to run with
+    seastar::scheduling_group get_scheduling_group() {
+        return _sg;
+    }
 private:
     static void init_rpc_verbs(raft_group0& shard0_this);
     static future<> uninit_rpc_verbs(netw::messaging_service& ms);
@@ -286,16 +324,6 @@ private:
 
     raft_server_for_group create_server_for_group0(raft::group_id id, raft::server_id my_id, service::storage_service& ss, cql3::query_processor& qp,
         service::migration_manager& mm, bool topology_change_enabled);
-
-    // Run the discovery algorithm.
-    //
-    // Discovers an existing group 0 cluster or elects a server (called a 'leader')
-    // responsible for creating a new group 0 cluster if one doesn't exist
-    // (in particular, we may become that leader).
-    //
-    // See 'raft-in-scylla.md', 'Establishing group 0 in a fresh cluster'.
-    future<group0_info> discover_group0(raft::server_id my_id,
-        const std::vector<gms::inet_address>& seeds, cql3::query_processor& qp);
 
     // Creates or joins group 0 and switches schema/topology changes to use group 0.
     // Can be restarted after a crash. Does nothing if the procedure was already finished once.
@@ -337,7 +365,8 @@ private:
     // Preconditions: Raft local feature enabled
     // and we haven't initialized group 0 yet after last Scylla start (`joined_group0()` is false).
     // Postcondition: `joined_group0()` is true.
-    future<> join_group0(std::vector<gms::inet_address> seeds, shared_ptr<group0_handshaker> handshaker, service::storage_service& ss, cql3::query_processor& qp, service::migration_manager& mm, db::system_keyspace& sys_ks, bool topology_change_enabled);
+    future<> join_group0(std::vector<gms::inet_address> seeds, shared_ptr<group0_handshaker> handshaker, service::storage_service& ss, cql3::query_processor& qp, service::migration_manager& mm, db::system_keyspace& sys_ks, bool topology_change_enabled,
+            const join_node_request_params& params);
 
     // Start an existing Raft server for the cluster-wide group 0.
     // Assumes the server was already added to the group earlier so we don't attempt to join it again.
@@ -352,13 +381,10 @@ private:
     // (we could then try restarting the server internally).
     future<> start_server_for_group0(raft::group_id group0_id, service::storage_service& ss, cql3::query_processor& qp, service::migration_manager& mm, bool topology_change_enabled);
 
-    // Make the given server a non-voter in Raft group 0 configuration.
+    // Modify the given server voter status in Raft group 0 configuration.
     // Retries on raft::commit_status_unknown.
-    future<> make_raft_config_nonvoter(raft::server_id);
-
-    // Load the initial Raft <-> IP address map as seen by
-    // the gossiper.
-    void load_initial_raft_address_map();
+    future<> modify_raft_voter_status(
+            const std::unordered_set<raft::server_id>&, can_vote, abort_source& as, std::optional<raft_timeout> timeout = std::nullopt);
 
     // Returns true if raft is enabled
     future<bool> use_raft();

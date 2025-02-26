@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -11,6 +11,7 @@
 #include <memory>
 #include <random>
 #include <bit>
+#include <fmt/std.h>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/sleep.hh>
@@ -26,7 +27,9 @@
 #include "raft/server.hh"
 #include "serializer.hh"
 #include "serializer_impl.hh"
+#include "utils/assert.hh"
 #include "utils/xx_hasher.hh"
+#include "utils/to_string.hh"
 #include "test/raft/helpers.hh"
 #include "test/lib/eventually.hh"
 #include "test/lib/random_utils.hh"
@@ -431,7 +434,7 @@ public:
     future<> load_snapshot(raft::snapshot_id snp_id) override {
         hasher = make_lw_shared<hasher_int>((*_snapshots)[_id][snp_id].hasher);
         tlogger.debug("sm[{}] loads snapshot {} idx={}", _id, (*_snapshots)[_id][snp_id].hasher.finalize_uint64(), (*_snapshots)[_id][snp_id].idx);
-        _seen = (*_snapshots)[_id][snp_id].idx;
+        _seen = (*_snapshots)[_id][snp_id].idx.value();
         if (_seen >= _apply_entries) {
             _done.set_value();
         }
@@ -943,7 +946,7 @@ template <typename Clock>
 future<> raft_cluster<Clock>::add_entries_concurrent(size_t n, std::optional<size_t> server) {
     const auto start = _next_val;
     _next_val += n;
-    return parallel_for_each(boost::irange(start, _next_val), [this, server](size_t v) { return add_entry(v, server); });
+    return parallel_for_each(std::views::iota(start, _next_val), [this, server](size_t v) { return add_entry(v, server); });
 }
 
 template <typename Clock>
@@ -951,7 +954,7 @@ future<> raft_cluster<Clock>::add_entry(size_t val, std::optional<size_t> server
     while (true) {
         try {
             auto& at = _servers[server ? *server : _leader].server;
-            co_await at->add_entry(create_command(val), raft::wait_type::committed);
+            co_await at->add_entry(create_command(val), raft::wait_type::committed, nullptr);
             break;
         } catch (raft::commit_status_unknown& e) {
             // FIXME: in some cases when we get `commit_status_unknown` the entry may have been applied.
@@ -1017,7 +1020,7 @@ void raft_cluster<Clock>::set_ticker_callback(size_t id) noexcept {
     });
 }
 
-std::vector<raft::log_entry> create_log(std::vector<log_entry> list, unsigned start_idx);
+std::vector<raft::log_entry> create_log(std::vector<log_entry> list, raft::index_t start_idx);
 
 size_t apply_changes(raft::server_id id, const std::vector<raft::command_cref>& commands,
         lw_shared_ptr<hasher_int> hasher);
@@ -1201,7 +1204,7 @@ future<> raft_cluster<Clock>::change_configuration(set_config sc) {
     }
 
     tlogger.debug("Changing configuration on leader {}", _leader);
-    co_await _servers[_leader].server->set_configuration(std::move(set));
+    co_await _servers[_leader].server->set_configuration(std::move(set), nullptr);
 
     if (!new_config.contains(_leader)) {
         co_await free_election();
@@ -1211,7 +1214,7 @@ future<> raft_cluster<Clock>::change_configuration(set_config sc) {
     // Add a dummy entry to confirm new configuration was committed
     try {
         co_await _servers[_leader].server->add_entry(create_command(dummy_command),
-                raft::wait_type::committed);
+                raft::wait_type::committed, nullptr);
     } catch (raft::not_a_leader& e) {
         // leader stepped down, implying config fully changed
     } catch (raft::commit_status_unknown& e) {}
@@ -1233,7 +1236,7 @@ future<> raft_cluster<Clock>::check_rpc_config(::check_rpc_config cc) {
     for (auto& node: cc.nodes) {
         BOOST_CHECK(node.id < _servers.size());
         co_await seastar::async([&] {
-            CHECK_EVENTUALLY_EQUAL(_servers[node.id].rpc->known_peers(), as);
+            BOOST_CHECK(eventually_true([&] { return _servers[node.id].rpc->known_peers() == as; }));
         });
     }
 }
@@ -1286,7 +1289,7 @@ future<> raft_cluster<Clock>::partition(::partition p) {
         } else if (std::holds_alternative<struct range>(s)) {
             auto range = std::get<struct range>(s);
             for (size_t id = range.start; id <= range.end; id++) {
-                assert(id < _servers.size());
+                SCYLLA_ASSERT(id < _servers.size());
                 partition_servers.insert(id);
             }
         } else {
@@ -1338,7 +1341,7 @@ future<> raft_cluster<Clock>::tick(::tick t) {
 
 template <typename Clock>
 future<> raft_cluster<Clock>::read(read_value r) {
-    co_await _servers[r.node_idx].server->read_barrier();
+    co_await _servers[r.node_idx].server->read_barrier(nullptr);
     auto val = _servers[r.node_idx].sm->hasher->finalize_uint64();
     auto expected = hasher_int::hash_range(r.expected_index).finalize_uint64();
     BOOST_CHECK_MESSAGE(val == expected,
@@ -1388,7 +1391,7 @@ void raft_cluster<Clock>::verify() {
         for (auto& s : (*_persisted_snapshots)) {
             auto& [snp, val] = s.second;
             auto digest = val.hasher.finalize_uint64();
-            auto expected = hasher_int::hash_range(val.idx).finalize_uint64();
+            auto expected = hasher_int::hash_range(val.idx.value()).finalize_uint64();
             BOOST_CHECK_MESSAGE(digest == expected,
                                 format("Persisted snapshot {} doesn't match {} != {}", snp.id, digest, expected));
         }
@@ -1405,12 +1408,12 @@ std::vector<initial_state> raft_cluster<Clock>::get_states(test_case test, bool 
 
     // Server initial logs, etc
     for (size_t i = 0; i < states.size(); ++i) {
-        size_t start_idx = 1;
+        raft::index_t start_idx{1};
         if (i < test.initial_snapshots.size()) {
             states[i].snapshot = test.initial_snapshots[i].snap;
-            states[i].snp_value.hasher = hasher_int::hash_range(test.initial_snapshots[i].snap.idx);
+            states[i].snp_value.hasher = hasher_int::hash_range(test.initial_snapshots[i].snap.idx.value());
             states[i].snp_value.idx = test.initial_snapshots[i].snap.idx;
-            start_idx = states[i].snapshot.idx + 1;
+            start_idx = states[i].snapshot.idx + raft::index_t{1};
         }
         if (i < test.initial_states.size()) {
             auto state = test.initial_states[i];

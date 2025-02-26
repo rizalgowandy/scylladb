@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/sstring.hh>
@@ -27,11 +27,11 @@
 #include "schema/schema.hh"
 #include "compress.hh"
 #include "replica/database.hh"
-#include <memory>
 #include "test/boost/sstable_test.hh"
 #include "test/lib/tmpdir.hh"
 #include "partition_slice_builder.hh"
 #include "sstables/sstable_mutation_reader.hh"
+#include "sstables/binary_search.hh"
 
 #include <boost/range/combine.hpp>
 
@@ -42,8 +42,8 @@ bytes as_bytes(const sstring& s) {
 }
 
 future<> test_using_working_sst(schema_ptr s, sstring dir) {
-    return test_env::do_with([s = std::move(s), dir = std::move(dir)] (test_env& env) {
-        return env.reusable_sst(std::move(s), std::move(dir)).discard_result();
+    return test_env::do_with_async([s = std::move(s), dir = std::move(dir)] (test_env& env) {
+        (void)env.reusable_sst(std::move(s), std::move(dir)).get();
     });
 }
 
@@ -52,7 +52,7 @@ SEASTAR_TEST_CASE(uncompressed_data) {
 }
 
 static auto make_schema_for_compressed_sstable() {
-    return make_shared_schema({}, "ks", "cf", {{"pk", utf8_type}}, {}, {}, {}, utf8_type);
+    return schema_builder("ks", "cf").with_column("pk", utf8_type, column_kind::partition_key).build();
 }
 
 SEASTAR_TEST_CASE(compressed_data) {
@@ -64,58 +64,48 @@ SEASTAR_TEST_CASE(composite_index) {
     return test_using_working_sst(composite_schema(), "test/resource/sstables/composite");
 }
 
-template<typename Func>
-inline auto
+template<std::invocable<test_env&, sstable_ptr> Func>
+inline future<std::invoke_result_t<Func, test_env&, sstable_ptr>>
 test_using_reusable_sst(schema_ptr s, sstring dir, sstables::generation_type::int_t gen, Func&& func) {
-    return test_env::do_with([s = std::move(s), dir = std::move(dir), gen, func = std::move(func)] (test_env& env) {
-        return env.reusable_sst(std::move(s), std::move(dir), generation_from_value(gen)).then([&env, func = std::move(func)] (sstable_ptr sst) mutable {
-            return func(env, std::move(sst));
-        });
+    using ret_type = std::invoke_result_t<Func, test_env&, sstable_ptr>;
+    return test_env::do_with_async_returning<ret_type>([s = std::move(s), dir = std::move(dir), gen, func = std::move(func)] (test_env& env) {
+        auto sst = env.reusable_sst(std::move(s), std::move(dir), generation_from_value(gen)).get();
+        return func(env, std::move(sst));
     });
 }
 
 future<std::vector<partition_key>> index_read(schema_ptr schema, sstring path) {
     return test_using_reusable_sst(std::move(schema), std::move(path), 1, [] (test_env& env, sstable_ptr ptr) {
-        return sstables::test(ptr).read_indexes(env.make_reader_permit()).then([] (auto&& indexes) {
-            return boost::copy_range<std::vector<partition_key>>(
-                    indexes | boost::adaptors::transformed([] (const sstables::test::index_entry& e) { return e.key; }));
-        });
+        auto indexes = sstables::test(ptr).read_indexes(env.make_reader_permit()).get();
+        return indexes | std::views::transform([] (const sstables::test::index_entry& e) { return e.key; }) | std::ranges::to<std::vector<partition_key>>();
     });
 }
 
 SEASTAR_TEST_CASE(simple_index_read) {
-    return index_read(uncompressed_schema(), uncompressed_dir()).then([] (auto vec) {
-        BOOST_REQUIRE(vec.size() == 4);
-    });
+    auto vec = co_await index_read(uncompressed_schema(), uncompressed_dir());
+    BOOST_REQUIRE(vec.size() == 4);
 }
 
 SEASTAR_TEST_CASE(composite_index_read) {
-    return index_read(composite_schema(), "test/resource/sstables/composite").then([] (auto vec) {
-        BOOST_REQUIRE(vec.size() == 20);
-    });
+    auto vec = co_await index_read(composite_schema(), "test/resource/sstables/composite");
+    BOOST_REQUIRE(vec.size() == 20);
 }
 
 template<uint64_t Position, uint64_t EntryPosition, uint64_t EntryKeySize>
 future<> summary_query(schema_ptr schema, sstring path, sstables::generation_type::int_t generation) {
     return test_using_reusable_sst(std::move(schema), path, generation, [] (test_env& env, sstable_ptr ptr) {
-        return sstables::test(ptr).read_summary_entry(Position).then([ptr] (auto entry) {
-            BOOST_REQUIRE(entry.position == EntryPosition);
-            BOOST_REQUIRE(entry.key.size() == EntryKeySize);
-            return make_ready_future<>();
-        });
+        auto entry = sstables::test(ptr).read_summary_entry(Position).get();
+        BOOST_REQUIRE(entry.position == EntryPosition);
+        BOOST_REQUIRE(entry.key.size() == EntryKeySize);
     });
 }
 
 template<uint64_t Position, uint64_t EntryPosition, uint64_t EntryKeySize>
 future<> summary_query_fail(schema_ptr schema, sstring path, sstables::generation_type::int_t generation) {
-    return summary_query<Position, EntryPosition, EntryKeySize>(std::move(schema), path, generation).then_wrapped([] (auto fut) {
-        try {
-            fut.get();
-        } catch (std::out_of_range& ok) {
-            return make_ready_future<>();
-        }
-        return make_ready_future<>();
-    });
+    try {
+        co_await summary_query<Position, EntryPosition, EntryKeySize>(std::move(schema), std::move(path), generation);
+    } catch (const std::out_of_range&) {
+    }
 }
 
 SEASTAR_TEST_CASE(small_summary_query_ok) {
@@ -163,45 +153,36 @@ SEASTAR_TEST_CASE(missing_summary_interval_1_query_ok) {
 
 SEASTAR_TEST_CASE(missing_summary_first_last_sane) {
     return test_using_reusable_sst(uncompressed_schema(), uncompressed_dir(), 2, [] (test_env& env, shared_sstable ptr) {
-        auto& summary = sstables::test(ptr).get_summary();
+        const auto& summary = ptr->get_summary();
         BOOST_REQUIRE(summary.header.size == 1);
         BOOST_REQUIRE(summary.positions.size() == 1);
         BOOST_REQUIRE(summary.entries.size() == 1);
         BOOST_REQUIRE(bytes_view(summary.first_key) == as_bytes("vinna"));
         BOOST_REQUIRE(bytes_view(summary.last_key) == as_bytes("finna"));
-        return make_ready_future<>();
     });
 }
 
 static future<sstable_ptr> do_write_sst(test_env& env, schema_ptr schema, sstring load_dir, sstring write_dir, sstables::generation_type generation) {
-    return env.reusable_sst(std::move(schema), load_dir, generation).then([write_dir, generation] (sstable_ptr sst) mutable {
-        sstable_generation_generator gen{generation.as_int()};
-        sstables::test(sst).change_generation_number(gen());
-        sstables::test(sst).change_dir(write_dir);
-        auto fut = sstables::test(sst).store();
-        return std::move(fut).then([sst = std::move(sst)] {
-            return make_ready_future<sstable_ptr>(std::move(sst));
-        });
-    });
+    auto sst = co_await env.reusable_sst(std::move(schema), load_dir, generation);
+    sstable_generation_generator gen(generation.as_int());
+    co_await sstables::test(sst).store(write_dir, gen());
+    co_return sst;
 }
 
 static future<> write_sst_info(schema_ptr schema, sstring load_dir, sstring write_dir, sstables::generation_type generation) {
-    return test_env::do_with([schema = std::move(schema), load_dir = std::move(load_dir), write_dir = std::move(write_dir), generation] (test_env& env) {
-        return do_write_sst(env, std::move(schema), load_dir, write_dir, generation).then([] (auto ptr) { return make_ready_future<>(); });
+    return test_env::do_with_async([schema = std::move(schema), load_dir = std::move(load_dir), write_dir = std::move(write_dir),
+                                    generation = std::move(generation)] (test_env& env) {
+        (void)do_write_sst(env, std::move(schema), std::move(load_dir), std::move(write_dir), std::move(generation)).get();
     });
 }
 
 static future<> check_component_integrity(component_type component) {
-    auto tmp = make_lw_shared<tmpdir>();
-    auto s = make_schema_for_compressed_sstable();
-    sstables::generation_type gen(1);
-    return write_sst_info(s, "test/resource/sstables/compressed", tmp->path().string(), gen).then([component, tmp] {
-        auto file_path_a = sstable::filename("test/resource/sstables/compressed", "ks", "cf", la, sstables::generation_type(1), big, component);
-        auto file_path_b = sstable::filename(tmp->path().string(), "ks", "cf", la, sstables::generation_type(2), big, component);
-        return tests::compare_files(file_path_a, file_path_b).then([] (auto eq) {
-            BOOST_REQUIRE(eq);
-        });
-    }).then([tmp] {});
+    tmpdir tmp;
+    co_await write_sst_info(make_schema_for_compressed_sstable(), "test/resource/sstables/compressed", tmp.path().string(), sstables::generation_type(1));
+    auto file_path_a = sstable::filename("test/resource/sstables/compressed", "ks", "cf", la, sstables::generation_type(1), big, component);
+    auto file_path_b = sstable::filename(tmp.path().string(), "ks", "cf", la, sstables::generation_type(2), big, component);
+    auto eq = co_await tests::compare_files(file_path_a, file_path_b);
+    BOOST_REQUIRE(eq);
 }
 
 SEASTAR_TEST_CASE(check_compressed_info_func) {
@@ -209,28 +190,27 @@ SEASTAR_TEST_CASE(check_compressed_info_func) {
 }
 
 future<>
-write_and_validate_sst(schema_ptr s, sstring dir, noncopyable_function<future<> (shared_sstable sst1, shared_sstable sst2)> func) {
+write_and_validate_sst(schema_ptr s, sstring dir, noncopyable_function<void (shared_sstable sst1, shared_sstable sst2)> func) {
     return test_env::do_with_async([s = std::move(s), dir = std::move(dir), func = std::move(func)] (test_env& env) mutable {
         auto sst1 = do_write_sst(env, s, dir, env.tempdir().path().native(), env.new_generation()).get();
         auto sst2 = env.make_sstable(s, sst1->get_version());
-        func(std::move(sst1), std::move(sst2)).get();
+        func(std::move(sst1), std::move(sst2));
     }, test_env_config{ .use_uuid = false });
 }
 
 SEASTAR_TEST_CASE(check_summary_func) {
     auto s = make_schema_for_compressed_sstable();
     return write_and_validate_sst(std::move(s), "test/resource/sstables/compressed", [] (shared_sstable sst1, shared_sstable sst2) {
-        return sstables::test(sst2).read_summary().then([sst1, sst2] {
-            summary& sst1_s = sstables::test(sst1).get_summary();
-            summary& sst2_s = sstables::test(sst2).get_summary();
+        sstables::test(sst2).read_summary().get();
 
-            BOOST_REQUIRE(::memcmp(&sst1_s.header, &sst2_s.header, sizeof(summary::header)) == 0);
-            BOOST_REQUIRE(sst1_s.positions == sst2_s.positions);
-            BOOST_REQUIRE(sst1_s.entries == sst2_s.entries);
-            BOOST_REQUIRE(sst1_s.first_key.value == sst2_s.first_key.value);
-            BOOST_REQUIRE(sst1_s.last_key.value == sst2_s.last_key.value);
-            return make_ready_future<>();
-        });
+        const summary& sst1_s = sst1->get_summary();
+        const summary& sst2_s = sst2->get_summary();
+
+        BOOST_REQUIRE(::memcmp(&sst1_s.header, &sst2_s.header, sizeof(summary::header)) == 0);
+        BOOST_REQUIRE(sst1_s.positions == sst2_s.positions);
+        BOOST_REQUIRE(sst1_s.entries == sst2_s.entries);
+        BOOST_REQUIRE(sst1_s.first_key.value == sst2_s.first_key.value);
+        BOOST_REQUIRE(sst1_s.last_key.value == sst2_s.last_key.value);
     });
 }
 
@@ -241,53 +221,43 @@ SEASTAR_TEST_CASE(check_filter_func) {
 SEASTAR_TEST_CASE(check_statistics_func) {
     auto s = make_schema_for_compressed_sstable();
     return write_and_validate_sst(std::move(s), "test/resource/sstables/compressed", [] (shared_sstable sst1, shared_sstable sst2) {
-        return sstables::test(sst2).read_statistics().then([sst1, sst2] {
-            statistics& sst1_s = sstables::test(sst1).get_statistics();
-            statistics& sst2_s = sstables::test(sst2).get_statistics();
+        sstables::test(sst2).read_statistics().get();
+        const statistics& sst1_s = sst1->get_statistics();
+        const statistics& sst2_s = sst2->get_statistics();
 
-            BOOST_REQUIRE(sst1_s.offsets.elements.size() == sst2_s.offsets.elements.size());
-            BOOST_REQUIRE(sst1_s.contents.size() == sst2_s.contents.size());
+        BOOST_REQUIRE(sst1_s.offsets.elements.size() == sst2_s.offsets.elements.size());
+        BOOST_REQUIRE(sst1_s.contents.size() == sst2_s.contents.size());
 
-            for (auto&& e : boost::combine(sst1_s.offsets.elements, sst2_s.offsets.elements)) {
-                BOOST_REQUIRE(boost::get<0>(e).second ==  boost::get<1>(e).second);
-            }
-            // TODO: compare the field contents from both sstables.
-            return make_ready_future<>();
-        });
+        for (auto&& e : boost::combine(sst1_s.offsets.elements, sst2_s.offsets.elements)) {
+            BOOST_REQUIRE(boost::get<0>(e).second ==  boost::get<1>(e).second);
+        }
+        // TODO: compare the field contents from both sstables.
     });
 }
 
 SEASTAR_TEST_CASE(check_toc_func) {
     auto s = make_schema_for_compressed_sstable();
     return write_and_validate_sst(std::move(s), "test/resource/sstables/compressed", [] (shared_sstable sst1, shared_sstable sst2) {
-        return sstables::test(sst2).read_toc().then([sst1, sst2] {
-            auto& sst1_c = sstables::test(sst1).get_components();
-            auto& sst2_c = sstables::test(sst2).get_components();
+        sst2->read_toc().get();
+        auto& sst1_c = sstables::test(sst1).get_components();
+        auto& sst2_c = sstables::test(sst2).get_components();
 
-            BOOST_REQUIRE(sst1_c == sst2_c);
-            return make_ready_future<>();
-        });
+        BOOST_REQUIRE(sst1_c == sst2_c);
     });
 }
 
 SEASTAR_TEST_CASE(uncompressed_random_access_read) {
     return test_using_reusable_sst(uncompressed_schema(), uncompressed_dir(), 1, [] (auto& env, auto sstp) {
-        // note: it's important to pass on a shared copy of sstp to prevent its
-        // destruction until the continuation finishes reading!
-        return sstables::test(sstp).data_read(env.make_reader_permit(), 97, 6).then([sstp] (temporary_buffer<char> buf) {
-            BOOST_REQUIRE(sstring(buf.get(), buf.size()) == "gustaf");
-            return make_ready_future<>();
-        });
+        temporary_buffer<char> buf = sstp->data_read(97, 6, env.make_reader_permit()).get();
+        BOOST_REQUIRE(sstring(buf.get(), buf.size()) == "gustaf");
     });
 }
 
 SEASTAR_TEST_CASE(compressed_random_access_read) {
     auto s = make_schema_for_compressed_sstable();
     return test_using_reusable_sst(std::move(s), "test/resource/sstables/compressed", 1, [] (auto& env, auto sstp) {
-        return sstables::test(sstp).data_read(env.make_reader_permit(), 97, 6).then([sstp] (temporary_buffer<char> buf) {
-            BOOST_REQUIRE(sstring(buf.get(), buf.size()) == "gustaf");
-            return make_ready_future<>();
-        });
+        temporary_buffer<char> buf = sstp->data_read(97, 6, env.make_reader_permit()).get();
+        BOOST_REQUIRE(sstring(buf.get(), buf.size()) == "gustaf");
     });
 }
 
@@ -309,8 +279,7 @@ SEASTAR_TEST_CASE(find_key_map) {
         kk.push_back(make_map_value(map_type, map));
 
         auto key = sstables::key::from_deeply_exploded(*s, kk);
-        BOOST_REQUIRE(sstables::test(sstp).binary_search(s->get_partitioner(), summary.entries, key) == 0);
-        return make_ready_future<>();
+        BOOST_REQUIRE(sstables::binary_search(s->get_partitioner(), summary.entries, key) == 0);
     });
 }
 
@@ -331,8 +300,7 @@ SEASTAR_TEST_CASE(find_key_set) {
         kk.push_back(make_set_value(set_type, set));
 
         auto key = sstables::key::from_deeply_exploded(*s, kk);
-        BOOST_REQUIRE(sstables::test(sstp).binary_search(s->get_partitioner(), summary.entries, key) == 0);
-        return make_ready_future<>();
+        BOOST_REQUIRE(sstables::binary_search(s->get_partitioner(), summary.entries, key) == 0);
     });
 }
 
@@ -353,8 +321,7 @@ SEASTAR_TEST_CASE(find_key_list) {
         kk.push_back(make_list_value(list_type, list));
 
         auto key = sstables::key::from_deeply_exploded(*s, kk);
-        BOOST_REQUIRE(sstables::test(sstp).binary_search(s->get_partitioner(), summary.entries, key) == 0);
-        return make_ready_future<>();
+        BOOST_REQUIRE(sstables::binary_search(s->get_partitioner(), summary.entries, key) == 0);
     });
 }
 
@@ -372,8 +339,7 @@ SEASTAR_TEST_CASE(find_key_composite) {
         kk.push_back(data_value(b2));
 
         auto key = sstables::key::from_deeply_exploded(*s, kk);
-        BOOST_REQUIRE(sstables::test(sstp).binary_search(s->get_partitioner(), summary.entries, key) == 0);
-        return make_ready_future<>();
+        BOOST_REQUIRE(sstables::binary_search(s->get_partitioner(), summary.entries, key) == 0);
     });
 }
 
@@ -384,21 +350,19 @@ SEASTAR_TEST_CASE(all_in_place) {
         int idx = 0;
         for (auto& e: summary.entries) {
             auto key = sstables::key::from_bytes(bytes(e.key));
-            BOOST_REQUIRE(sstables::test(sstp).binary_search(sstp->get_schema()->get_partitioner(), summary.entries, key) == idx++);
+            BOOST_REQUIRE(sstables::binary_search(sstp->get_schema()->get_partitioner(), summary.entries, key) == idx++);
         }
-        return make_ready_future<>();
     });
 }
 
 SEASTAR_TEST_CASE(full_index_search) {
     return test_using_reusable_sst(uncompressed_schema(), uncompressed_dir(), 1, [] (auto& env, auto sstp) {
-        return sstables::test(sstp).read_indexes(env.make_reader_permit()).then([sstp] (auto&& index_list) {
-            int idx = 0;
-            for (auto& e : index_list) {
-                auto key = key::from_partition_key(*sstp->get_schema(), e.key);
-                BOOST_REQUIRE(sstables::test(sstp).binary_search(sstp->get_schema()->get_partitioner(), index_list, key) == idx++);
-            }
-        });
+        auto index_list = sstables::test(sstp).read_indexes(env.make_reader_permit()).get();
+        int idx = 0;
+        for (auto& e : index_list) {
+            auto key = key::from_partition_key(*sstp->get_schema(), e.key);
+            BOOST_REQUIRE(sstables::binary_search(sstp->get_schema()->get_partitioner(), index_list, key) == idx++);
+        }
     });
 }
 
@@ -416,22 +380,18 @@ SEASTAR_TEST_CASE(not_find_key_composite_bucket0) {
 
         auto key = sstables::key::from_deeply_exploded(*s, kk);
         // (result + 1) * -1 -1 = 0
-        BOOST_REQUIRE(sstables::test(sstp).binary_search(s->get_partitioner(), summary.entries, key) == -2);
-        return make_ready_future<>();
+        BOOST_REQUIRE(sstables::binary_search(s->get_partitioner(), summary.entries, key) == -2);
     });
 }
 
 // See CASSANDRA-7593. This sstable writes 0 in the range_start. We need to handle that case as well
 SEASTAR_TEST_CASE(wrong_range) {
     return test_using_reusable_sst(uncompressed_schema(), "test/resource/sstables/wrongrange", 114, [] (auto& env, auto sstp) {
-        return do_with(dht::partition_range::make_singular(make_dkey(uncompressed_schema(), "todata")), [&env, sstp] (auto& range) {
-            auto s = columns_schema();
-            return with_closeable(sstp->make_reader(s, env.make_reader_permit(), range, s->full_slice()), [sstp, s] (auto& rd) {
-              return read_mutation_from_flat_mutation_reader(rd).then([sstp, s] (auto mutation) {
-                return make_ready_future<>();
-              });
-            });
-        });
+        auto range = dht::partition_range::make_singular(make_dkey(uncompressed_schema(), "todata"));
+        auto s = columns_schema();
+        auto rd = sstp->make_reader(s, env.make_reader_permit(), range, s->full_slice());
+        auto close_rd = deferred_close(rd);
+        (void)read_mutation_from_mutation_reader(rd).get();
     });
 }
 
@@ -441,20 +401,16 @@ SEASTAR_TEST_CASE(statistics_rewrite) {
         for (const auto& entry : std::filesystem::directory_iterator(uncompressed_dir().c_str())) {
             std::filesystem::copy(entry.path(), uncompressed_dir_copy / entry.path().filename());
         }
-        auto generation_dir = (uncompressed_dir_copy / sstables::staging_dir).native();
-        std::filesystem::create_directories(generation_dir);
 
-        auto sstp = env.reusable_sst(uncompressed_schema(), uncompressed_dir_copy.native()).get0();
-        test::create_links(*sstp, generation_dir).get();
-        auto file_path = sstable::filename(generation_dir, "ks", "cf", la, generation_from_value(1), big, component_type::Data);
-        auto exists = file_exists(file_path).get0();
+        auto sstp = env.reusable_sst(uncompressed_schema(), uncompressed_dir_copy.native()).get();
+        auto file_path = sstable::filename(uncompressed_dir_copy.native(), "ks", "cf", la, generation_from_value(1), big, component_type::Data);
+        auto exists = file_exists(file_path).get();
         BOOST_REQUIRE(exists);
 
-        sstp = env.reusable_sst(uncompressed_schema(), generation_dir).get0();
         // mutate_sstable_level results in statistics rewrite
         sstp->mutate_sstable_level(10).get();
 
-        sstp = env.reusable_sst(uncompressed_schema(), generation_dir).get0();
+        sstp = env.reusable_sst(uncompressed_schema(), uncompressed_dir_copy.native()).get();
         BOOST_REQUIRE(sstp->get_sstable_level() == 10);
     });
 }
@@ -467,22 +423,11 @@ SEASTAR_TEST_CASE(statistics_rewrite) {
 
 static schema_ptr large_partition_schema() {
     static thread_local auto s = [] {
-        schema_builder builder(make_shared_schema(
-                generate_legacy_id("try1", "data"), "try1", "data",
-        // partition key
-        {{"t1", utf8_type}},
-        // clustering key
-        {{"t2", utf8_type}},
-        // regular columns
-        {{"t3", utf8_type}},
-        // static columns
-        {},
-        // regular column name type
-        utf8_type,
-        // comment
-        ""
-       ));
-       return builder.build(schema_builder::compact_storage::no);
+        schema_builder builder("try1", "data", generate_legacy_id("try1", "data"));
+        builder.with_column("t1", utf8_type, column_kind::partition_key);
+        builder.with_column("t2", utf8_type, column_kind::clustering_key);
+        builder.with_column("t3", utf8_type);
+        return builder.build(schema_builder::compact_storage::no);
     }();
     return s;
 }
@@ -499,14 +444,11 @@ static future<shared_sstable> load_large_partition_sst(test_env& env, const ssta
 // search for anything.
 SEASTAR_TEST_CASE(promoted_index_read) {
   return for_each_sstable_version([] (const sstables::sstable::version_types version) {
-    return test_env::do_with([version] (test_env& env) {
-      return load_large_partition_sst(env, version).then([&env] (auto sstp) {
-        schema_ptr s = large_partition_schema();
-        return sstables::test(sstp).read_indexes(env.make_reader_permit()).then([sstp] (std::vector<sstables::test::index_entry> vec) {
-            BOOST_REQUIRE(vec.size() == 1);
-            BOOST_REQUIRE(vec[0].promoted_index_size > 0);
-        });
-      });
+    return test_env::do_with_async([version] (test_env& env) {
+        auto sstp = load_large_partition_sst(env, version).get();
+        std::vector<sstables::test::index_entry> vec = sstables::test(sstp).read_indexes(env.make_reader_permit()).get();
+        BOOST_REQUIRE(vec.size() == 1);
+        BOOST_REQUIRE(vec[0].promoted_index_size > 0);
     });
   });
 }
@@ -535,17 +477,17 @@ static future<int> count_rows(test_env& env, sstable_ptr sstp, schema_ptr s, sst
         auto pr = dht::partition_range::make_singular(make_dkey(s, key.c_str()));
         auto rd = sstp->make_reader(s, env.make_reader_permit(), pr, ps);
         auto close_rd = deferred_close(rd);
-        auto mfopt = rd().get0();
+        auto mfopt = rd().get();
         if (!mfopt) {
             return 0;
         }
         int nrows = 0;
-        mfopt = rd().get0();
+        mfopt = rd().get();
         while (mfopt) {
             if (mfopt->is_clustering_row()) {
                 nrows++;
             }
-            mfopt = rd().get0();
+            mfopt = rd().get();
         }
         return nrows;
     });
@@ -557,17 +499,17 @@ static future<int> count_rows(test_env& env, sstable_ptr sstp, schema_ptr s, sst
         auto pr = dht::partition_range::make_singular(make_dkey(s, key.c_str()));
         auto rd = sstp->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
         auto close_rd = deferred_close(rd);
-        auto mfopt = rd().get0();
+        auto mfopt = rd().get();
         if (!mfopt) {
             return 0;
         }
         int nrows = 0;
-        mfopt = rd().get0();
+        mfopt = rd().get();
         while (mfopt) {
             if (mfopt->is_clustering_row()) {
                 nrows++;
             }
-            mfopt = rd().get0();
+            mfopt = rd().get();
         }
         return nrows;
     });
@@ -581,17 +523,17 @@ static future<int> count_rows(test_env& env, sstable_ptr sstp, schema_ptr s, sst
         auto reader = sstp->make_reader(s, env.make_reader_permit(), query::full_partition_range, ps);
         auto close_reader = deferred_close(reader);
         int nrows = 0;
-        auto mfopt = reader().get0();
+        auto mfopt = reader().get();
         while (mfopt) {
-            mfopt = reader().get0();
+            mfopt = reader().get();
             BOOST_REQUIRE(mfopt);
             while (!mfopt->is_end_of_partition()) {
                 if (mfopt->is_clustering_row()) {
                     nrows++;
                 }
-                mfopt = reader().get0();
+                mfopt = reader().get();
             }
-            mfopt = reader().get0();
+            mfopt = reader().get();
         }
         return nrows;
     });
@@ -694,7 +636,7 @@ SEASTAR_TEST_CASE(test_skipping_in_compressed_stream) {
 
         tmpdir tmp;
         auto file_path = (tmp.path() / "test").string();
-        file f = open_file_dma(file_path, open_flags::create | open_flags::wo).get0();
+        file f = open_file_dma(file_path, open_flags::create | open_flags::wo).get();
 
         file_input_stream_options opts;
         opts.read_ahead = 0;
@@ -706,7 +648,7 @@ SEASTAR_TEST_CASE(test_skipping_in_compressed_stream) {
 
         sstables::compression c;
         // this initializes "c"
-        auto os = make_file_output_stream(f, file_output_stream_options()).get0();
+        auto os = make_file_output_stream(f, file_output_stream_options()).get();
         auto out = make_compressed_file_m_format_output_stream(std::move(os), &c, cp);
 
         // Make sure that amount of written data is a multiple of chunk_len so that we hit #2143.
@@ -722,21 +664,21 @@ SEASTAR_TEST_CASE(test_skipping_in_compressed_stream) {
         uncompressed_size += buf2.size();
         out.close().get();
 
-        auto compressed_size = seastar::file_size(file_path).get0();
+        auto compressed_size = seastar::file_size(file_path).get();
         c.update(compressed_size);
 
         auto make_is = [&] {
-            f = open_file_dma(file_path, open_flags::ro).get0();
-            return make_compressed_file_m_format_input_stream(f, &c, 0, uncompressed_size, opts, semaphore.make_permit());
+            f = open_file_dma(file_path, open_flags::ro).get();
+            return make_compressed_file_m_format_input_stream(f, &c, 0, uncompressed_size, opts, semaphore.make_permit(), std::nullopt);
         };
 
         auto expect = [] (input_stream<char>& in, const temporary_buffer<char>& buf) {
-            auto b = in.read_exactly(buf.size()).get0();
+            auto b = in.read_exactly(buf.size()).get();
             BOOST_REQUIRE(b == buf);
         };
 
         auto expect_eof = [] (input_stream<char>& in) {
-            auto b = in.read().get0();
+            auto b = in.read().get();
             BOOST_REQUIRE(b.empty());
         };
 
@@ -811,22 +753,6 @@ BOOST_AUTO_TEST_CASE(test_empty_key_view_comparison) {
     auto lf = empty_partition_key_view.legacy_form(s);
     BOOST_CHECK_EQUAL(0, lf.size());
     BOOST_CHECK(lf.begin() == lf.end());
-}
-
-template <typename T> concept Formattable = fmt::is_formattable<T>::value;
-
-namespace sstables {
-
-template <Formattable T>
-std::ostream& boost_test_print_type(std::ostream& os, const T& v) {
-    fmt::print(os, "{}", v);
-    return os;
-}
-
-std::ostream& boost_test_print_type(std::ostream& os, sstable_format_types format_type) {
-    return os << static_cast<int>(format_type);
-}
-
 }
 
 // Test that sstables::parse_path is able to parse the paths of sstables

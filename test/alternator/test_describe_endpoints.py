@@ -1,10 +1,11 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Test for the DescribeEndpoints operation
 
 import boto3
+from test.alternator.conftest import get_valid_alternator_role
 
 # Test that the DescribeEndpoints operation works as expected: that it
 # returns one endpoint (it may return more, but it never does this in
@@ -31,6 +32,7 @@ def test_describe_endpoints(request, dynamodb):
             # requires us to specify dummy region and credential parameters,
             # otherwise the user is forced to properly configure ~/.aws even
             # for local runs.
-            boto3.client('dynamodb',endpoint_url=url, region_name='us-east-1', aws_access_key_id='alternator', aws_secret_access_key='secret_pass', verify=verify).describe_endpoints()
+            user, secret = get_valid_alternator_role(url)
+            boto3.client('dynamodb',endpoint_url=url, region_name='us-east-1', aws_access_key_id=user, aws_secret_access_key=secret, verify=verify).describe_endpoints()
         # Nothing to check here - if the above call failed with an exception,
         # the test would fail.

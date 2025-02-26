@@ -1,11 +1,15 @@
 #include "locator/ec2_snitch.hh"
 #include <seastar/core/seastar.hh>
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/http/reply.hh>
 
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
+
+#include "utils/assert.hh"
+#include "utils/class_registrator.hh"
 
 namespace locator {
 
@@ -26,13 +30,13 @@ future<> ec2_snitch::load_config(bool prefer_local) {
     if (this_shard_id() == io_cpu_id()) {
         auto token = co_await aws_api_call(AWS_QUERY_SERVER_ADDR, AWS_QUERY_SERVER_PORT, TOKEN_REQ_ENDPOINT, std::nullopt);
         auto az = co_await aws_api_call(AWS_QUERY_SERVER_ADDR, AWS_QUERY_SERVER_PORT, ZONE_NAME_QUERY_REQ, token);
-        assert(az.size());
+        SCYLLA_ASSERT(az.size());
 
         std::vector<std::string> splits;
 
         // Split "us-east-1a" or "asia-1a" into "us-east"/"1a" and "asia"/"1a".
         split(splits, az, is_any_of("-"));
-        assert(splits.size() > 1);
+        SCYLLA_ASSERT(splits.size() > 1);
 
         sstring my_rack = splits[splits.size() - 1];
 
@@ -66,17 +70,18 @@ future<sstring> ec2_snitch::aws_api_call(sstring addr, uint16_t port, sstring cm
             ++i;
             return aws_api_call_once(addr, port, cmd, token).then([] (auto res) {
                 return make_ready_future<std::optional<sstring>>(std::move(res));
-            }).handle_exception([&i] (auto ep) {
+            }).handle_exception([this, &i] (auto ep) {
                 try {
                     std::rethrow_exception(ep);
                 } catch (const std::system_error &e) {
-                    logger().error(e.what());
                     if (i >= AWS_API_CALL_RETRIES - 1) {
-                        logger().error("Maximum number of retries exceeded");
+                        logger().error("EC2 API call failed: {}. Maximum number of retries exceeded", e.what());
                         throw e;
+                    } else {
+                        logger().error("EC2 API call failed: {}. Will retry in {} seconds", e.what(), std::chrono::duration_cast<std::chrono::seconds>(_ec2_api_retry.sleep_time()).count());
                     }
                 }
-                return sleep(AWS_API_CALL_RETRY_INTERVAL).then([] {
+                return _ec2_api_retry.retry().then([] {
                     return make_ready_future<std::optional<sstring>>(std::nullopt);
                 });
             });

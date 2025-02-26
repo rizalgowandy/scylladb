@@ -37,7 +37,6 @@ Prerequisites
    UN  172.91.202.32  91.11 KB   256     32.9%             525ed7g4-7437-1dbn-mac8-53fddce9123c   B1
    UN  172.91.202.33  124.42 KB  256     32.6%             975edbm4-6564-63bd-san8-73fddce952ga   B1
 
-
 Procedure
 ---------
 
@@ -56,7 +55,7 @@ Procedure
       cqlsh> DESCRIBE <KEYSPACE_NAME>
       cqlsh> CREATE KEYSPACE <KEYSPACE_NAME> WITH REPLICATION = {'class' : 'NetworkTopologyStrategy', '<DC_NAME1>' : 3, '<DC_NAME2>' : 3, '<DC_NAME3>' : 3};
 
-      cqlsh> ALTER KEYSPACE <KEYSPACE_NAME> WITH REPLICATION = {'class' : 'NetworkTopologyStrategy', '<DC_NAME1>' : 3, '<DC_NAME2>' : 3};
+      cqlsh> ALTER KEYSPACE <KEYSPACE_NAME> WITH REPLICATION = {'class' : 'NetworkTopologyStrategy', '<DC_NAME1>' : 3, '<DC_NAME2>' : 3, '<DC_NAME3>' : 0};
 
    For example:
 
@@ -72,10 +71,10 @@ Procedure
 
    .. code-block:: shell
 
-      cqlsh> ALTER KEYSPACE nba WITH REPLICATION = {'class' : 'NetworkTopologyStrategy', 'US-DC' : 3, 'EUROPE-DC' : 3};
+      cqlsh> ALTER KEYSPACE nba WITH REPLICATION = {'class' : 'NetworkTopologyStrategy', 'US-DC' : 3, 'ASIA-DC' : 0, 'EUROPE-DC' : 3};
 
 #. Run :doc:`nodetool decommission </operating-scylla/nodetool-commands/decommission>` on every node in the data center that is to be removed.
-   Refer to :doc:`Remove a Node from a Scylla Cluster - Down Scale </operating-scylla/procedures/cluster-management/remove-node>` for further information.
+   Refer to :doc:`Remove a Node from a ScyllaDB Cluster - Down Scale </operating-scylla/procedures/cluster-management/remove-node>` for further information.
 
    For example:
 

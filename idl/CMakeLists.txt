@@ -17,7 +17,7 @@ function(compile_idl input)
   add_custom_command(
     OUTPUT ${output}
     COMMAND ${Python3_EXECUTABLE} ${idl_compiler} --ns ser -f ${input} -o ${output}
-    DEPENDS ${idle_compiler} ${input})
+    DEPENDS ${idl_compiler} ${input})
   set(${parsed_args_SOURCES} ${output} PARENT_SCOPE)
 endfunction(compile_idl)
 
@@ -35,7 +35,7 @@ set(idl_headers
   streaming.idl.hh
   paging_state.idl.hh
   frozen_schema.idl.hh
-  partition_checksum.idl.hh
+  repair.idl.hh
   replay_position.idl.hh
   mutation.idl.hh
   query.idl.hh
@@ -51,16 +51,21 @@ set(idl_headers
   raft_storage.idl.hh
   group0.idl.hh
   hinted_handoff.idl.hh
+  sstables.idl.hh
   storage_proxy.idl.hh
   storage_service.idl.hh
   group0_state_machine.idl.hh
-  forward_request.idl.hh
+  mapreduce_request.idl.hh
   replica_exception.idl.hh
   per_partition_rate_limit_info.idl.hh
   position_in_partition.idl.hh
   experimental/broadcast_tables_lang.idl.hh
   join_node.idl.hh
   utils.idl.hh
+  gossip.idl.hh
+  migration_manager.idl.hh
+  node_ops.idl.hh
+  tasks.idl.hh
   )
 
 foreach(idl_header ${idl_headers})

@@ -10,7 +10,7 @@ What Should Make You Want To Start Looking For A Large Partition?
 
 Any of the following:
 
-* Latencies on a single shard become very long (look at the "Scylla Overview Metrics" dashboard of `ScyllaDB Monitoring Stack <https://monitoring.docs.scylladb.com/stable/>`_).
+* Latencies on a single shard become very long (look at the "ScyllaDB Overview Metrics" dashboard of `ScyllaDB Monitoring Stack <https://monitoring.docs.scylladb.com/stable/>`_).
 * Oversized allocation warning messages in the log:
 
   .. code-block:: none
@@ -21,7 +21,7 @@ Any of the following:
 
   .. code-block:: none
 
-     WARN  2022-09-22 17:33:11,075 [shard 1]large_data - Writing large partition Some_KS/Some_table: PK[/CK[/COL]] (SIZE bytes) to SSTABLE_NAME
+     WARN  2022-09-22 17:33:11,075 [shard 1]large_data - Writing large partition Some_KS/Some_table: [COL] (SIZE bytes) to SSTABLE_NAME
 
   In this case, refer to :ref:`Troubleshooting Large Partition Tables <large-partition-table-configure>` for more information.
 
@@ -47,9 +47,7 @@ For example:
 Using system tables to detect large partitions, rows, or cells
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Starting from scylla 2.3, large partitions are listed in the ``system.large_partitions`` table.  See :doc:`Scylla Large Partitions Table </troubleshooting/large-partition-table/>` for more information.
-
-Starting from scylla 3.1, large rows and large cells are listed similarly in the ``system.large_rows`` and ``system.large_cells`` tables, respectively.  See :doc:`Scylla Large Rows and Cells Tables </troubleshooting/large-rows-large-cells-tables/>` for more information.
+Large rows and large cells are listed in the ``system.large_rows`` and ``system.large_cells`` tables, respectively.  See :doc:`ScyllaDB Large Rows and Cells Tables </troubleshooting/large-rows-large-cells-tables/>` for more information.
 
 
 When Compaction Creates an Error

@@ -4,26 +4,41 @@ import sys
 import warnings
 from datetime import date
 
-from sphinx_scylladb_theme.utils import multiversion_regex_builder
+from sphinx_scylladb_theme.utils import multiversion_regex_builder, fetch_multiversion_configuration
 from recommonmark.transform import AutoStructify
 
 sys.path.insert(0, os.path.abspath('./_ext'))
 sys.path.insert(0, os.path.abspath(".."))
 
 # -- Global variables
+FLAG = os.getenv('FLAG', 'manual')
 
+# Set the project name
+PROJECT = "ScyllaDB Manual"
 # Set the base URL for the documentation site.
-BASE_URL = 'https://opensource.docs.scylladb.com'
-# Build documentation for the following tags and branches.
-TAGS = []
-BRANCHES = ["master", "branch-5.1", "branch-5.2", "branch-5.4"]
-# Set the latest version. 
-LATEST_VERSION = "branch-5.4"
-# Set which versions are not released yet.
-UNSTABLE_VERSIONS = ["master"]
-# Set which versions are deprecated.
-DEPRECATED_VERSIONS = [""]
+BASE_URL = 'https://docs.scylladb.com/manual'
+# Multiversion configuration URL
+VERSIONS_URL = "https://raw.githubusercontent.com/scylladb/scylladb-docs-homepage/refs/heads/main/docs/_static/data/manual_doc_versions.json"
 
+if FLAG == 'opensource':
+    # Set the project name
+    PROJECT = "ScyllaDB Open Source"
+    # Set the base URL for the documentation site.
+    BASE_URL = 'https://opensource.docs.scylladb.com'
+    # Multiversion configuration URL
+    VERSIONS_URL = "https://raw.githubusercontent.com/scylladb/scylladb-docs-homepage/refs/heads/main/docs/_static/data/opensource_doc_versions.json"
+
+# Build documentation for the following tags and branches.
+MULTIVERSION_CONFIG = fetch_multiversion_configuration(VERSIONS_URL)
+TAGS = MULTIVERSION_CONFIG.get("tags", [])
+BRANCHES = MULTIVERSION_CONFIG.get("branches", ["master"])
+# Set the latest version. 
+LATEST_VERSION = MULTIVERSION_CONFIG.get("latest", "master")
+# Set which versions are not released yet.
+UNSTABLE_VERSIONS = MULTIVERSION_CONFIG.get("unstable", [])
+# Set which versions are deprecated.
+DEPRECATED_VERSIONS = MULTIVERSION_CONFIG.get("deprecated", [])
+    
 # -- General configuration
 
 # Add any Sphinx extension module names here, as strings.
@@ -35,21 +50,27 @@ extensions = [
     "sphinx.ext.extlinks",
     "sphinx_sitemap",
     "sphinx_scylladb_theme",
-    "sphinx_multiversion",  # optional
-    "recommonmark",  # optional
+    "sphinx_multiversion",
+    "sphinx_scylladb_markdown",
     "sphinxcontrib.datatemplates",
     "scylladb_cc_properties",
-    "scylladb_aws_images"
+    "scylladb_aws_images",
+    "scylladb_azure_images",
+    "scylladb_gcp_images",
+    "scylladb_include_flag",
+    "scylladb_dynamic_substitutions",
+    "scylladb_swagger",
+    "scylladb_metrics"
 ]
 
 # The suffix(es) of source filenames.
-source_suffix = [".rst", ".md"]
+source_suffix = ['.rst']
 
 # The master toctree document.
 master_doc = "index"
 
 # General information about the project.
-project = "ScyllaDB Open Source"
+project = PROJECT
 copyright = str(date.today().year) + ", ScyllaDB. All rights reserved."
 author = u"ScyllaDB Project Contributors"
 
@@ -73,6 +94,11 @@ notfound_template = "404.html"
 
 # Prefix added to all the URLs generated in the 404 page.
 notfound_urls_prefix = ""
+
+# -- Options for markdown extension
+scylladb_markdown_enable = True
+scylladb_markdown_recommonmark_versions = ['branch-5.1', 'branch-5.2', 'branch-5.4']
+suppress_warnings = ["myst.xref_missing"]
 
 # -- Options for sitemap extension
 
@@ -102,6 +128,25 @@ scylladb_aws_images_ami_bucket_directory = "downloads/scylla/aws/ami/"
 scylladb_aws_images_ami_download_directory = "_data/opensource/aws/ami"
 scylladb_aws_images_cloudformation_bucket_directory = "downloads/scylla/aws/cloudformation/"
 
+# -- Options for scylladb_azure_images extension
+scylladb_azure_images_base_url = "https://s3.amazonaws.com/downloads.scylladb.com"
+scylladb_azure_images_bucket_directory = "downloads/scylla/azure/"
+scylladb_azure_images_download_directory = "_data/opensource/azure"
+
+# -- Options for scylladb_gcp_images extension
+scylladb_gcp_images_base_url = "https://s3.amazonaws.com/downloads.scylladb.com"
+scylladb_gcp_images_bucket_directory = "downloads/scylla/gce/"
+scylladb_gcp_images_download_directory = "_data/opensource/gce"
+
+# -- Options for scylladb_swagger extension
+scylladb_swagger_origin_api = "../api"
+scylladb_swagger_template = "swagger.tmpl"
+scylladb_swagger_inc_template = "swagger_inc.tmpl"
+
+# -- Options for scylladb_metrics
+scylladb_metrics_directory = "_data/opensource/metrics"
+
+
 # -- Options for HTML output
 
 # The theme to use for pages.
@@ -127,12 +172,15 @@ html_theme_options = {
     "hide_feedback_buttons": 'false',
     "github_issues_repository": "scylladb/scylladb",
     "github_repository": "scylladb/scylladb",
+    "github_label": "type/documentation",
     "versions_unstable": UNSTABLE_VERSIONS,
     "versions_deprecated": DEPRECATED_VERSIONS,
     'banner_button_text': 'Register for Free',
     'banner_button_url': 'https://lp.scylladb.com/university-live-2023-03-registration?siteplacement=docs',
     'banner_title_text': 'ScyllaDB University LIVE, FREE Virtual Training Event | March 21',
     "collapse_navigation": 'true',
+    "brand": "open-source" if FLAG == 'opensource' else "self-hosted",
+
 }
 
 # Last updated format
@@ -150,14 +198,6 @@ html_baseurl = BASE_URL
 # Dictionary of values to pass into the template engine’s context for all pages
 html_context = {"html_baseurl": html_baseurl}
 
-# -- Initialize Sphinx
-def setup(sphinx):
-    warnings.filterwarnings(
-        action="ignore",
-        category=UserWarning,
-        message=r".*Container node skipped.*",
-    )
-    sphinx.add_config_value('recommonmark_config', {
-        'enable_eval_rst': True,
-    }, True)
-    sphinx.add_transform(AutoStructify)
+def setup(app):
+    if 'opensource' in app.tags:
+        app.tags.add('experimental')

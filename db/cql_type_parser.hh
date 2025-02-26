@@ -4,14 +4,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include <vector>
 #include <seastar/core/sstring.hh>
-#include <seastar/core/shared_ptr.hh>
 
 #include "types/types.hh"
 
@@ -37,7 +36,7 @@ public:
     ~raw_builder();
 
     void add(sstring name, std::vector<sstring> field_names, std::vector<sstring> field_types);
-    std::vector<user_type> build();
+    future<std::vector<user_type>> build();
 private:
     class impl;
     std::unique_ptr<impl>

@@ -43,9 +43,9 @@ of eventual consistency on an event of a timestamp collision:
 nodes proceed without coordination. Eventually cell values
 supplied by a statement with the highest timestamp will prevail (see :ref:`update ordering <update-ordering>`).
 
-Unless a timestamp is provided by the client, Scylla will automatically
+Unless a timestamp is provided by the client, ScyllaDB will automatically
 generate a timestamp with microsecond precision for each
-column assigned by ``INSERT``. Scylla ensures timestamps created
+column assigned by ``INSERT``. ScyllaDB ensures timestamps created
 by the same node are unique. Timestamps assigned at different
 nodes are not guaranteed to be globally unique.
 With a steadily high write rate timestamp collision
@@ -94,7 +94,7 @@ columns effects of both statements are preserved:
 
 Also note that ``INSERT`` does not support counters, while ``UPDATE`` does.
 
-.. note:: New in Scylla Open Source 3.2, you can use the ``IF NOT EXISTS`` condition with the ``INSERT`` statement. When this is used, the insert is only made if the row does not exist prior to the insertion. Each such ``INSERT`` gets a globally unique timestamp. Using ``IF NOT EXISTS`` incurs a non-negligible performance cost (internally, as Paxos will be used), so use ``IF NOT EXISTS`` wisely.
+.. note:: You can use the ``IF NOT EXISTS`` condition with the ``INSERT`` statement. When this is used, the insert is only made if the row does not exist prior to the insertion. Each such ``INSERT`` gets a globally unique timestamp. Using ``IF NOT EXISTS`` incurs a non-negligible performance cost (internally, as Paxos will be used), so use ``IF NOT EXISTS`` wisely.
 
 
 If :ref:`enabled <cdc-options>` on a table, you can use UPDATE, INSERT, and DELETE statements with Change Data Capture (CDC) tables.

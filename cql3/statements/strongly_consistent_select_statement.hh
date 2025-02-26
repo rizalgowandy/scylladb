@@ -5,14 +5,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include "cql3/expr/expression.hh"
 #include "cql3/statements/select_statement.hh"
-#include "service/broadcast_tables/experimental/lang.hh"
 
 namespace cql3 {
 

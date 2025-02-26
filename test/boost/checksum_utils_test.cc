@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #define BOOST_TEST_MODULE core
@@ -11,7 +11,7 @@
 #include <boost/test/unit_test.hpp>
 #include "sstables/checksum_utils.hh"
 #include "test/lib/make_random_string.hh"
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 
 template<typename ReferenceImpl, typename Impl>
 static

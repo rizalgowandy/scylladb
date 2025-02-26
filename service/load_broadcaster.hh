@@ -4,11 +4,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
+#include <seastar/core/distributed.hh>
+#include "utils/assert.hh"
 #include "replica/database_fwd.hh"
 #include "gms/i_endpoint_state_change_subscriber.hh"
 #include "gms/gossiper.hh"
@@ -32,26 +34,24 @@ public:
         _gossiper.register_(shared_from_this());
     }
     ~load_broadcaster() {
-        assert(_stopped);
+        SCYLLA_ASSERT(_stopped);
     }
 
-    virtual future<> on_change(gms::inet_address endpoint, gms::application_state state, const gms::versioned_value& value, gms::permit_id) override {
-        if (state == gms::application_state::LOAD) {
+    virtual future<> on_change(gms::inet_address endpoint, const gms::application_state_map& states, gms::permit_id pid) override {
+        return on_application_state_change(endpoint, states, gms::application_state::LOAD, pid, [this] (gms::inet_address endpoint, const gms::versioned_value& value, gms::permit_id) {
             _load_info[endpoint] = std::stod(value.value());
-        }
-        return make_ready_future();
+            return make_ready_future<>();
+        });
     }
 
     virtual future<> on_join(gms::inet_address endpoint, gms::endpoint_state_ptr ep_state, gms::permit_id pid) override {
         auto* local_value = ep_state->get_application_state_ptr(gms::application_state::LOAD);
         if (local_value) {
-            return on_change(endpoint, gms::application_state::LOAD, *local_value, pid);
+            _load_info[endpoint] = std::stod(local_value->value());
         }
         return make_ready_future();
     }
     
-    virtual future<> before_change(gms::inet_address endpoint, gms::endpoint_state_ptr current_state, gms::application_state new_state_key, const gms::versioned_value& newValue) override { return make_ready_future(); }
-
     future<> on_alive(gms::inet_address endpoint, gms::endpoint_state_ptr, gms::permit_id) override { return make_ready_future(); }
 
     future<> on_dead(gms::inet_address endpoint, gms::endpoint_state_ptr, gms::permit_id) override { return make_ready_future(); }

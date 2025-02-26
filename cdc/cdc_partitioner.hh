@@ -3,14 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <seastar/core/sstring.hh>
 
-#include "bytes.hh"
 #include "dht/i_partitioner.hh"
 
 class schema;

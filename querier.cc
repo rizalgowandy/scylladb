@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/coroutine.hh>
@@ -12,9 +12,8 @@
 #include "dht/i_partitioner.hh"
 #include "reader_concurrency_semaphore.hh"
 #include "schema/schema.hh"
-#include "log.hh"
-
-#include <boost/range/adaptor/map.hpp>
+#include "utils/log.hh"
+#include "utils/error_injection.hh"
 
 namespace query {
 
@@ -218,13 +217,13 @@ querier_cache::querier_cache(is_user_semaphore_func is_user_semaphore_func, std:
 }
 
 struct querier_utils {
-    static flat_mutation_reader_v2 get_reader(querier_base& q) noexcept {
-        return std::move(std::get<flat_mutation_reader_v2>(q._reader));
+    static mutation_reader get_reader(querier_base& q) noexcept {
+        return std::move(std::get<mutation_reader>(q._reader));
     }
     static reader_concurrency_semaphore::inactive_read_handle get_inactive_read_handle(querier_base& q) noexcept {
         return std::move(std::get<reader_concurrency_semaphore::inactive_read_handle>(q._reader));
     }
-    static void set_reader(querier_base& q, flat_mutation_reader_v2 r) noexcept {
+    static void set_reader(querier_base& q, mutation_reader r) noexcept {
         q._reader = std::move(r);
     }
     static void set_inactive_read_handle(querier_base& q, reader_concurrency_semaphore::inactive_read_handle h) noexcept {
@@ -241,7 +240,7 @@ void querier_cache::insert_querier(
         std::chrono::seconds ttl,
         tracing::trace_state_ptr trace_state) {
     // FIXME: see #3159
-    // In reverse mode flat_mutation_reader drops any remaining rows of the
+    // In reverse mode mutation_reader drops any remaining rows of the
     // current partition when the page ends so it cannot be reused across
     // pages.
     if (q.is_reversed()) {
@@ -289,6 +288,11 @@ void querier_cache::insert_querier(
         }
         --stats.population;
     };
+
+
+    if (const auto override_ttl = utils::get_local_injector().inject_parameter<uint64_t>("querier-cache-ttl-seconds"); override_ttl) {
+        ttl = std::chrono::seconds(*override_ttl);
+    }
 
     sem.set_notify_handler(irh, std::move(notify_handler), ttl);
     querier_utils::set_inactive_read_handle(*it->second, std::move(irh));
@@ -380,7 +384,7 @@ std::optional<Querier> querier_cache::lookup_querier(
                     reinterpret_cast<uintptr_t>(&current_sem));
     }
     else if (can_be_used == can_use::no_fatal_semaphore_mismatch) {
-        on_internal_error(qlogger, format("semaphore mismatch detected, dropping reader {}: "
+        on_internal_error(qlogger, seastar::format("semaphore mismatch detected, dropping reader {}: "
                 "reader belongs to {} (0x{:x}) but the query class appropriate is {} (0x{:x})",
                 permit.description(),
                 q_semaphore_name,
@@ -426,7 +430,7 @@ std::optional<shard_mutation_querier> querier_cache::lookup_shard_mutation_queri
 future<> querier_base::close() noexcept {
     struct variant_closer {
         querier_base& q;
-        future<> operator()(flat_mutation_reader_v2& reader) {
+        future<> operator()(mutation_reader& reader) {
             return reader.close();
         }
         future<> operator()(reader_concurrency_semaphore::inactive_read_handle& irh) {
@@ -435,6 +439,22 @@ future<> querier_base::close() noexcept {
         }
     };
     return std::visit(variant_closer{*this}, _reader);
+}
+
+thread_local logger::rate_limit querier::row_tombstone_warn_rate_limit{std::chrono::seconds(10)};
+thread_local logger::rate_limit querier::cell_tombstone_warn_rate_limit{std::chrono::seconds(10)};
+
+void querier::maybe_log_tombstone_warning(std::string_view what, uint64_t live, uint64_t dead, logger::rate_limit& rl) {
+    if (!_qr_config.tombstone_warn_threshold || dead < _qr_config.tombstone_warn_threshold) {
+        return;
+    }
+    if (_range->is_singular()) {
+        qrlogger.log(log_level::warn, rl, "Read {} live {} and {} dead {}/tombstones for {}.{} partition key \"{}\" {} (see tombstone_warn_threshold)",
+                      live, what, dead, what, _schema->ks_name(), _schema->cf_name(), _range->start()->value().key()->with_schema(*_schema), (*_range));
+    } else {
+        qrlogger.log(log_level::warn, rl, "Read {} live {} and {} dead {}/tombstones for {}.{} <partition-range-scan> {} (see tombstone_warn_threshold)",
+                      live, what, dead, what, _schema->ks_name(), _schema->cf_name(), (*_range));
+    }
 }
 
 void querier_cache::set_entry_ttl(std::chrono::seconds entry_ttl) {

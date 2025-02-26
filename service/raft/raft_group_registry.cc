@@ -3,17 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #include "service/raft/raft_group_registry.hh"
+#include "raft/raft.hh"
 #include "service/raft/raft_rpc.hh"
-#include "service/raft/raft_address_map.hh"
 #include "db/system_keyspace.hh"
 #include "message/messaging_service.hh"
 #include "gms/gossiper.hh"
 #include "gms/i_endpoint_state_change_subscriber.hh"
 #include "serializer_impl.hh"
 #include "idl/raft.dist.hh"
+#include "utils/composite_abort_source.hh"
 #include "utils/error_injection.hh"
 
 #include <seastar/core/coroutine.hh>
@@ -37,7 +38,7 @@ public:
     }
 
     future<> mark_alive(direct_failure_detector::pinger::endpoint_id id) override {
-        static const auto msg = "marking Raft server {} as alive for raft groups";
+        static constexpr auto msg = "marking Raft server {} as alive for raft groups";
 
         auto raft_id = raft::server_id{id};
         _alive_set.insert(raft_id);
@@ -54,7 +55,7 @@ public:
     }
 
     future<> mark_dead(direct_failure_detector::pinger::endpoint_id id) override {
-        static const auto msg = "marking Raft server {} as dead for raft groups";
+        static constexpr auto msg = "marking Raft server {} as dead for raft groups";
 
         auto raft_id = raft::server_id{id};
         _alive_set.erase(raft_id);
@@ -75,99 +76,10 @@ public:
 };
 // }}} direct_fd_proxy
 
-// {{{ gossiper_state_change_subscriber_proxy
-
-class gossiper_state_change_subscriber_proxy: public gms::i_endpoint_state_change_subscriber {
-    raft_address_map& _address_map;
-
-    future<>
-    on_endpoint_change(gms::inet_address endpoint, gms::endpoint_state_ptr ep_state) {
-        auto app_state_ptr = ep_state->get_application_state_ptr(gms::application_state::HOST_ID);
-        if (app_state_ptr) {
-            raft::server_id id(utils::UUID(app_state_ptr->value()));
-            rslog.debug("gossiper_state_change_subscriber_proxy::on_endpoint_change() {} {}", endpoint, id);
-            _address_map.add_or_update_entry(id, endpoint, ep_state->get_heart_beat_state().get_generation());
-        }
-        return make_ready_future<>();
-    }
-
-public:
-    gossiper_state_change_subscriber_proxy(raft_address_map& address_map)
-            : _address_map(address_map)
-    {}
-
-    virtual future<>
-    on_join(gms::inet_address endpoint, gms::endpoint_state_ptr ep_state, gms::permit_id) override {
-        return on_endpoint_change(endpoint, ep_state);
-    }
-
-    virtual future<>
-    before_change(gms::inet_address endpoint,
-        gms::endpoint_state_ptr current_state, gms::application_state new_statekey,
-        const gms::versioned_value& newvalue) override {
-        // Raft server ID never changes - do nothing
-        return make_ready_future<>();
-    }
-
-    virtual future<>
-    on_change(gms::inet_address endpoint,
-        gms::application_state state, const gms::versioned_value& value, gms::permit_id) override {
-        // Raft server ID never changes - do nothing
-        return make_ready_future<>();
-    }
-
-    virtual future<>
-    on_alive(gms::inet_address endpoint, gms::endpoint_state_ptr ep_state, gms::permit_id) override {
-        co_await utils::get_local_injector().inject_with_handler("raft_group_registry::on_alive", [endpoint, ep_state] (auto& handler) -> future<> {
-            auto app_state_ptr = ep_state->get_application_state_ptr(gms::application_state::HOST_ID);
-            if (!app_state_ptr) {
-                co_return;
-            }
-            
-            raft::server_id id(utils::UUID(app_state_ptr->value()));
-            rslog.info("gossiper_state_change_subscriber_proxy::on_alive() {} {}", endpoint, id);
-            auto second_node_ip = handler.get("second_node_ip");
-            assert(second_node_ip);
-
-            if (endpoint == gms::inet_address(sstring{*second_node_ip})) {
-                rslog.info("Sleeping before handling on_alive");
-                co_await handler.wait_for_message(std::chrono::steady_clock::now() + std::chrono::minutes{1});
-                rslog.info("Finished Sleeping before handling on_alive");
-            }
-        });
-        co_await on_endpoint_change(endpoint, ep_state);
-    }
-
-    virtual future<>
-    on_dead(gms::inet_address endpoint, gms::endpoint_state_ptr state, gms::permit_id) override {
-        return make_ready_future<>();
-    }
-
-    virtual future<>
-    on_remove(gms::inet_address endpoint, gms::permit_id) override {
-        // The mapping is removed when the server is removed from
-        // Raft configuration, not when it's dead or alive, or
-        // removed
-        return make_ready_future<>();
-    }
-
-    virtual future<>
-    on_restart(gms::inet_address endpoint, gms::endpoint_state_ptr ep_state, gms::permit_id) override {
-        return on_endpoint_change(endpoint, ep_state);
-    }
-};
-
-// }}} gossiper_state_change_subscriber_proxy
-
-raft_group_registry::raft_group_registry(bool is_enabled,
+raft_group_registry::raft_group_registry(
         raft::server_id my_id,
-        raft_address_map& address_map,
-        netw::messaging_service& ms, gms::gossiper& gossiper, direct_failure_detector::failure_detector& fd)
-    : _is_enabled(is_enabled)
-    , _ms(ms)
-    , _gossiper(gossiper)
-    , _gossiper_proxy(make_shared<gossiper_state_change_subscriber_proxy>(address_map))
-    , _address_map{address_map}
+        netw::messaging_service& ms, direct_failure_detector::failure_detector& fd)
+    : _ms(ms)
     , _direct_fd(fd)
     , _direct_fd_proxy(make_shared<direct_fd_proxy>(my_id))
     , _my_id(my_id)
@@ -189,16 +101,8 @@ void raft_group_registry::init_rpc_verbs() {
         }
 
         return container().invoke_on(shard_for_group(gid),
-                [addr = netw::messaging_service::get_source(cinfo).addr, from, gid, handler] (raft_group_registry& self) mutable {
-            // Update the address mappings for the rpc module
-            // in case the sender is encountered for the first time
+                [addr = netw::messaging_service::get_source(cinfo).addr, gid, handler] (raft_group_registry& self) mutable {
             auto& rpc = self.get_rpc(gid);
-            // The address learnt from a probably unknown server should
-            // eventually expire. Do not use it to update
-            // a previously learned gossiper address: otherwise an RPC from
-            // a node outside of the config could permanently
-            // change the address map of a healthy cluster.
-            self._address_map.opt_add_entry(from, std::move(addr));
             // Execute the actual message handling code
             if constexpr (is_one_way) {
                 handler(rpc);
@@ -219,6 +123,10 @@ void raft_group_registry::init_rpc_verbs() {
     ser::raft_rpc_verbs::register_raft_append_entries(&_ms, [handle_raft_rpc] (const rpc::client_info& cinfo, rpc::opt_time_point timeout,
         raft::group_id gid, raft::server_id from, raft::server_id dst, raft::append_request append_request) mutable {
         return handle_raft_rpc(cinfo, gid, from, dst, [from, append_request = std::move(append_request), original_shard_id = this_shard_id()] (raft_rpc& rpc) mutable {
+            if (utils::get_local_injector().enter("raft_drop_incoming_append_entries")) {
+                return;
+            }
+
             // lw_shared_ptr (raft::log_entry_ptr) doesn't support cross-shard ref counting (see debug_shared_ptr_counter_type),
             // so we are copying entries to this shard if it isn't equal the original one.
             rpc.append_entries(std::move(from),
@@ -372,17 +280,16 @@ future<> raft_group_registry::stop_servers() noexcept {
 }
 
 seastar::future<> raft_group_registry::start() {
-    assert(_is_enabled);
-
-    _gossiper.register_(_gossiper_proxy);
-
     // Once a Raft server starts, it soon times out
     // and starts an election, so RPC must be ready by
     // then to send VoteRequest messages.
     init_rpc_verbs();
 
-    _direct_fd_subscription.emplace(co_await _direct_fd.register_listener(*_direct_fd_proxy,
-        direct_fd_clock::base::duration{std::chrono::seconds{1}}.count()));
+    direct_fd_clock::base::duration threshold{std::chrono::seconds{2}};
+    if (const auto ms = utils::get_local_injector().inject_parameter<int64_t>("raft-group-registry-fd-threshold-in-ms"); ms) {
+        threshold = direct_fd_clock::base::duration{std::chrono::milliseconds{*ms}};
+    }
+    _direct_fd_subscription.emplace(co_await _direct_fd.register_listener(*_direct_fd_proxy, threshold.count()));
 }
 
 const raft::server_id& raft_group_registry::get_my_raft_id() {
@@ -390,13 +297,9 @@ const raft::server_id& raft_group_registry::get_my_raft_id() {
 }
 
 seastar::future<> raft_group_registry::stop() {
-    if (!_is_enabled) {
-        co_return;
-    }
     co_await drain_on_shutdown();
     co_await uninit_rpc_verbs();
     _direct_fd_subscription.reset();
-    co_await _gossiper.unregister_(_gossiper_proxy);
 }
 
 seastar::future<> raft_group_registry::drain_on_shutdown() noexcept {
@@ -423,6 +326,14 @@ raft::server& raft_group_registry::get_server(raft::group_id gid) {
     return *ptr;
 }
 
+raft_server_with_timeouts raft_group_registry::get_server_with_timeouts(raft::group_id gid) {
+    auto& group_server = server_for_group(gid);
+    if (!group_server.server.get()) {
+        on_internal_error(rslog, format("get_server(): no server for group {}", gid));
+    }
+    return raft_server_with_timeouts(group_server, failure_detector());
+}
+
 raft::server* raft_group_registry::find_server(raft::group_id gid) {
     auto it = _servers.find(gid);
     if (it == _servers.end()) {
@@ -447,6 +358,13 @@ raft::server& raft_group_registry::group0() {
     return get_server(*_group0_id);
 }
 
+raft_server_with_timeouts raft_group_registry::group0_with_timeouts() {
+    if (!_group0_id) {
+        on_internal_error(rslog, "group0(): _group0_id not present");
+    }
+    return get_server_with_timeouts(*_group0_id);
+}
+
 future<> raft_group_registry::start_server_for_group(raft_server_for_group new_grp) {
     auto gid = new_grp.gid;
 
@@ -459,6 +377,8 @@ future<> raft_group_registry::start_server_for_group(raft_server_for_group new_g
         // By the time the tick() is executed the server should already be initialized.
         co_await new_grp.server->start();
         new_grp.server->register_metrics();
+    } catch (abort_requested_exception&) {
+        throw;
     } catch (...) {
         on_internal_error(rslog, format("Failed to start a Raft group {}: {}", gid,
                 std::current_exception()));
@@ -504,26 +424,127 @@ shared_ptr<raft::failure_detector> raft_group_registry::failure_detector() {
 
 raft_group_registry::~raft_group_registry() = default;
 
-future<bool> direct_fd_pinger::ping(direct_failure_detector::pinger::endpoint_id id, abort_source& as) {
-    auto dst_id = raft::server_id{std::move(id)};
-    auto addr = _address_map.find(dst_id);
-    if (!addr) {
-        {
-            auto& rate_limit = _rate_limits.try_get_recent_entry(id, std::chrono::minutes(5));
-            rslog.log(log_level::warn, rate_limit, "Raft server id {} cannot be translated to an IP address.", id);
+namespace {
+    auto fmt_loc(const seastar::compat::source_location& l) {
+        return fmt::format("{}({}:{}) `{}`", l.file_name(), l.line(), l.column(), l.function_name());
+    };
+}
+
+raft_server_with_timeouts::raft_server_with_timeouts(raft_server_for_group& group_server, shared_ptr<raft::failure_detector> fd)
+    : _group_server(group_server)
+    , _fd(fd)
+{
+}
+
+template <std::invocable<abort_source*> Op>
+std::invoke_result_t<Op, abort_source*>
+raft_server_with_timeouts::run_with_timeout(Op&& op, const char* op_name,
+    seastar::abort_source* as, std::optional<raft_timeout> timeout)
+{
+    if (!timeout) {
+        co_return co_await op(as);
+    }
+    if (!timeout->value) {
+        if (!_group_server.default_op_timeout) {
+            on_internal_error(rslog, ::format("raft operation [{}], timeout requested at [{}],"
+                                              "but no value for it has been defined",
+                op_name, fmt_loc(timeout->loc)));
         }
-        _rate_limits.remove_least_recent_entries(std::chrono::minutes(30));
-        co_return false;
+        timeout->value = lowres_clock::now() + _group_server.default_op_timeout.value();
+    }
+    utils::composite_abort_source composite_as;
+
+    abort_on_expiry<> expiry{*timeout->value};
+    composite_as.add(expiry.abort_source());
+
+    if (as) {
+        composite_as.add(*as);
     }
 
     try {
-        auto reply = co_await ser::raft_rpc_verbs::send_direct_fd_ping(&_ms, netw::msg_addr(*addr), as, dst_id);
+        co_return co_await op(&composite_as.abort_source());
+    } catch (const raft::request_aborted& e) {
+        if (!expiry.abort_source().abort_requested() || (as && as->abort_requested())) {
+            throw;
+        }
+        sstring quorum_message;
+        {
+            unsigned voters_count = 0;
+            std::vector<raft::server_id> dead_voters;
+            for (const auto& c: _group_server.server->get_configuration().current) {
+                if (c.can_vote) {
+                    ++voters_count;
+                    if (!_fd->is_alive(c.addr.id)) {
+                        dead_voters.push_back(c.addr.id);
+                    }
+                }
+            }
+            if (voters_count > 0 && dead_voters.size() >= (voters_count + 1) / 2) {
+                std::string dead_voters_str;
+                for (const auto id: dead_voters) {
+                    fmt::format_to(std::back_inserter(dead_voters_str), ",{}", id);
+                    if (dead_voters_str.size() > 512) {
+                        dead_voters_str.append("...");
+                        break;
+                    }
+                }
+                quorum_message = ::format(", there is no raft quorum, total voters count {}, alive voters count {}, dead voters [{}]",
+                    voters_count, voters_count - dead_voters.size(), std::string_view(dead_voters_str).substr(1));
+            }
+        }
+        const auto message = ::format("group [{}] raft operation [{}] timed out{}",
+            _group_server.gid, op_name, quorum_message);
+        static thread_local logger::rate_limit rate_limit{std::chrono::seconds(1)};
+        rslog.log(log_level::warn, rate_limit, "{}; timeout requested at [{}], original error {}",
+            message, fmt_loc(timeout->loc), std::current_exception());
+        throw raft_operation_timeout_error(message.c_str());
+    }
+}
+
+future<> raft_server_with_timeouts::add_entry(raft::command command, raft::wait_type type,
+        seastar::abort_source& as, std::optional<raft_timeout> timeout)
+{
+    return run_with_timeout([&](abort_source* as) {
+            return _group_server.server->add_entry(std::move(command), type, as);
+        }, "add_entry", &as, timeout);
+}
+
+future<> raft_server_with_timeouts::modify_config(std::vector<raft::config_member> add, std::vector<raft::server_id> del,
+        seastar::abort_source* as, std::optional<raft_timeout> timeout)
+{
+    return run_with_timeout([&](abort_source* as) {
+            return _group_server.server->modify_config(std::move(add), std::move(del), as);
+        }, "modify_config", as, timeout);
+}
+
+future<bool> raft_server_with_timeouts::trigger_snapshot(seastar::abort_source* as, std::optional<raft_timeout> timeout)
+{
+    return run_with_timeout([&](abort_source* as) {
+        return _group_server.server->trigger_snapshot(as);
+    }, "trigger_snapshot", as, timeout);
+}
+
+future<> raft_server_with_timeouts::read_barrier(seastar::abort_source* as, std::optional<raft_timeout> timeout)
+{
+    return run_with_timeout([&](abort_source* as) -> future<> {
+        co_await utils::get_local_injector().inject("sleep_in_read_barrier", std::chrono::seconds(1));
+        co_return co_await _group_server.server->read_barrier(as);
+    }, "read_barrier", as, timeout);
+}
+
+future<bool> direct_fd_pinger::ping(direct_failure_detector::pinger::endpoint_id id, abort_source& as) {
+    auto dst_id = raft::server_id{id};
+
+    try {
+        auto reply = co_await ser::raft_rpc_verbs::send_direct_fd_ping(&_ms, locator::host_id{id}, as, dst_id);
         if (auto* wrong_dst = std::get_if<wrong_destination>(&reply.result)) {
+            // FIXME: after moving to host_id based verbs we will not get `wrong_destination`
+            //        any more since the connection will fail
             // This may happen e.g. when node B is replacing node A with the same IP.
             // When we ping node A, the pings will reach node B instead.
             // B will detect they were destined for node A and return wrong_destination.
-            rslog.trace("ping(id = {}, ip_addr = {}): wrong destination (reached {})",
-                        dst_id, *addr, wrong_dst->reached_id);
+            rslog.trace("ping(id = {}): wrong destination (reached {})",
+                        dst_id, wrong_dst->reached_id);
             co_return false;
         } else if (auto* info = std::get_if<group_liveness_info>(&reply.result)) {
             co_return info->group0_alive;

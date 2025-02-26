@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -16,24 +16,21 @@
 #include <iosfwd>
 #include <functional>
 #include <compare>
+#include "bytes_fwd.hh"
 #include "utils/mutable_view.hh"
 #include "utils/simple_hashers.hh"
 
-using bytes = basic_sstring<int8_t, uint32_t, 31, false>;
-using bytes_view = std::basic_string_view<int8_t>;
-using bytes_mutable_view = basic_mutable_view<bytes_view::value_type>;
-using bytes_opt = std::optional<bytes>;
 using sstring_view = std::string_view;
 
 inline bytes to_bytes(bytes&& b) {
     return std::move(b);
 }
 
-inline sstring_view to_sstring_view(bytes_view view) {
+inline std::string_view to_string_view(bytes_view view) {
     return {reinterpret_cast<const char*>(view.data()), view.size()};
 }
 
-inline bytes_view to_bytes_view(sstring_view view) {
+inline bytes_view to_bytes_view(std::string_view view) {
     return {reinterpret_cast<const int8_t*>(view.data()), view.size()};
 }
 
@@ -42,26 +39,21 @@ struct fmt_hex {
     fmt_hex(const bytes_view& v) noexcept : v(v) {}
 };
 
-std::ostream& operator<<(std::ostream& os, const fmt_hex& hex);
-
-bytes from_hex(sstring_view s);
+bytes from_hex(std::string_view s);
 sstring to_hex(bytes_view b);
 sstring to_hex(const bytes& b);
 sstring to_hex(const bytes_opt& b);
-
-std::ostream& operator<<(std::ostream& os, const bytes& b);
-std::ostream& operator<<(std::ostream& os, const bytes_opt& b);
 
 template <>
 struct fmt::formatter<fmt_hex> {
     size_t _group_size_in_bytes = 0;
     char _delimiter = ' ';
 public:
-    // format_spec := [group_size[delimeter]]
+    // format_spec := [group_size[delimiter]]
     // group_size := a char from '0' to '9'
-    // delimeter := a char other than '{'  or '}'
+    // delimiter := a char other than '{'  or '}'
     //
-    // by default, the given bytes are printed without delimeter, just
+    // by default, the given bytes are printed without delimiter, just
     // like a string. so a string view of {0x20, 0x01, 0x0d, 0xb8} is
     // printed like:
     // "20010db8".
@@ -70,14 +62,14 @@ public:
     // are printed. for instance, to print an bytes_view like IPv6. so
     // the format specfier would be "{:2:}", where
     // - "2": bytes are printed in groups of 2 bytes
-    // - ":": each group is delimeted by ":"
+    // - ":": each group is delimited by ":"
     // and the formatted output will look like:
     // "2001:0db8:0000"
     //
     // or we can mimic how the default format of used by hexdump using
     // "{:2 }", where
     // - "2": bytes are printed in group of 2 bytes
-    // - " ": each group is delimeted by " "
+    // - " ": each group is delimited by " "
     // and the formatted output will look like:
     // "2001 0db8 0000"
     //
@@ -86,10 +78,10 @@ public:
     // and the formatted output will look like:
     // "20-01-0b-b8-00-00"
     constexpr auto parse(fmt::format_parse_context& ctx) {
-        // get the delimeter if any
+        // get the delimiter if any
         auto it = ctx.begin();
         auto end = ctx.end();
-        if (it != end) {
+        if (it != end && *it != '}') {
             int group_size = *it++ - '0';
             if (group_size < 0 ||
                 static_cast<size_t>(group_size) > sizeof(uint64_t)) {

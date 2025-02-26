@@ -3,25 +3,26 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <fmt/ranges.h>
 #include "query-request.hh"
 #include "query-result.hh"
 #include "query-result-writer.hh"
 #include "query-result-set.hh"
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/thread.hh>
-#include "utils/to_string.hh"
 #include "bytes.hh"
 #include "mutation/mutation_partition_serializer.hh"
 #include "query-result-reader.hh"
 #include "query_result_merger.hh"
 #include "partition_slice_builder.hh"
 #include "schema/schema_registry.hh"
+#include "utils/assert.hh"
 #include "utils/overloaded_functor.hh"
 
 namespace query {
@@ -60,28 +61,37 @@ std::ostream& operator<<(std::ostream& out, const read_command& r) {
     return out;
 }
 
-std::ostream& operator<<(std::ostream& out, const forward_request::reduction_type& r) {
+lw_shared_ptr<query::read_command> reversed(lw_shared_ptr<query::read_command>&& cmd)
+{
+    auto schema = local_schema_registry().get(cmd->schema_version)->get_reversed();
+    cmd->schema_version = schema->version();
+    cmd->slice = query::legacy_reverse_slice_to_native_reverse_slice(*schema, cmd->slice);
+
+    return std::move(cmd);
+}
+
+std::ostream& operator<<(std::ostream& out, const mapreduce_request::reduction_type& r) {
     out << "reduction_type{";
     switch (r) {
-        case forward_request::reduction_type::count:
+        case mapreduce_request::reduction_type::count:
             out << "count";
             break;
-        case forward_request::reduction_type::aggregate:
+        case mapreduce_request::reduction_type::aggregate:
             out << "aggregate";
             break;
     }
     return out << "}";
 }
 
-std::ostream& operator<<(std::ostream& out, const forward_request::aggregation_info& a) {
+std::ostream& operator<<(std::ostream& out, const mapreduce_request::aggregation_info& a) {
     fmt::print(out, "aggregation_info{{, name={}, column_names=[{}]}}",
                a.name, fmt::join(a.column_names, ","));;
     return out;
 }
 
-std::ostream& operator<<(std::ostream& out, const forward_request& r) {
+std::ostream& operator<<(std::ostream& out, const mapreduce_request& r) {
     auto ms = std::chrono::time_point_cast<std::chrono::milliseconds>(r.timeout).time_since_epoch().count();
-    fmt::print(out, "forward_request{{reductions=[{}]",
+    fmt::print(out, "mapreduce_request{{reductions=[{}]",
                fmt::join(r.reduction_types, ","));
     if (r.aggregation_infos) {
         fmt::print(out, ", aggregation_infos=[{}]",
@@ -98,36 +108,25 @@ std::ostream& operator<<(std::ostream& out, const specific_ranges& s) {
     return out;
 }
 
-void trim_clustering_row_ranges_to(const schema& s, clustering_row_ranges& ranges, position_in_partition pos, bool reversed) {
-    auto cmp = [reversed, cmp = position_in_partition::composite_tri_compare(s)] (const auto& a, const auto& b) {
-        return reversed ? cmp(b, a) : cmp(a, b);
-    };
-    auto start_bound = [reversed] (const auto& range) -> position_in_partition_view {
-        return reversed ? position_in_partition_view::for_range_end(range) : position_in_partition_view::for_range_start(range);
-    };
-    auto end_bound = [reversed] (const auto& range) -> position_in_partition_view {
-        return reversed ? position_in_partition_view::for_range_start(range) : position_in_partition_view::for_range_end(range);
-    };
+void trim_clustering_row_ranges_to(const schema& s, clustering_row_ranges& ranges, position_in_partition pos) {
+    auto cmp = position_in_partition::composite_tri_compare(s);
 
     auto it = ranges.begin();
     while (it != ranges.end()) {
-        if (cmp(end_bound(*it), pos) <= 0) {
+        auto end_bound = position_in_partition_view::for_range_end(*it);
+        if (cmp(end_bound, pos) <= 0) {
             it = ranges.erase(it);
             continue;
-        } else if (cmp(start_bound(*it), pos) <= 0) {
-            assert(cmp(pos, end_bound(*it)) < 0);
-            auto r = reversed ?
-                clustering_range(it->start(), clustering_range::bound(pos.key(), pos.get_bound_weight() != bound_weight::before_all_prefixed)) :
-                clustering_range(clustering_range::bound(pos.key(), pos.get_bound_weight() != bound_weight::after_all_prefixed), it->end());
-            *it = std::move(r);
+        } else if (auto start_bound = position_in_partition_view::for_range_start(*it); cmp(start_bound, pos) <= 0) {
+            SCYLLA_ASSERT(cmp(pos, end_bound) < 0);
+            *it = clustering_range(clustering_range::bound(pos.key(), pos.get_bound_weight() != bound_weight::after_all_prefixed), it->end());
         }
         ++it;
     }
 }
 
-void trim_clustering_row_ranges_to(const schema& s, clustering_row_ranges& ranges, const clustering_key& key, bool reversed) {
-    return trim_clustering_row_ranges_to(s, ranges,
-            reversed ? position_in_partition::before_key(key) : position_in_partition::after_key(s, key), reversed);
+void trim_clustering_row_ranges_to(const schema& s, clustering_row_ranges& ranges, const clustering_key& key) {
+    return trim_clustering_row_ranges_to(s, ranges, position_in_partition::after_key(s, key));
 }
 
 
@@ -167,19 +166,6 @@ partition_slice reverse_slice(const schema& schema, partition_slice slice) {
             auto& ranges = sranges.ranges();
             std::reverse(ranges.begin(), ranges.end());
             reverse_clustering_ranges_bounds(ranges);
-        })
-        .with_option_toggled<partition_slice::option::reversed>()
-        .build();
-}
-
-partition_slice half_reverse_slice(const schema& schema, partition_slice slice) {
-    return partition_slice_builder(schema, std::move(slice))
-        .mutate_ranges([] (clustering_row_ranges& ranges) {
-            std::reverse(ranges.begin(), ranges.end());
-        })
-        .mutate_specific_ranges([] (specific_ranges& sranges) {
-            auto& ranges = sranges.ranges();
-            std::reverse(ranges.begin(), ranges.end());
         })
         .with_option_toggled<partition_slice::option::reversed>()
         .build();
@@ -266,7 +252,7 @@ void partition_slice::clear_range(const schema& s, const partition_key& k) {
         // just in case someone changes the impl above,
         // we should do actual remove if specific_ranges suddenly
         // becomes an actual map
-        assert(_specific_ranges->size() == 1);
+        SCYLLA_ASSERT(_specific_ranges->size() == 1);
         _specific_ranges = nullptr;
     }
 }
@@ -405,9 +391,9 @@ foreign_ptr<lw_shared_ptr<query::result>> result_merger::get() {
     return make_foreign(make_lw_shared<query::result>(std::move(w), is_short_read, row_count, partition_count, std::move(last_position)));
 }
 
-std::ostream& operator<<(std::ostream& out, const query::forward_result::printer& p) {
+std::ostream& operator<<(std::ostream& out, const query::mapreduce_result::printer& p) {
     if (p.functions.size() != p.res.query_results.size()) {
-        return out << "[malformed forward_result (" << p.res.query_results.size()
+        return out << "[malformed mapreduce_result (" << p.res.query_results.size()
             << " results, " << p.functions.size() << " aggregates)]";
     }
 
@@ -426,12 +412,12 @@ std::ostream& operator<<(std::ostream& out, const query::forward_result::printer
 }
 
 std::optional<query::clustering_range> position_range_to_clustering_range(const position_range& r, const schema& s) {
-    assert(r.start().get_type() == partition_region::clustered);
-    assert(r.end().get_type() == partition_region::clustered);
+    SCYLLA_ASSERT(r.start().get_type() == partition_region::clustered);
+    SCYLLA_ASSERT(r.end().get_type() == partition_region::clustered);
 
     if (r.start().has_key() && r.end().has_key()
             && clustering_key_prefix::equality(s)(r.start().key(), r.end().key())) {
-        assert(r.start().get_bound_weight() != r.end().get_bound_weight());
+        SCYLLA_ASSERT(r.start().get_bound_weight() != r.end().get_bound_weight());
 
         if (r.end().get_bound_weight() == bound_weight::after_all_prefixed
                 && r.start().get_bound_weight() != bound_weight::after_all_prefixed) {
@@ -452,16 +438,16 @@ std::optional<query::clustering_range> position_range_to_clustering_range(const 
 
     auto to_bound = [&s] (const position_in_partition& p, bool left) -> std::optional<query::clustering_range::bound> {
         if (p.is_before_all_clustered_rows(s)) {
-            assert(left);
+            SCYLLA_ASSERT(left);
             return {};
         }
 
         if (p.is_after_all_clustered_rows(s)) {
-            assert(!left);
+            SCYLLA_ASSERT(!left);
             return {};
         }
 
-        assert(p.has_key());
+        SCYLLA_ASSERT(p.has_key());
 
         auto bw = p.get_bound_weight();
         bool inclusive = left

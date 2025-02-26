@@ -44,6 +44,18 @@ function(add_scylla_test name)
   add_executable(${name} ${src})
   add_dependencies(tests ${name})
 
+  cmake_path(RELATIVE_PATH CMAKE_CURRENT_SOURCE_DIR
+    BASE_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    OUTPUT_VARIABLE dirname)
+  list(APPEND scylla_tests "${dirname}/${name}")
+  set(scylla_tests "${scylla_tests}" PARENT_SCOPE)
+
+  if(Scylla_ENABLE_LTO)
+    # The runtime benefits of LTO don't outweight the compile time costs for tests.
+    target_link_options(${name} PRIVATE
+      $<$<CONFIG:RelWithDebInfo>:-fno-lto>)
+  endif()
+
   target_include_directories(${name}
     PRIVATE
       ${CMAKE_SOURCE_DIR})
@@ -62,8 +74,7 @@ function(add_scylla_test name)
   elseif(kind STREQUAL "BOOST")
     target_link_libraries(${name}
       PRIVATE
-        Boost::unit_test_framework
-        Boost::dynamic_linking)
+        Boost::unit_test_framework)
   elseif(kind STREQUAL "UNIT")
     target_link_libraries(${name}
       PRIVATE
@@ -78,13 +89,51 @@ function(add_scylla_test name)
   endif()
 endfunction()
 
+option(BUILD_TESTING
+  "Build the tests" ON)
+
 if(BUILD_TESTING)
     add_custom_target(tests)
     add_dependencies(tests scylla)
 
     add_subdirectory(boost)
+    add_subdirectory(ldap)
     add_subdirectory(manual)
     add_subdirectory(unit)
     add_subdirectory(raft)
     add_subdirectory(resource/wasm)
+
+    if(CMAKE_CONFIGURATION_TYPES)
+      foreach(config ${CMAKE_CONFIGURATION_TYPES})
+        string(APPEND build_mode
+          "$<$<CONFIG:${config}>:${scylla_build_mode_${config}}>")
+      endforeach()
+    else()
+      set(build_mode ${scylla_build_mode_${CMAKE_BUILD_TYPE}})
+    endif()
+
+    set(Scylla_TEST_REPEAT
+      "1"
+      CACHE
+      STRING
+      "How many times to repeat each unittest")
+    set(Scylla_TEST_TIMEOUT
+      "7200"
+      CACHE
+      STRING
+      "How many seconds to allow for running all tests")
+    add_custom_target(test
+      COMMAND ./test.py --mode=${build_mode} --repeat=${Scylla_TEST_REPEAT} --timeout=${Scylla_TEST_TIMEOUT}
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+      USES_TERMINAL)
+    add_dependencies(test tests)
 endif()
+
+if(CMAKE_CONFIGURATION_TYPES)
+  set(by_products_option BYPRODUCTS test-list.phony.stamp)
+endif()
+add_custom_target(unit_test_list
+  COMMAND echo -e "'$<LIST:JOIN,${scylla_tests},\\n>'"
+  COMMENT "List configured unit tests"
+  ${by_products_option}
+  COMMAND_EXPAND_LISTS)

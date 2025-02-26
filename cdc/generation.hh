@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
@@ -45,6 +45,8 @@ namespace gms {
 } // namespace gms
 
 namespace cdc {
+
+api::timestamp_clock::duration get_generation_leeway();
 
 class stream_id final {
     bytes _value;
@@ -119,7 +121,7 @@ public:
 class no_generation_data_exception : public std::runtime_error {
 public:
     no_generation_data_exception(cdc::generation_id generation_ts)
-        : std::runtime_error(format("could not find generation data for timestamp {}", generation_ts))
+        : std::runtime_error(fmt::format("could not find generation data for timestamp {}", generation_ts))
     {}
 };
 
@@ -131,7 +133,7 @@ public:
  * The chosen condition is arbitrary, it only tries to make sure that no two nodes propose a generation of streams
  * when upgrading, and nothing bad happens if they for some reason do (it's mostly an optimization).
  */
-bool should_propose_first_generation(const gms::inet_address& me, const gms::gossiper&);
+bool should_propose_first_generation(const locator::host_id& me, const gms::gossiper&);
 
 /*
  * Checks if the CDC generation is optimal, which is true if its `topology_description` is consistent

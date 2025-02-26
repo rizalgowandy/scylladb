@@ -1,15 +1,18 @@
 # Copyright 2020-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for the QueryFilter parameter of the Query operation.
 # QueryFilter is the older version of the newer FilterExpression syntax,
 # which is tested in test_filter_expression.py.
 
+import random
+
 import pytest
 from botocore.exceptions import ClientError
-import random
-from util import full_query, full_query_and_counts, random_string, random_bytes
+
+from test.alternator.util import full_query, full_query_and_counts, random_string, random_bytes
+
 
 # The test_table_sn_with_data fixture is the regular test_table_sn fixture
 # with a partition inserted with 20 items. The sort key 'c' of the items

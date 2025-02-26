@@ -3,11 +3,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
-#include "types/types.hh"
+
+#include <seastar/core/future.hh>
+
+#include "bytes_fwd.hh"
+#include "seastarx.hh"
 
 namespace redis {
 

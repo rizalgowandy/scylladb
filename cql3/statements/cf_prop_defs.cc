@@ -5,10 +5,11 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "cql3/statements/cf_prop_defs.hh"
+#include "cql3/statements/request_validations.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "db/extensions.hh"
 #include "db/tags/extension.hh"
@@ -20,6 +21,7 @@
 #include "tombstone_gc.hh"
 #include "db/per_partition_rate_limit_extension.hh"
 #include "db/per_partition_rate_limit_options.hh"
+#include "db/tablet_options.hh"
 #include "utils/bloom_calculations.hh"
 
 #include <boost/algorithm/string/predicate.hpp>
@@ -29,8 +31,6 @@ namespace cql3 {
 namespace statements {
 
 const sstring cf_prop_defs::KW_COMMENT = "comment";
-const sstring cf_prop_defs::KW_READREPAIRCHANCE = "read_repair_chance";
-const sstring cf_prop_defs::KW_DCLOCALREADREPAIRCHANCE = "dclocal_read_repair_chance";
 const sstring cf_prop_defs::KW_GCGRACESECONDS = "gc_grace_seconds";
 const sstring cf_prop_defs::KW_PAXOSGRACESECONDS = "paxos_grace_seconds";
 const sstring cf_prop_defs::KW_MINCOMPACTIONTHRESHOLD = "min_threshold";
@@ -54,6 +54,8 @@ const sstring cf_prop_defs::COMPACTION_STRATEGY_CLASS_KEY = "class";
 
 const sstring cf_prop_defs::COMPACTION_ENABLED_KEY = "enabled";
 
+const sstring cf_prop_defs::KW_TABLETS = "tablets";
+
 schema::extensions_map cf_prop_defs::make_schema_extensions(const db::extensions& exts) const {
     schema::extensions_map er;
     for (auto& p : exts.schema_extensions()) {
@@ -70,6 +72,14 @@ schema::extensions_map cf_prop_defs::make_schema_extensions(const db::extensions
     return er;
 }
 
+data_dictionary::keyspace cf_prop_defs::find_keyspace(const data_dictionary::database db, std::string_view ks_name) {
+    try {
+        return db.find_keyspace(ks_name);
+    } catch (const data_dictionary::no_such_keyspace& e) {
+        throw request_validations::invalid_request("{}", e.what());
+    }
+}
+
 void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name, const schema::extensions_map& schema_extensions) const {
     // Skip validation if the comapction strategy class is already set as it means we've already
     // prepared (and redoing it would set strategyClass back to null, which we don't want)
@@ -77,18 +87,22 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
         return;
     }
 
+    const auto& ks = find_keyspace(db, ks_name);
+
     static std::set<sstring> keywords({
-        KW_COMMENT, KW_READREPAIRCHANCE, KW_DCLOCALREADREPAIRCHANCE,
+        KW_COMMENT,
         KW_GCGRACESECONDS, KW_CACHING, KW_DEFAULT_TIME_TO_LIVE,
         KW_MIN_INDEX_INTERVAL, KW_MAX_INDEX_INTERVAL, KW_SPECULATIVE_RETRY,
         KW_BF_FP_CHANCE, KW_MEMTABLE_FLUSH_PERIOD, KW_COMPACTION,
         KW_COMPRESSION, KW_CRC_CHECK_CHANCE,  KW_ID, KW_PAXOSGRACESECONDS,
-        KW_SYNCHRONOUS_UPDATES
+        KW_SYNCHRONOUS_UPDATES, KW_TABLETS,
     });
     static std::set<sstring> obsolete_keywords({
         sstring("index_interval"),
         sstring("replicate_on_write"),
         sstring("populate_io_cache_on_flush"),
+        sstring("read_repair_chance"),
+        sstring("dclocal_read_repair_chance"),
     });
 
     const auto& exts = db.extensions();
@@ -124,15 +138,6 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
         cp.validate();
     }
 
-    if (auto caching_options = get_caching_options(); caching_options && !caching_options->enabled() && !db.features().per_table_caching) {
-        throw exceptions::configuration_exception(KW_CACHING + " can't contain \"'enabled':false\" unless whole cluster supports it");
-    }
-
-    auto cdc_options = get_cdc_options(schema_extensions);
-    if (cdc_options && cdc_options->enabled() && !db.features().cdc) {
-        throw exceptions::configuration_exception("CDC not supported by the cluster");
-    }
-
     auto per_partition_rate_limit_options = get_per_partition_rate_limit_options(schema_extensions);
     if (per_partition_rate_limit_options && !db.features().typed_errors_in_read_rpc) {
         throw exceptions::configuration_exception("Per-partition rate limit is not supported yet by the whole cluster");
@@ -163,7 +168,24 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
         }
     }
 
+    auto memtable_flush_period = get_int(KW_MEMTABLE_FLUSH_PERIOD, DEFAULT_MEMTABLE_FLUSH_PERIOD);
+    if (memtable_flush_period != 0 && memtable_flush_period < DEFAULT_MEMTABLE_FLUSH_PERIOD_MIN_VALUE) {
+        throw exceptions::configuration_exception(format(
+            "{} must be 0 or greater than {}",
+            KW_MEMTABLE_FLUSH_PERIOD, DEFAULT_MEMTABLE_FLUSH_PERIOD_MIN_VALUE));
+    }
+
     speculative_retry::from_sstring(get_string(KW_SPECULATIVE_RETRY, speculative_retry(speculative_retry::type::NONE, 0).to_sstring()));
+
+    if (auto tablet_options_map = get_tablet_options()) {
+        if (!ks.uses_tablets()) {
+            throw exceptions::configuration_exception("tablet options cannot be used when tablets are disabled for the keyspace");
+        }
+        if (!db.features().tablet_options) {
+            throw exceptions::configuration_exception("tablet options cannot be used until all nodes in the cluster enable this feature");
+        }
+        db::tablet_options::validate(*tablet_options_map);
+    }
 }
 
 std::map<sstring, sstring> cf_prop_defs::get_compaction_type_options() const {
@@ -254,17 +276,16 @@ const db::per_partition_rate_limit_options* cf_prop_defs::get_per_partition_rate
     return &ext->get_options();
 }
 
-void cf_prop_defs::apply_to_builder(schema_builder& builder, schema::extensions_map schema_extensions) const {
+std::optional<db::tablet_options::map_type> cf_prop_defs::get_tablet_options() const {
+    if (auto tablet_options = get_map(KW_TABLETS)) {
+        return tablet_options.value();
+    }
+    return std::nullopt;
+}
+
+void cf_prop_defs::apply_to_builder(schema_builder& builder, schema::extensions_map schema_extensions, const data_dictionary::database& db, sstring ks_name) const {
     if (has_property(KW_COMMENT)) {
         builder.set_comment(get_string(KW_COMMENT, ""));
-    }
-
-    if (has_property(KW_READREPAIRCHANCE)) {
-        builder.set_read_repair_chance(get_double(KW_READREPAIRCHANCE, builder.get_read_repair_chance()));
-    }
-
-    if (has_property(KW_DCLOCALREADREPAIRCHANCE)) {
-        builder.set_dc_local_read_repair_chance(get_double(KW_DCLOCALREADREPAIRCHANCE, builder.get_dc_local_read_repair_chance()));
     }
 
     if (has_property(KW_GCGRACESECONDS)) {
@@ -346,7 +367,11 @@ void cf_prop_defs::apply_to_builder(schema_builder& builder, schema::extensions_
             schema_extensions.emplace(key, ext);
         }
     }
-
+    // Set default tombstone_gc mode.
+    if (!schema_extensions.contains(tombstone_gc_extension::NAME)) {
+        auto ext = seastar::make_shared<tombstone_gc_extension>(get_default_tombstonesonte_gc_mode(db, ks_name));
+        schema_extensions.emplace(tombstone_gc_extension::NAME, std::move(ext));
+    }
     builder.set_extensions(std::move(schema_extensions));
 
     if (has_property(KW_SYNCHRONOUS_UPDATES)) {
@@ -356,6 +381,10 @@ void cf_prop_defs::apply_to_builder(schema_builder& builder, schema::extensions_
         };
 
         builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>(tags_map));
+    }
+
+    if (auto tablet_options_opt = get_map(KW_TABLETS)) {
+        builder.set_tablet_options(std::move(*tablet_options_opt));
     }
 }
 

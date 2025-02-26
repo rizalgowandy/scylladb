@@ -5,15 +5,16 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include "native_function.hh"
 #include "scalar_function.hh"
-#include "log.hh"
+#include "exceptions/exceptions.hh"
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/util/log.hh>
 
 namespace cql3 {
 namespace functions {

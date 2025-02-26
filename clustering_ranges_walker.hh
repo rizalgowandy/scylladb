@@ -5,21 +5,24 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include "schema/schema.hh"
 #include "query-request.hh"
 #include "mutation/mutation_fragment.hh"
 #include "mutation/mutation_fragment_v2.hh"
 
+#include <ranges>
+
 // Utility for in-order checking of overlap with position ranges.
 class clustering_ranges_walker {
     const schema& _schema;
     const query::clustering_row_ranges& _ranges;
-    boost::iterator_range<query::clustering_row_ranges::const_iterator> _current_range;
+    std::ranges::subrange<query::clustering_row_ranges::const_iterator> _current_range;
     bool _in_current; // next position is known to be >= _current_start
     bool _past_current; // next position is known to be >= _current_end
     bool _using_clustering_range; // Whether current range comes from _current_range
@@ -37,7 +40,7 @@ private:
             if (!_current_range) {
                 return false;
             }
-            _current_range.advance_begin(1);
+            _current_range.advance(1);
         }
         ++_change_counter;
         _using_clustering_range = true;
@@ -103,7 +106,7 @@ public:
         // which positions you call advance_to(), provided that you change
         // the current tombstone at the same positions.
         // Redundant changes will not be generated.
-        // This is to support the guarantees of flat_mutation_reader_v2.
+        // This is to support the guarantees of mutation_reader.
         range_tombstones rts;
     };
 
@@ -249,7 +252,7 @@ public:
             auto range_end = position_in_partition_view::for_range_end(rng);
             if (!less(rt.position(), range_start) && !less(range_end, rt.end_position())) {
                 // Fully enclosed by this range.
-                assert(!first);
+                SCYLLA_ASSERT(!first);
                 return std::move(rt);
             }
             auto this_range_rt = rt;

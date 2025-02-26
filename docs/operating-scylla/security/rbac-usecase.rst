@@ -9,7 +9,7 @@ Role Based Access Control (RBAC) is a method of reducing lists of authorized use
 
 Roles vs Users
 --------------
-Roles supersede users and generalize them. In addition to doing with `roles` everything that you could previously do with `users` in older versions of Scylla, roles can be granted to other roles. If a role `developer` is granted to a role `manager`, then all permissions of the `developer` are granted to the `manager`.
+Roles supersede users and generalize them. In addition to doing with `roles` everything that you could previously do with `users` in older versions of ScyllaDB, roles can be granted to other roles. If a role `developer` is granted to a role `manager`, then all permissions of the `developer` are granted to the `manager`.
 
 In order to distinguish roles which correspond uniquely to an individual person and roles which are representative of a group, any role that can login is a user. Within that framework, you can conclude that all users are roles, but not all roles are users.
 
@@ -22,7 +22,7 @@ In the same manner, should someone leave the organization, all you would have to
 Should someone change positions at the company, just assign the new employee to the new role and revoke roles no longer required for the new position.
    
 To build an RBAC environment, you need to create the roles and their associated permissions and then assign or grant the roles to the individual users. Roles inherit the permissions of any other roles that they are granted. The hierarchy of roles can be either simple or extremely complex. This gives great flexibility to database administrators, where they can  create specific permission conditions without incurring a huge administrative burden.
-In addition to standard roles, `ScyllaDB Enterprise <https://enterprise.docs.scylladb.com/>`_ users can implement `Workload Prioritization <https://enterprise.docs.scylladb.com/stable/using-scylla/workload-prioritization.html>`, which allows you to attach roles to Service Levels, thus granting resources to roles as the role demands.
+In addition to standard roles, ScyllaDB users can implement :doc:`Workload Prioritization </features/workload-prioritization/>`, which allows you to attach roles to Service Levels, thus granting resources to roles as the role demands.
 
 .. _rbac-usecase-grant-roles-and-permissions:
 
@@ -47,7 +47,7 @@ Use case
 --------
 
 This is a use case that is given as an example. You should modify the commands to your organization’s requirements.
-A health club has opened, and they have an application that supports their clients, which is using Scylla as the database backend. The following groups would need to be given permissions:
+A health club has opened, and they have an application that supports their clients, which is using ScyllaDB as the database backend. The following groups would need to be given permissions:
 The office staff can add new customers and can cancel subscriptions, view all customer data, and can change classes for the trainers as well as view the trainers’ data.  
 Trainers can only view their schedule and can view customer data. 
 Customers view the class schedule. 
@@ -87,9 +87,9 @@ If you proceed with the following example without authorization, you will see th
 
 .. code-block:: cql
 
-   CREATE KEYSPACE IF NOT EXISTS customer WITH REPLICATION = { 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 };
+   CREATE KEYSPACE IF NOT EXISTS customer WITH REPLICATION = { 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 3 };
    CREATE TABLE IF NOT EXISTS customer.info (ssid UUID, name text, DOB text, telephone text, email text, memberid text, PRIMARY KEY (ssid,  name, memberid));
-   CREATE KEYSPACE IF NOT EXISTS schedule WITH REPLICATION = { 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 };
+   CREATE KEYSPACE IF NOT EXISTS schedule WITH REPLICATION = { 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 3 };
    CREATE TABLE IF NOT EXISTS schedule.cust (memberid UUID, ssid text, class text, meeting_day text, meeting_time text, PRIMARY KEY (memberid, ssid));
    CREATE TABLE IF NOT EXISTS schedule.train (trainerid UUID, class text, meeting_day text, meeting_time text, PRIMARY KEY (trainerid));
 
@@ -213,4 +213,4 @@ Additional References
 
 * :doc:`Authorization</operating-scylla/security/authorization/>`
 * :doc:`CQLSh the CQL shell</cql/cqlsh>`
-* `Workload Prioritization <https://enterprise.docs.scylladb.com/stable/using-scylla/workload-prioritization.html>`_ - to attach a service level to a role. Only available in `ScyllaDB Enterprise <https://enterprise.docs.scylladb.com/>`_.
+* :doc:`Workload Prioritization </features/workload-prioritization/>` - to attach a service level to a role

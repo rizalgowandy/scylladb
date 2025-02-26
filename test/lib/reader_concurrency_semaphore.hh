@@ -3,12 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "../../reader_concurrency_semaphore.hh"
+#include "schema/schema.hh"
 
 namespace tests {
 
@@ -18,8 +19,9 @@ class reader_concurrency_semaphore_wrapper {
 
 public:
     reader_concurrency_semaphore_wrapper(const char* name = nullptr)
-        : _semaphore(std::make_unique<::reader_concurrency_semaphore>(::reader_concurrency_semaphore::no_limits{}, name ? name : "test")) {
-    }
+        : _semaphore(std::make_unique<::reader_concurrency_semaphore>(::reader_concurrency_semaphore::no_limits{}, name ? name : "test",
+                    reader_concurrency_semaphore::register_metrics::no))
+    { }
     ~reader_concurrency_semaphore_wrapper() {
         _semaphore->stop().get();
     }

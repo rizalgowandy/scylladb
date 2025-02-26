@@ -3,22 +3,19 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #pragma once
 
+#include "utils/assert.hh"
 #include <vector>
 #include <unordered_set>
 #include <functional>
-#include <source_location>
 #include <boost/container/deque.hpp>
-#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/future.hh>
 #include <seastar/util/log.hh>
-#include <seastar/util/source_location-compat.hh>
 #include <seastar/core/abort_source.hh>
 #include "bytes_ostream.hh"
-#include "utils/UUID.hh"
 #include "internal.hh"
 #include "logical_clock.hh"
 
@@ -229,7 +226,7 @@ struct configuration {
 
     // Transition from C_old + C_new to C_new.
     void leave_joint() {
-        assert(is_joint());
+        SCYLLA_ASSERT(is_joint());
         previous.clear();
     }
 };
@@ -242,6 +239,8 @@ struct log_entry {
     term_t term;
     index_t idx;
     std::variant<command, configuration, dummy> data;
+
+    size_t get_size() const;
 };
 
 using log_entry_ptr = seastar::lw_shared_ptr<const log_entry>;
@@ -324,7 +323,7 @@ struct no_other_voting_member : public error {
 };
 
 struct request_aborted : public error {
-    request_aborted() : error("Request is aborted by a caller") {}
+    request_aborted(const std::string& error_msg) : error(error_msg) {}
 };
 
 inline bool is_uncertainty(const std::exception& e) {
@@ -817,16 +816,16 @@ public:
 } // namespace raft
 
 template <>
-struct fmt::formatter<raft::server_address> : fmt::formatter<std::string_view> {
+struct fmt::formatter<raft::server_address> : fmt::formatter<string_view> {
     auto format(const raft::server_address&, fmt::format_context& ctx) const -> decltype(ctx.out());
 };
 
 template <>
-struct fmt::formatter<raft::config_member> : fmt::formatter<std::string_view> {
+struct fmt::formatter<raft::config_member> : fmt::formatter<string_view> {
     auto format(const raft::config_member&, fmt::format_context& ctx) const -> decltype(ctx.out());
 };
 
 template <>
-struct fmt::formatter<raft::configuration> : fmt::formatter<std::string_view> {
+struct fmt::formatter<raft::configuration> : fmt::formatter<string_view> {
     auto format(const raft::configuration&, fmt::format_context& ctx) const -> decltype(ctx.out());
 };

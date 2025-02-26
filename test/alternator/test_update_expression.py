@@ -1,14 +1,14 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for the UpdateItem operations with an UpdateExpression parameter
 
-import random
-import string
 import pytest
 from botocore.exceptions import ClientError
-from util import random_string
+
+from test.alternator.util import random_string
+
 
 # The simplest test of using UpdateExpression to set a top-level attribute,
 # instead of the older AttributeUpdates parameter.

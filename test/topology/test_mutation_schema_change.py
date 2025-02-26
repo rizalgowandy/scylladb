@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2022-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 """
 Reproducer for a failure during lwt operation due to missing of a column mapping in schema history table.
@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 @pytest.mark.asyncio
+@pytest.mark.enable_tablets(False)                       # uses lightweight transactions
 async def test_mutation_schema_change(manager, random_tables):
     """
         Cluster A, B, C
@@ -35,7 +36,8 @@ async def test_mutation_schema_change(manager, random_tables):
     manager.driver_close()
     # Reduce the snapshot thresholds
     await manager.mark_dirty()
-    errs = [inject_error_one_shot(manager.api, s.ip_addr, 'raft_server_snapshot_reduce_threshold')
+    errs = [inject_error_one_shot(manager.api, s.ip_addr, "raft_server_set_snapshot_thresholds",
+                                  parameters={'snapshot_threshold': '3', 'snapshot_trailing': '1'})
             for s in [server_a, server_b, server_c]]
     await asyncio.gather(*errs)
 
@@ -80,6 +82,7 @@ async def test_mutation_schema_change(manager, random_tables):
 
 
 @pytest.mark.asyncio
+@pytest.mark.enable_tablets(False)                       # uses lightweight transactions
 async def test_mutation_schema_change_restart(manager, random_tables):
     """
         Cluster A, B, C
@@ -96,7 +99,8 @@ async def test_mutation_schema_change_restart(manager, random_tables):
     manager.driver_close()
     # Reduce the snapshot thresholds
     await manager.mark_dirty()
-    errs = [inject_error_one_shot(manager.api, s.ip_addr, 'raft_server_snapshot_reduce_threshold')
+    errs = [inject_error_one_shot(manager.api, s.ip_addr, "raft_server_set_snapshot_thresholds",
+                                  parameters={'snapshot_threshold': '3', 'snapshot_trailing': '1'})
             for s in [server_a, server_b, server_c]]
     await asyncio.gather(*errs)
 

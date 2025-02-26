@@ -5,24 +5,23 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include <string_view>
-#include <iostream>
 #include <optional>
 #include <stdexcept>
 #include <tuple>
 #include <vector>
 #include <unordered_set>
 
-#include <boost/range/adaptor/transformed.hpp>
-#include <seastar/core/print.hh>
+#include <fmt/core.h>
 #include <seastar/core/sstring.hh>
 
 #include "auth/permission.hh"
+#include "cql3/functions/function.hh"
 #include "seastarx.hh"
 #include "utils/hash.hh"
 #include "utils/small_vector.hh"
@@ -33,7 +32,7 @@ namespace auth {
 class invalid_resource_name : public std::invalid_argument {
 public:
     explicit invalid_resource_name(std::string_view name)
-            : std::invalid_argument(format("The resource name '{}' is invalid.", name)) {
+            : std::invalid_argument(fmt::format("The resource name '{}' is invalid.", name)) {
     }
 };
 
@@ -41,6 +40,28 @@ enum class resource_kind {
     data, role, service_level, functions
 };
 
+}
+
+template <>
+struct fmt::formatter<auth::resource_kind> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const auth::resource_kind kind, FormatContext& ctx) const {
+        using enum auth::resource_kind;
+        switch (kind) {
+        case data:
+            return formatter<string_view>::format("data", ctx);
+        case role:
+            return formatter<string_view>::format("role", ctx);
+        case service_level:
+            return formatter<string_view>::format("service_level", ctx);
+        case functions:
+            return formatter<string_view>::format("functions", ctx);
+        }
+        std::abort();
+    }
+};
+
+namespace auth {
 ///
 /// Type tag for constructing data resources.
 ///
@@ -123,13 +144,11 @@ private:
 
 bool operator<(const resource&, const resource&);
 
-std::ostream& operator<<(std::ostream&, const resource&);
-
 class resource_kind_mismatch : public std::invalid_argument {
 public:
     explicit resource_kind_mismatch(resource_kind expected, resource_kind actual)
         : std::invalid_argument(
-            format("This resource has kind '{}', but was expected to have kind '{}'.", actual, expected)) {
+            fmt::format("This resource has kind '{}', but was expected to have kind '{}'.", actual, expected)) {
     }
 };
 
@@ -146,11 +165,10 @@ public:
     explicit data_resource_view(const resource& r);
 
     std::optional<std::string_view> keyspace() const;
+    bool is_keyspace() const;
 
     std::optional<std::string_view> table() const;
 };
-
-std::ostream& operator<<(std::ostream&, const data_resource_view&);
 
 ///
 /// A "role" view of \ref resource.
@@ -169,8 +187,6 @@ public:
     std::optional<std::string_view> role() const;
 };
 
-std::ostream& operator<<(std::ostream&, const role_resource_view&);
-
 ///
 /// A "service_level" view of \ref resource.
 ///
@@ -182,8 +198,6 @@ public:
     explicit service_level_resource_view(const resource&);
 
 };
-
-std::ostream& operator<<(std::ostream&, const service_level_resource_view&);
 
 ///
 /// A "function" view of \ref resource.
@@ -201,8 +215,6 @@ public:
     std::optional<std::string_view> function_name() const;
     std::optional<std::vector<std::string_view>> function_args() const;
 };
-
-std::ostream& operator<<(std::ostream&, const functions_resource_view&);
 
 ///
 /// Parse a resource from its name.
@@ -250,30 +262,13 @@ inline resource make_functions_resource(std::string_view keyspace, std::string_v
     return resource(functions_resource_t{}, keyspace, function_name, function_signature);
 }
 
+resource make_functions_resource(const cql3::functions::function& f);
+
 sstring encode_signature(std::string_view name, std::vector<data_type> args);
 
 std::pair<sstring, std::vector<data_type>> decode_signature(std::string_view encoded_signature);
 
 }
-
-template <>
-struct fmt::formatter<auth::resource_kind> : fmt::formatter<std::string_view> {
-    template <typename FormatContext>
-    auto format(const auth::resource_kind kind, FormatContext& ctx) const {
-        using enum auth::resource_kind;
-        switch (kind) {
-        case data:
-            return formatter<std::string_view>::format("data", ctx);
-        case role:
-            return formatter<std::string_view>::format("role", ctx);
-        case service_level:
-            return formatter<std::string_view>::format("service_level", ctx);
-        case functions:
-            return formatter<std::string_view>::format("functions", ctx);
-        }
-        std::abort();
-    }
-};
 
 namespace std {
 
@@ -321,3 +316,13 @@ using resource_set = std::unordered_set<resource>;
 resource_set expand_resource_family(const resource&);
 
 }
+
+template <> struct fmt::formatter<auth::data_resource_view> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const auth::data_resource_view&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <> struct fmt::formatter<auth::resource> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const auth::resource&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

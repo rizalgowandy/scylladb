@@ -3,13 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "seastarx.hh"
 #include "cql3/statements/alter_service_level_statement.hh"
 #include "service/qos/service_level_controller.hh"
-#include "transport/messages/result_message.hh"
+#include "service/raft/raft_group0_client.hh"
 #include "service/client_state.hh"
 #include "service/query_state.hh"
 
@@ -26,7 +26,7 @@ alter_service_level_statement::alter_service_level_statement(sstring service_lev
 std::unique_ptr<cql3::statements::prepared_statement>
 cql3::statements::alter_service_level_statement::prepare(
         data_dictionary::database db, cql_stats &stats) {
-    return std::make_unique<prepared_statement>(::make_shared<alter_service_level_statement>(*this));
+    return std::make_unique<prepared_statement>(audit_info(), ::make_shared<alter_service_level_statement>(*this));
 }
 
 future<> alter_service_level_statement::check_access(query_processor& qp, const service::client_state &state) const {
@@ -37,13 +37,14 @@ future<::shared_ptr<cql_transport::messages::result_message>>
 alter_service_level_statement::execute(query_processor& qp,
         service::query_state &state,
         const query_options &, std::optional<service::group0_guard> guard) const {
+    service::group0_batch mc{std::move(guard)};
+    validate_shares_option(qp, _slo);
     qos::service_level& sl = state.get_service_level_controller().get_service_level(_service_level);
     qos::service_level_options slo = _slo.replace_defaults(sl.slo);
-    return state.get_service_level_controller().alter_distributed_service_level(_service_level, slo).then([] {
-        using void_result_msg = cql_transport::messages::result_message::void_message;
-        using result_msg = cql_transport::messages::result_message;
-        return ::static_pointer_cast<result_msg>(make_shared<void_result_msg>());
-    });
+    auto& slc = state.get_service_level_controller();
+    co_await slc.alter_distributed_service_level(_service_level, slo, mc);
+    co_await slc.commit_mutations(std::move(mc));
+    co_return nullptr;
 }
 }
 }

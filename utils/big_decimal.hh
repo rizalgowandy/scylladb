@@ -3,18 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "multiprecision_int.hh"
-#include <boost/multiprecision/cpp_int.hpp>
-#include <ostream>
+#include <boost/multiprecision/fwd.hpp>
+#include <seastar/core/sstring.hh>
 #include <compare>
 #include <concepts>
 
-#include "bytes.hh"
+using seastar::sstring;
 
 uint64_t from_varint_to_integer(const utils::multiprecision_int& varint);
 
@@ -22,12 +22,17 @@ class big_decimal {
 private:
     int32_t _scale;
     boost::multiprecision::cpp_int _unscaled_value;
+
+private:
+    std::strong_ordering tri_cmp_slow(const big_decimal& other) const;
+    std::strong_ordering tri_cmp_positive_nonzero_different_scale(const big_decimal& other) const;
+
 public:
     enum class rounding_mode {
         HALF_EVEN,
     };
 
-    explicit big_decimal(sstring_view text);
+    explicit big_decimal(std::string_view text);
     big_decimal();
     big_decimal(int32_t scale, boost::multiprecision::cpp_int unscaled_value);
     big_decimal(std::integral auto v) : big_decimal(0, v) {}
@@ -44,11 +49,12 @@ public:
     big_decimal& operator-=(const big_decimal& other);
     big_decimal operator+(const big_decimal& other) const;
     big_decimal operator-(const big_decimal& other) const;
+    big_decimal operator-() const;
     big_decimal div(const ::uint64_t y, const rounding_mode mode) const;
 };
 
 template <>
-struct fmt::formatter<big_decimal> : fmt::formatter<std::string_view> {
+struct fmt::formatter<big_decimal> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const big_decimal& v, FormatContext& ctx) const {
         return fmt::format_to(ctx.out(), "{}", v.to_string());

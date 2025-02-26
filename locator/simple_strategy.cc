@@ -3,45 +3,42 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
-
-#include <algorithm>
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 
 #include "simple_strategy.hh"
+#include "exceptions/exceptions.hh"
+#include "utils/assert.hh"
 #include "utils/class_registrator.hh"
 #include <boost/algorithm/string.hpp>
-#include "utils/sequenced_set.hh"
 
 namespace locator {
 
-simple_strategy::simple_strategy(const replication_strategy_config_options& config_options) :
-        abstract_replication_strategy(config_options, replication_strategy_type::simple) {
-    for (auto& config_pair : config_options) {
+simple_strategy::simple_strategy(replication_strategy_params params) :
+        abstract_replication_strategy(params, replication_strategy_type::simple) {
+    for (auto& config_pair : _config_options) {
         auto& key = config_pair.first;
         auto& val = config_pair.second;
 
         if (boost::iequals(key, "replication_factor")) {
-            validate_replication_factor(val);
-            _replication_factor = std::stol(val);
-
+            _replication_factor = parse_replication_factor(val);
             break;
         }
     }
 }
 
-future<endpoint_set> simple_strategy::calculate_natural_endpoints(const token& t, const token_metadata& tm) const {
+future<host_id_set> simple_strategy::calculate_natural_endpoints(const token& t, const token_metadata& tm) const {
     const std::vector<token>& tokens = tm.sorted_tokens();
 
     if (tokens.empty()) {
-        co_return endpoint_set();
+        co_return host_id_set{};
     }
 
     size_t replicas = _replication_factor;
-    endpoint_set endpoints;
+    host_id_set endpoints;
     endpoints.reserve(replicas);
 
     for (auto& token : tm.ring_range(t)) {
@@ -54,7 +51,7 @@ future<endpoint_set> simple_strategy::calculate_natural_endpoints(const token& t
         }
 
         auto ep = tm.get_endpoint(token);
-        assert(ep);
+        SCYLLA_ASSERT(ep);
 
         endpoints.push_back(*ep);
         co_await coroutine::maybe_yield();
@@ -67,19 +64,28 @@ size_t simple_strategy::get_replication_factor(const token_metadata&) const {
     return _replication_factor;
 }
 
-void simple_strategy::validate_options(const gms::feature_service&) const {
+void simple_strategy::validate_options(const gms::feature_service&, const locator::topology&) const {
     auto it = _config_options.find("replication_factor");
     if (it == _config_options.end()) {
         throw exceptions::configuration_exception("SimpleStrategy requires a replication_factor strategy option.");
     }
-    validate_replication_factor(it->second);
+    parse_replication_factor(it->second);
+    if (_uses_tablets) {
+        throw exceptions::configuration_exception("SimpleStrategy doesn't support tablet replication");
+    }
 }
 
-std::optional<std::unordered_set<sstring>>simple_strategy::recognized_options(const topology&) const {
-    return {{ "replication_factor" }};
+sstring simple_strategy::sanity_check_read_replicas(const effective_replication_map& erm, const host_id_vector_replica_set& read_replicas) const {
+    if (read_replicas.size() > _replication_factor) {
+        return seastar::format("ERM inconsistency, the read replica set for simple strategy has higher count of"
+                               " read replicas [{}] than its replication factor [{}]",
+                               read_replicas.size(),
+                               _replication_factor);
+    }
+    return {};
 }
 
-using registry = class_registrator<abstract_replication_strategy, simple_strategy, const replication_strategy_config_options&>;
+using registry = class_registrator<abstract_replication_strategy, simple_strategy, replication_strategy_params>;
 static registry registrator("org.apache.cassandra.locator.SimpleStrategy");
 static registry registrator_short_name("SimpleStrategy");
 

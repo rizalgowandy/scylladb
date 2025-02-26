@@ -3,13 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/range/algorithm/copy.hpp>
-#include <boost/range/algorithm_ext/push_back.hpp>
+#include "utils/assert.hh"
+#include <fmt/ranges.h>
 
 #include <boost/test/unit_test.hpp>
 #include "query-result-set.hh"
@@ -21,6 +20,7 @@
 #include "test/lib/result_set_assertions.hh"
 #include "test/lib/mutation_source_test.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
+#include "test/lib/test_utils.hh"
 
 #include "querier.hh"
 #include "mutation_query.hh"
@@ -47,22 +47,22 @@ static schema_ptr make_schema() {
 
 struct mutation_less_cmp {
     bool operator()(const mutation& m1, const mutation& m2) const {
-        assert(m1.schema() == m2.schema());
+        SCYLLA_ASSERT(m1.schema() == m2.schema());
         return m1.decorated_key().less_compare(*m1.schema(), m2.decorated_key());
     }
 };
 static mutation_source make_source(std::vector<mutation> mutations) {
     return mutation_source([mutations = std::move(mutations)] (schema_ptr s, reader_permit permit, const dht::partition_range& range, const query::partition_slice& slice,
             tracing::trace_state_ptr, streamed_mutation::forwarding fwd, mutation_reader::forwarding fwd_mr) {
-        assert(range.is_full()); // slicing not implemented yet
+        SCYLLA_ASSERT(range.is_full()); // slicing not implemented yet
         for (auto&& m : mutations) {
-            if (slice.options.contains(query::partition_slice::option::reversed)) {
-                assert(m.schema()->make_reversed()->version() == s->version());
+            if (slice.is_reversed()) {
+                SCYLLA_ASSERT(m.schema()->make_reversed()->version() == s->version());
             } else {
-                assert(m.schema() == s);
+                SCYLLA_ASSERT(m.schema() == s);
             }
         }
-        return make_flat_mutation_reader_from_mutations_v2(s, std::move(permit), mutations, slice, fwd);
+        return make_mutation_reader_from_mutations_v2(s, std::move(permit), mutations, slice, fwd);
     });
 }
 
@@ -78,7 +78,7 @@ static query::result_memory_accounter make_accounter() {
 
 // Called from a seastar thread
 query::result_set to_result_set(const reconcilable_result& r, schema_ptr s, const query::partition_slice& slice) {
-    return query::result_set::from_raw_result(s, slice, to_data_query_result(r, s, slice, inf32, inf32).get0());
+    return query::result_set::from_raw_result(s, slice, to_data_query_result(r, s, slice, inf32, inf32).get());
 }
 
 static reconcilable_result mutation_query(schema_ptr s, reader_permit permit, const mutation_source& source, const dht::partition_range& range,
@@ -86,8 +86,7 @@ static reconcilable_result mutation_query(schema_ptr s, reader_permit permit, co
 
     auto querier = query::querier(source, s, std::move(permit), range, slice, {});
     auto close_querier = deferred_close(querier);
-    auto table_schema = slice.options.contains(query::partition_slice::option::reversed) ? s->make_reversed() : s;
-    auto rrb = reconcilable_result_builder(*table_schema, slice, make_accounter());
+    auto rrb = reconcilable_result_builder(*s, slice, make_accounter());
     return querier.consume_page(std::move(rrb), row_limit, partition_limit, query_time).get();
 }
 
@@ -214,7 +213,7 @@ SEASTAR_TEST_CASE(test_reverse_ordering_is_respected) {
 
             reconcilable_result result = mutation_query(query_schema, semaphore.make_permit(), src, query::full_partition_range, slice, 3, query::max_partitions, now);
 
-            assert_that(to_result_set(result, table_schema, slice))
+            assert_that(to_result_set(result, query_schema, slice))
                 .has_size(3)
                 .has(a_row()
                     .with_column("pk", data_value(bytes("key1")))
@@ -243,7 +242,7 @@ SEASTAR_TEST_CASE(test_reverse_ordering_is_respected) {
 
             reconcilable_result result = mutation_query(query_schema, semaphore.make_permit(), src, query::full_partition_range, slice, 3, query::max_partitions, now);
 
-            assert_that(to_result_set(result, table_schema, slice))
+            assert_that(to_result_set(result, query_schema, slice))
                 .has_size(3)
                 .has(a_row()
                     .with_column("pk", data_value(bytes("key1")))
@@ -262,15 +261,16 @@ SEASTAR_TEST_CASE(test_reverse_ordering_is_respected) {
         {
             auto slice = partition_slice_builder(*query_schema)
                 .with_range(query::clustering_range(
-                    {clustering_key_prefix::from_single_value(*query_schema, bytes("C"))},
-                    {clustering_key_prefix::from_single_value(*query_schema, bytes("E"))}))
+                    {clustering_key_prefix::from_single_value(*query_schema, bytes("E"))},
+                    {clustering_key_prefix::from_single_value(*query_schema, bytes("C"))}
+                    ))
                 .reversed()
                 .build();
 
             {
                 reconcilable_result result = mutation_query(query_schema, semaphore.make_permit(), src, query::full_partition_range, slice, 10, query::max_partitions, now);
 
-                assert_that(to_result_set(result, table_schema, slice))
+                assert_that(to_result_set(result, query_schema, slice))
                     .has_size(3)
                     .has(a_row()
                         .with_column("pk", data_value(bytes("key1")))
@@ -289,7 +289,7 @@ SEASTAR_TEST_CASE(test_reverse_ordering_is_respected) {
             {
                 reconcilable_result result = mutation_query(query_schema, semaphore.make_permit(), src, query::full_partition_range, slice, 1, query::max_partitions, now);
 
-                assert_that(to_result_set(result, table_schema, slice))
+                assert_that(to_result_set(result, query_schema, slice))
                     .has_size(1)
                     .has(a_row()
                         .with_column("pk", data_value(bytes("key1")))
@@ -300,7 +300,7 @@ SEASTAR_TEST_CASE(test_reverse_ordering_is_respected) {
             {
                 reconcilable_result result = mutation_query(query_schema, semaphore.make_permit(), src, query::full_partition_range, slice, 2, query::max_partitions, now);
 
-                assert_that(to_result_set(result, table_schema, slice))
+                assert_that(to_result_set(result, query_schema, slice))
                     .has_size(2)
                     .has(a_row()
                         .with_column("pk", data_value(bytes("key1")))
@@ -326,7 +326,7 @@ SEASTAR_TEST_CASE(test_reverse_ordering_is_respected) {
 
             reconcilable_result result = mutation_query(query_schema, semaphore.make_permit(), src, query::full_partition_range, slice, 2, query::max_partitions, now);
 
-            assert_that(to_result_set(result, table_schema, slice))
+            assert_that(to_result_set(result, query_schema, slice))
                 .has_size(2)
                 .has(a_row()
                     .with_column("pk", data_value(bytes("key1")))
@@ -349,7 +349,7 @@ SEASTAR_TEST_CASE(test_reverse_ordering_is_respected) {
 
             reconcilable_result result = mutation_query(query_schema, semaphore.make_permit(), src, query::full_partition_range, slice, 3, query::max_partitions, now);
 
-            assert_that(to_result_set(result, table_schema, slice))
+            assert_that(to_result_set(result, query_schema, slice))
                 .has_size(2)
                 .has(a_row()
                     .with_column("pk", data_value(bytes("key1")))
@@ -370,7 +370,7 @@ SEASTAR_TEST_CASE(test_reverse_ordering_is_respected) {
 
             reconcilable_result result = mutation_query(query_schema, semaphore.make_permit(), src, query::full_partition_range, slice, 3, query::max_partitions, now);
 
-            assert_that(to_result_set(result, table_schema, slice))
+            assert_that(to_result_set(result, query_schema, slice))
                 .has_only(a_row()
                     .with_column("pk", data_value(bytes("key1")))
                     .with_column("ck", data_value(bytes("B")))
@@ -463,28 +463,28 @@ SEASTAR_TEST_CASE(test_result_row_count) {
             auto src = make_source({m1});
 
             auto r = to_data_query_result(mutation_query(s, semaphore.make_permit(), make_source({m1}), query::full_partition_range, slice, 10000, query::max_partitions, now),
-                    s, slice, inf32, inf32).get0();
+                    s, slice, inf32, inf32).get();
             BOOST_REQUIRE_EQUAL(r.row_count().value(), 0);
 
             m1.set_static_cell("s1", data_value(bytes("S_v1")), 1);
             r = to_data_query_result(mutation_query(s, semaphore.make_permit(), make_source({m1}), query::full_partition_range, slice, 10000, query::max_partitions, now),
-                    s, slice, inf32, inf32).get0();
+                    s, slice, inf32, inf32).get();
             BOOST_REQUIRE_EQUAL(r.row_count().value(), 1);
 
             m1.set_clustered_cell(clustering_key::from_single_value(*s, bytes("A")), "v1", data_value(bytes("A_v1")), 1);
             r = to_data_query_result(mutation_query(s, semaphore.make_permit(), make_source({m1}), query::full_partition_range, slice, 10000, query::max_partitions, now),
-                    s, slice, inf32, inf32).get0();
+                    s, slice, inf32, inf32).get();
             BOOST_REQUIRE_EQUAL(r.row_count().value(), 1);
 
             m1.set_clustered_cell(clustering_key::from_single_value(*s, bytes("B")), "v1", data_value(bytes("B_v1")), 1);
             r = to_data_query_result(mutation_query(s, semaphore.make_permit(), make_source({m1}), query::full_partition_range, slice, 10000, query::max_partitions, now),
-                    s, slice, inf32, inf32).get0();
+                    s, slice, inf32, inf32).get();
             BOOST_REQUIRE_EQUAL(r.row_count().value(), 2);
 
             mutation m2(s, partition_key::from_single_value(*s, "key2"));
             m2.set_static_cell("s1", data_value(bytes("S_v1")), 1);
             r = to_data_query_result(mutation_query(s, semaphore.make_permit(), make_source({m1, m2}), query::full_partition_range, slice, 10000, query::max_partitions, now),
-                    s, slice, inf32, inf32).get0();
+                    s, slice, inf32, inf32).get();
             BOOST_REQUIRE_EQUAL(r.row_count().value(), 3);
     });
 }
@@ -555,11 +555,11 @@ SEASTAR_THREAD_TEST_CASE(test_result_size_calculation) {
     slice.options.set<query::partition_slice::option::allow_short_read>();
 
     query::result::builder digest_only_builder(slice, query::result_options{query::result_request::only_digest, query::digest_algorithm::xxHash},
-            l.new_digest_read(query::max_result_size(query::result_memory_limiter::maximum_result_size), query::short_read::yes).get0(), query::max_tombstones);
+            l.new_digest_read(query::max_result_size(query::result_memory_limiter::maximum_result_size), query::short_read::yes).get(), query::max_tombstones);
     data_query(s, semaphore.make_permit(), source, query::full_partition_range, slice, digest_only_builder);
 
     query::result::builder result_and_digest_builder(slice, query::result_options{query::result_request::result_and_digest, query::digest_algorithm::xxHash},
-            l.new_data_read(query::max_result_size(query::result_memory_limiter::maximum_result_size), query::short_read::yes).get0(), query::max_tombstones);
+            l.new_data_read(query::max_result_size(query::result_memory_limiter::maximum_result_size), query::short_read::yes).get(), query::max_tombstones);
     data_query(s, semaphore.make_permit(), source, query::full_partition_range, slice, result_and_digest_builder);
 
     BOOST_REQUIRE_EQUAL(digest_only_builder.memory_accounter().used_memory(), result_and_digest_builder.memory_accounter().used_memory());
@@ -600,5 +600,5 @@ SEASTAR_THREAD_TEST_CASE(test_reverse_range_tombstones) {
     auto src = make_source({m});
     auto slice = partition_slice_builder(*query_schema).reversed().build();
     reconcilable_result result = mutation_query(query_schema, semaphore.make_permit(), src, query::full_partition_range, slice, query::max_rows, query::max_partitions, now);
-    assert_that(result.partitions().at(0).mut().unfreeze(table_schema)).is_equal_to(m);
+    assert_that(result.partitions().at(0).mut().unfreeze(query_schema)).is_equal_to(reverse(m));
 }

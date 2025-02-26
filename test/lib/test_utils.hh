@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -12,6 +12,7 @@
 #include <seastar/util/source_location-compat.hh>
 #include <string>
 #include <boost/test/unit_test.hpp>
+#include <fmt/core.h>
 #include <fmt/format.h>
 
 using namespace seastar;
@@ -109,5 +110,26 @@ extern std::mutex boost_logger_mutex;
 // unreadable XML files, and therefore cause failure when parsing its content.
 #define THREADSAFE_BOOST_REQUIRE( P ) THREADSAFE_BOOST_CHECK(BOOST_REQUIRE( P ))
 #define THREADSAFE_BOOST_REQUIRE_EQUAL( L, R ) THREADSAFE_BOOST_CHECK(BOOST_REQUIRE_EQUAL( L, R ))
+
+}
+
+namespace internal {
+
+template<typename Lhs, typename Rhs>
+concept has_left_shift = requires(Lhs& lhs, const Rhs& rhs) {
+    { lhs << rhs } -> std::same_as<Lhs&>;
+};
+
+}
+
+namespace std {
+
+template <typename T>
+requires (fmt::is_formattable<T>::value &&
+          !::internal::has_left_shift<std::ostream, T>)
+std::ostream& boost_test_print_type(std::ostream& os, const T& p) {
+    fmt::print(os, "{}", p);
+    return os;
+}
 
 }

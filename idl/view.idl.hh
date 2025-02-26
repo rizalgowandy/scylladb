@@ -3,14 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 namespace db {
 namespace view {
 class update_backlog {
-    size_t current;
-    size_t max;
+    size_t get_current_bytes();
+    size_t get_max_bytes();
 };
 }
 }

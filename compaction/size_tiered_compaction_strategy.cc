@@ -3,15 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include "sstables/sstables.hh"
 #include "size_tiered_compaction_strategy.hh"
-
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/range/adaptors.hpp>
-#include <boost/range/algorithm.hpp>
+#include "cql3/statements/property_definitions.hh"
 
 namespace sstables {
 
@@ -113,7 +111,7 @@ size_tiered_compaction_strategy::create_sstable_and_length_pairs(const std::vect
 
     for(auto& sstable : sstables) {
         auto sstable_size = sstable->data_size();
-        assert(sstable_size != 0);
+        SCYLLA_ASSERT(sstable_size != 0);
 
         sstable_length_pairs.emplace_back(sstable, sstable_size);
     }
@@ -240,12 +238,11 @@ size_tiered_compaction_strategy::get_sstables_for_compaction(table_state& table_
     // ratio is greater than threshold.
     // prefer oldest sstables from biggest size tiers because they will be easier to satisfy conditions for
     // tombstone purge, i.e. less likely to shadow even older data.
-    for (auto&& sstables : buckets | boost::adaptors::reversed) {
+    for (auto&& sstables : buckets | std::views::reverse) {
         // filter out sstables which droppable tombstone ratio isn't greater than the defined threshold.
-        auto e = boost::range::remove_if(sstables, [this, compaction_time, &table_s] (const sstables::shared_sstable& sst) -> bool {
+        std::erase_if(sstables, [this, compaction_time, &table_s] (const sstables::shared_sstable& sst) -> bool {
             return !worth_dropping_tombstones(sst, compaction_time, table_s);
         });
-        sstables.erase(e, sstables.end());
         if (sstables.empty()) {
             continue;
         }
@@ -297,8 +294,9 @@ size_tiered_compaction_strategy::most_interesting_bucket(const std::vector<sstab
 }
 
 compaction_descriptor
-size_tiered_compaction_strategy::get_reshaping_job(std::vector<shared_sstable> input, schema_ptr schema, reshape_mode mode) const
+size_tiered_compaction_strategy::get_reshaping_job(std::vector<shared_sstable> input, schema_ptr schema, reshape_config cfg) const
 {
+    auto mode = cfg.mode;
     size_t offstrategy_threshold = std::max(schema->min_compaction_threshold(), 4);
     size_t max_sstables = std::max(schema->max_compaction_threshold(), int(offstrategy_threshold));
 

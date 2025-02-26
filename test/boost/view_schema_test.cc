@@ -3,12 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
 #include <boost/test/unit_test.hpp>
-#include <boost/range/adaptor/map.hpp>
 #include <fmt/ostream.h>
 #include <fmt/ranges.h>
 #include "replica/database.hh"
@@ -16,15 +15,20 @@
 #include "db/view/node_view_update_backlog.hh"
 #include "db/view/view_builder.hh"
 
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
+#include "test/lib/eventually.hh"
 #include "exceptions/unrecognized_entity_exception.hh"
 #include "db/config.hh"
 #include "types/set.hh"
 #include "types/list.hh"
 #include "types/map.hh"
+#include "types/vector.hh"
+
+BOOST_AUTO_TEST_SUITE(view_schema_test)
 
 using namespace std::literals::chrono_literals;
 
@@ -48,7 +52,7 @@ SEASTAR_TEST_CASE(test_case_sensitivity) {
 
         for (auto view : {"mv_test", "mv_test2"}) {
             eventually([&] {
-            auto msg = e.execute_cql(format("select \"theKey\", \"theClustering\", \"theValue\" from {} ", view)).get0();
+            auto msg = e.execute_cql(format("select \"theKey\", \"theClustering\", \"theValue\" from {} ", view)).get();
             assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({
@@ -63,7 +67,7 @@ SEASTAR_TEST_CASE(test_case_sensitivity) {
 
         for (auto view : {"mv_test", "mv_test2"}) {
             eventually([&] {
-            auto msg = e.execute_cql(format("select \"theKey\", \"Col\", \"theValue\" from {} ", view)).get0();
+            auto msg = e.execute_cql(format("select \"theKey\", \"Col\", \"theValue\" from {} ", view)).get();
             assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({
@@ -90,7 +94,7 @@ SEASTAR_TEST_CASE(test_access_and_schema) {
         e.execute_cql("alter table cf add foo text;").get();
         e.execute_cql("insert into cf (p, c, v, foo) values (0, 'foo', 1, 'bar');").get();
         eventually([&] {
-        auto msg = e.execute_cql("select foo from vcf").get0();
+        auto msg = e.execute_cql("select foo from vcf").get();
         assert_that(msg).is_rows()
             .with_size(1)
             .with_row({
@@ -98,7 +102,7 @@ SEASTAR_TEST_CASE(test_access_and_schema) {
             });
         });
         e.execute_cql("alter table cf rename c to bar;").get();
-        auto msg = e.execute_cql("select bar from vcf").get0();
+        auto msg = e.execute_cql("select bar from vcf").get();
         assert_that(msg).is_rows()
             .with_size(1)
             .with_row({
@@ -116,7 +120,7 @@ SEASTAR_TEST_CASE(test_column_dropped_from_base) {
         e.execute_cql("alter table cf drop a;").get();
         e.execute_cql("insert into cf (p, c, v) values (0, 'foo', 1);").get();
         eventually([&] {
-        auto msg = e.execute_cql("select v from vcf").get0();
+        auto msg = e.execute_cql("select v from vcf").get();
         assert_that(msg).is_rows()
             .with_size(1)
             .with_row({
@@ -133,26 +137,26 @@ SEASTAR_TEST_CASE(test_updates) {
                        "where k is not null and v is not null primary key (v, k)").get();
 
         e.execute_cql("insert into base (k, v) values (0, 0);").get();
-        auto msg = e.execute_cql("select k, v from base where k = 0").get0();
+        auto msg = e.execute_cql("select k, v from base where k = 0").get();
         assert_that(msg).is_rows()
             .with_size(1)
             .with_row({ {int32_type->decompose(0)}, {int32_type->decompose(0)} });
         eventually([&] {
-        auto msg = e.execute_cql("select k, v from mv where v = 0").get0();
+        auto msg = e.execute_cql("select k, v from mv where v = 0").get();
         assert_that(msg).is_rows()
             .with_size(1)
             .with_row({ {int32_type->decompose(0)}, {int32_type->decompose(0)} });
         });
 
         e.execute_cql("insert into base (k, v) values (0, 1);").get();
-        msg = e.execute_cql("select k, v from base where k = 0").get0();
+        msg = e.execute_cql("select k, v from base where k = 0").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {int32_type->decompose(1)} });
         eventually([&] {
-        auto msg = e.execute_cql("select k, v from mv where v = 0").get0();
+        auto msg = e.execute_cql("select k, v from mv where v = 0").get();
         assert_that(msg).is_rows().with_size(0);
-        msg = e.execute_cql("select k, v from mv where v = 1").get0();
+        msg = e.execute_cql("select k, v from mv where v = 1").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {int32_type->decompose(1)} });
@@ -167,24 +171,24 @@ SEASTAR_TEST_CASE(test_updates_no_read_before_update) {
                               "where k is not null and c is not null primary key (k, c)").get();
 
         e.execute_cql("insert into base (k, c, v) values (0, 0, 0);").get();
-        auto msg = e.execute_cql("select k, v from base where k = 0").get0();
+        auto msg = e.execute_cql("select k, v from base where k = 0").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {int32_type->decompose(0)} });
         eventually([&] {
-        auto msg = e.execute_cql("select k, v from mv where k = 0").get0();
+        auto msg = e.execute_cql("select k, v from mv where k = 0").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {int32_type->decompose(0)} });
         });
 
         e.execute_cql("insert into base (k, c, v) values (0, 0, 1);").get();
-        msg = e.execute_cql("select k, v from base where k = 0").get0();
+        msg = e.execute_cql("select k, v from base where k = 0").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {int32_type->decompose(1)} });
         eventually([&] {
-        msg = e.execute_cql("select k, v from mv where k = 0").get0();
+        msg = e.execute_cql("select k, v from mv where k = 0").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {int32_type->decompose(1)} });
@@ -234,6 +238,7 @@ SEASTAR_TEST_CASE(test_all_types) {
                     "mapval map<ascii, int>,"
                     "frozenmapval frozen<map<ascii, int>>,"
                     "tupleval frozen<tuple<int, ascii, uuid>>,"
+                    "vectorval vector<int, 3>,"
                     "udtval frozen<myType>)").get();
         auto s = e.local_db().find_schema(sstring("ks"), sstring("cf"));
         BOOST_REQUIRE(s);
@@ -251,7 +256,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         // ================ ascii ================
         e.execute_cql("insert into cf (k, asciival) values (0, 'ascii text');").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, asciival, udtval from mv_asciival where asciival = 'ascii text'").get0();
+        auto msg = e.execute_cql("select k, asciival, udtval from mv_asciival where asciival = 'ascii text'").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {ascii_type->decompose("ascii text")}, { } });
@@ -260,7 +265,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         // ================ bigint ================
         e.execute_cql("insert into cf (k, bigintval) values (0, 12121212);").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, bigintval, asciival from mv_bigintval where bigintval = 12121212").get0();
+        auto msg = e.execute_cql("select k, bigintval, asciival from mv_bigintval where bigintval = 12121212").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {long_type->decompose(12121212L)}, {ascii_type->decompose("ascii text")} });
@@ -269,7 +274,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         // ================ blob ================
         e.execute_cql("insert into cf (k, blobval) values (0, 0x000001);").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, blobval, asciival from mv_blobval where blobval = 0x000001").get0();
+        auto msg = e.execute_cql("select k, blobval, asciival from mv_blobval where blobval = 0x000001").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {bytes_type->from_string("000001")}, {ascii_type->decompose("ascii text")} });
@@ -278,17 +283,17 @@ SEASTAR_TEST_CASE(test_all_types) {
         // ================ boolean ================
         e.execute_cql("insert into cf (k, booleanval) values (0, true);").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, booleanval, asciival from mv_booleanval where booleanval = true").get0();
+        auto msg = e.execute_cql("select k, booleanval, asciival from mv_booleanval where booleanval = true").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {boolean_type->decompose(true)}, {ascii_type->decompose("ascii text")} });
         });
         e.execute_cql("insert into cf (k, booleanval) values (0, false);").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, booleanval, asciival from mv_booleanval where booleanval = true").get0();
+        auto msg = e.execute_cql("select k, booleanval, asciival from mv_booleanval where booleanval = true").get();
         assert_that(msg).is_rows()
                 .with_size(0);
-        msg = e.execute_cql("select k, booleanval, asciival from mv_booleanval where booleanval = false").get0();
+        msg = e.execute_cql("select k, booleanval, asciival from mv_booleanval where booleanval = false").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {boolean_type->decompose(false)}, {ascii_type->decompose("ascii text")} });
@@ -297,7 +302,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         // ================ date ================
         e.execute_cql("insert into cf (k, dateval) values (0, '1986-01-19');").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, dateval, asciival from mv_dateval where dateval = '1986-01-19'").get0();
+        auto msg = e.execute_cql("select k, dateval, asciival from mv_dateval where dateval = '1986-01-19'").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {simple_date_type->from_string("1986-01-19")}, {ascii_type->decompose("ascii text")} });
@@ -306,7 +311,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         // ================ decimal ================
         e.execute_cql("insert into cf (k, decimalval) values (0, 123123.123123);").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, decimalval, asciival from mv_decimalval where decimalval = 123123.123123").get0();
+        auto msg = e.execute_cql("select k, decimalval, asciival from mv_decimalval where decimalval = 123123.123123").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {decimal_type->from_string("123123.123123")}, {ascii_type->decompose("ascii text")} });
@@ -315,7 +320,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         // ================ double ================
         e.execute_cql("insert into cf (k, doubleval) values (0, 123123.123123);").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, doubleval, asciival from mv_doubleval where doubleval = 123123.123123").get0();
+        auto msg = e.execute_cql("select k, doubleval, asciival from mv_doubleval where doubleval = 123123.123123").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {double_type->from_string("123123.123123")}, {ascii_type->decompose("ascii text")} });
@@ -324,7 +329,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         // ================ float ================
         e.execute_cql("insert into cf (k, floatval) values (0, 123123.123123);").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, floatval, asciival from mv_floatval where floatval = 123123.123123").get0();
+        auto msg = e.execute_cql("select k, floatval, asciival from mv_floatval where floatval = 123123.123123").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {float_type->from_string("123123.123123")}, {ascii_type->decompose("ascii text")} });
@@ -333,7 +338,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         // ================ inet ================
         e.execute_cql("insert into cf (k, inetval) values (0, '127.0.0.1');").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, inetval, asciival from mv_inetval where inetval = '127.0.0.1'").get0();
+        auto msg = e.execute_cql("select k, inetval, asciival from mv_inetval where inetval = '127.0.0.1'").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {inet_addr_type->from_string("127.0.0.1")}, {ascii_type->decompose("ascii text")} });
@@ -342,7 +347,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         // ================ int ================
         e.execute_cql("insert into cf (k, intval) values (0, 456);").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, intval, asciival from mv_intval where intval = 456").get0();
+        auto msg = e.execute_cql("select k, intval, asciival from mv_intval where intval = 456").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {int32_type->decompose(456)}, {ascii_type->decompose("ascii text")} });
@@ -351,7 +356,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         // ================ utf8 ================
         e.execute_cql("insert into cf (k, textval) values (0, '\"some \" text');").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, textval, asciival from mv_textval where textval = '\"some \" text'").get0();
+        auto msg = e.execute_cql("select k, textval, asciival from mv_textval where textval = '\"some \" text'").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {utf8_type->from_string("\"some \" text")}, {ascii_type->decompose("ascii text")} });
@@ -360,7 +365,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         // ================ time ================
         e.execute_cql("insert into cf (k, timeval) values (0, '07:35:07.000111222');").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, timeval, asciival from mv_timeval where timeval = '07:35:07.000111222'").get0();
+        auto msg = e.execute_cql("select k, timeval, asciival from mv_timeval where timeval = '07:35:07.000111222'").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {time_type->from_string("07:35:07.000111222")}, {ascii_type->decompose("ascii text")} });
@@ -369,7 +374,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         // ================ timestamp ================
         e.execute_cql("insert into cf (k, timestampval) values (0, '123123123123');").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, timestampval, asciival from mv_timestampval where timestampval = '123123123123'").get0();
+        auto msg = e.execute_cql("select k, timestampval, asciival from mv_timestampval where timestampval = '123123123123'").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {timestamp_type->from_string("123123123123")}, {ascii_type->decompose("ascii text")} });
@@ -378,7 +383,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         // ================ timeuuid ================
         e.execute_cql("insert into cf (k, timeuuidval) values (0, D2177dD0-EAa2-11de-a572-001B779C76e3);").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, timeuuidval, asciival from mv_timeuuidval where timeuuidval = D2177dD0-EAa2-11de-a572-001B779C76e3").get0();
+        auto msg = e.execute_cql("select k, timeuuidval, asciival from mv_timeuuidval where timeuuidval = D2177dD0-EAa2-11de-a572-001B779C76e3").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {timeuuid_type->from_string("D2177dD0-EAa2-11de-a572-001B779C76e3")}, {ascii_type->decompose("ascii text")} });
@@ -387,7 +392,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         // ================ uuid ================
         e.execute_cql("insert into cf (k, uuidval) values (0, 6bddc89a-5644-11e4-97fc-56847afe9799);").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, uuidval, asciival from mv_uuidval where uuidval = 6bddc89a-5644-11e4-97fc-56847afe9799").get0();
+        auto msg = e.execute_cql("select k, uuidval, asciival from mv_uuidval where uuidval = 6bddc89a-5644-11e4-97fc-56847afe9799").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {uuid_type->from_string("6bddc89a-5644-11e4-97fc-56847afe9799")}, {ascii_type->decompose("ascii text")} });
@@ -396,7 +401,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         // ================ varint ================
         e.execute_cql("insert into cf (k, varintval) values (0, 1234567890123456789012345678901234567890);").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, varintval, asciival from mv_varintval where varintval = 1234567890123456789012345678901234567890").get0();
+        auto msg = e.execute_cql("select k, varintval, asciival from mv_varintval where varintval = 1234567890123456789012345678901234567890").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {varint_type->from_string("1234567890123456789012345678901234567890")}, {ascii_type->decompose("ascii text")} });
@@ -406,7 +411,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         auto list_type = s->get_column_definition(bytes("listval"))->type;
         e.execute_cql("insert into cf (k, listval) values (0, [1, 2, 3]);").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, listval from mv_intval where intval = 456").get0();
+        auto msg = e.execute_cql("select k, listval from mv_intval where intval = 456").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_list_value(list_type, list_type_impl::native_type({1, 2, 3})).serialize() });
@@ -414,7 +419,7 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("insert into cf (k, listval) values (0, [1]);").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, listval from mv_intval where intval = 456").get0();
+        auto msg = e.execute_cql("select k, listval from mv_intval where intval = 456").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_list_value(list_type, list_type_impl::native_type({data_value(1)})).serialize() });
@@ -422,7 +427,7 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("update cf set listval = listval + [2] where k = 0;").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, listval from mv_intval where intval = 456").get0();
+        auto msg = e.execute_cql("select k, listval from mv_intval where intval = 456").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_list_value(list_type, list_type_impl::native_type({1, 2})).serialize() });
@@ -430,7 +435,7 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("update cf set listval = [0] + listval where k = 0;").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, listval from mv_intval where intval = 456").get0();
+        auto msg = e.execute_cql("select k, listval from mv_intval where intval = 456").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_list_value(list_type, list_type_impl::native_type({0, 1, 2})).serialize() });
@@ -438,7 +443,7 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("update cf set listval[1] = 10 where k = 0;").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, listval from mv_intval where intval = 456").get0();
+        auto msg = e.execute_cql("select k, listval from mv_intval where intval = 456").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_list_value(list_type, list_type_impl::native_type({0, 10, 2})).serialize() });
@@ -446,18 +451,18 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("delete listval[1] from cf where k = 0;").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, listval from mv_intval where intval = 456").get0();
+        auto msg = e.execute_cql("select k, listval from mv_intval where intval = 456").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_list_value(list_type, list_type_impl::native_type({0, 2})).serialize() });
         });
 
         e.execute_cql("insert into cf (k, listval) values (0, []);").get();
-        auto msg = e.execute_cql("select k, listval from cf where k = 0").get0();
+        auto msg = e.execute_cql("select k, listval from cf where k = 0").get();
         assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(0)}, {} }});
 
         eventually([&] {
-        auto msg = e.execute_cql("select k, listval from mv_intval where intval = 456").get0();
+        auto msg = e.execute_cql("select k, listval from mv_intval where intval = 456").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_rows({{ {int32_type->decompose(0)}, {} }});
@@ -466,7 +471,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         // frozen
         e.execute_cql("insert into cf (k, frozenlistval) values (0, [1, 2, 3]);").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, frozenlistval, asciival from mv_frozenlistval where frozenlistval = [1, 2, 3]").get0();
+        auto msg = e.execute_cql("select k, frozenlistval, asciival from mv_frozenlistval where frozenlistval = [1, 2, 3]").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_list_value(list_type, list_type_impl::native_type({1, 2, 3})).serialize(), {ascii_type->decompose("ascii text")} });
@@ -474,7 +479,7 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("insert into cf (k, frozenlistval) values (0, [3, 2, 1]);").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, frozenlistval, asciival from mv_frozenlistval where frozenlistval = [3, 2, 1]").get0();
+        auto msg = e.execute_cql("select k, frozenlistval, asciival from mv_frozenlistval where frozenlistval = [3, 2, 1]").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_list_value(list_type, list_type_impl::native_type({3, 2, 1})).serialize(), {ascii_type->decompose("ascii text")} });
@@ -482,7 +487,7 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("insert into cf (k, frozenlistval) values (0, []);").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, frozenlistval, asciival from mv_frozenlistval where frozenlistval = []").get0();
+        auto msg = e.execute_cql("select k, frozenlistval, asciival from mv_frozenlistval where frozenlistval = []").get();
         assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(0)}, make_list_value(list_type, list_type_impl::native_type({})).serialize() , {ascii_type->decompose("ascii text")} }});
         });
 
@@ -490,7 +495,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         auto set_type = s->get_column_definition(bytes("setval"))->type;
         e.execute_cql("insert into cf (k, setval) values (0, {6bddc89a-5644-11e4-97fc-56847afe9798, 6bddc89a-5644-11e4-97fc-56847afe9799});").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, setval from mv_intval where intval = 456").get0();
+        auto msg = e.execute_cql("select k, setval from mv_intval where intval = 456").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_set_value(set_type, set_type_impl::native_type({
@@ -500,7 +505,7 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("insert into cf (k, setval) values (0, {6bddc89a-5644-11e4-97fc-56847afe9798, 6bddc89a-5644-11e4-97fc-56847afe9798, 6bddc89a-5644-11e4-97fc-56847afe9799});").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, setval from mv_intval where intval = 456").get0();
+        auto msg = e.execute_cql("select k, setval from mv_intval where intval = 456").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_set_value(set_type, set_type_impl::native_type({
@@ -510,7 +515,7 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("update cf set setval = setval + {6bddc89a-5644-0000-97fc-56847afe9799} where k = 0;").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, setval from mv_intval where intval = 456").get0();
+        auto msg = e.execute_cql("select k, setval from mv_intval where intval = 456").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_set_value(set_type, set_type_impl::native_type({
@@ -521,7 +526,7 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("update cf set setval = setval - {6bddc89a-5644-0000-97fc-56847afe9799} where k = 0;").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, setval from mv_intval where intval = 456").get0();
+        auto msg = e.execute_cql("select k, setval from mv_intval where intval = 456").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_set_value(set_type, set_type_impl::native_type({
@@ -531,7 +536,7 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("insert into cf (k, setval) values (0, {});").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, setval from mv_intval where intval = 456").get0();
+        auto msg = e.execute_cql("select k, setval from mv_intval where intval = 456").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {} });
@@ -540,7 +545,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         // frozen
         e.execute_cql("insert into cf (k, frozensetval) values (0, {});").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, frozensetval from mv_frozensetval  where frozensetval = {}").get0();
+        auto msg = e.execute_cql("select k, frozensetval from mv_frozensetval  where frozensetval = {}").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_set_value(set_type, set_type_impl::native_type({})).serialize() });
@@ -548,7 +553,7 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("insert into cf (k, frozensetval) values (0, {6bddc89a-5644-11e4-97fc-56847afe9798, 6bddc89a-5644-11e4-97fc-56847afe9799});").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, frozensetval, asciival from mv_frozensetval where frozensetval = {6bddc89a-5644-11e4-97fc-56847afe9798, 6bddc89a-5644-11e4-97fc-56847afe9799}").get0();
+        auto msg = e.execute_cql("select k, frozensetval, asciival from mv_frozensetval where frozensetval = {6bddc89a-5644-11e4-97fc-56847afe9798, 6bddc89a-5644-11e4-97fc-56847afe9799}").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_set_value(set_type, set_type_impl::native_type({
@@ -558,7 +563,7 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("insert into cf (k, frozensetval) values (0, {6bddc89a-0000-11e4-97fc-56847afe9799, 6bddc89a-5644-11e4-97fc-56847afe9798});").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, frozensetval, asciival from mv_frozensetval where frozensetval = {6bddc89a-0000-11e4-97fc-56847afe9799, 6bddc89a-5644-11e4-97fc-56847afe9798}").get0();
+        auto msg = e.execute_cql("select k, frozensetval, asciival from mv_frozensetval where frozensetval = {6bddc89a-0000-11e4-97fc-56847afe9799, 6bddc89a-5644-11e4-97fc-56847afe9798}").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_set_value(set_type, set_type_impl::native_type({
@@ -570,7 +575,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         auto map_type = s->get_column_definition(bytes("mapval"))->type;
         e.execute_cql("insert into cf (k, mapval) values (0, {'a': 1, 'b': 2});").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, mapval from mv_intval where intval = 456").get0();
+        auto msg = e.execute_cql("select k, mapval from mv_intval where intval = 456").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_map_value(map_type, map_type_impl::native_type({
@@ -579,7 +584,7 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("update cf set mapval['c'] = 3 where k = 0;").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, mapval from mv_intval where intval = 456").get0();
+        auto msg = e.execute_cql("select k, mapval from mv_intval where intval = 456").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_map_value(map_type, map_type_impl::native_type({
@@ -588,7 +593,7 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("update cf set mapval['b'] = 10 where k = 0;").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, mapval from mv_intval where intval = 456").get0();
+        auto msg = e.execute_cql("select k, mapval from mv_intval where intval = 456").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_map_value(map_type, map_type_impl::native_type({
@@ -597,7 +602,7 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("delete mapval['b'] from cf where k = 0;").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, mapval from mv_intval where intval = 456").get0();
+        auto msg = e.execute_cql("select k, mapval from mv_intval where intval = 456").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_map_value(map_type, map_type_impl::native_type({
@@ -606,7 +611,7 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("insert into cf (k, mapval) values (0, {});").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, mapval from mv_intval where intval = 456").get0();
+        auto msg = e.execute_cql("select k, mapval from mv_intval where intval = 456").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {} });
@@ -615,7 +620,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         // frozen
         e.execute_cql("insert into cf (k, frozenmapval) values (0, {'a': 1, 'b': 2});").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, frozenmapval, asciival from mv_frozenmapval where frozenmapval = {'a': 1, 'b': 2}").get0();
+        auto msg = e.execute_cql("select k, frozenmapval, asciival from mv_frozenmapval where frozenmapval = {'a': 1, 'b': 2}").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_map_value(map_type, map_type_impl::native_type({
@@ -624,7 +629,7 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("insert into cf (k, frozenmapval) values (0, {'a': 1, 'b': 2, 'c': 3});").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, frozenmapval, asciival from mv_frozenmapval where frozenmapval = {'a': 1, 'b': 2, 'c': 3}").get0();
+        auto msg = e.execute_cql("select k, frozenmapval, asciival from mv_frozenmapval where frozenmapval = {'a': 1, 'b': 2, 'c': 3}").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_map_value(map_type, map_type_impl::native_type({
@@ -635,7 +640,7 @@ SEASTAR_TEST_CASE(test_all_types) {
         auto tuple_type = s->get_column_definition(bytes("tupleval"))->type;
         e.execute_cql("insert into cf (k, tupleval) values (0, (1, 'foobar', 6bddc89a-5644-11e4-97fc-56847afe9799));").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, tupleval, asciival from mv_tupleval where tupleval = (1, 'foobar', 6bddc89a-5644-11e4-97fc-56847afe9799)").get0();
+        auto msg = e.execute_cql("select k, tupleval, asciival from mv_tupleval where tupleval = (1, 'foobar', 6bddc89a-5644-11e4-97fc-56847afe9799)").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_tuple_value(tuple_type, tuple_type_impl::native_type({
@@ -645,9 +650,9 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("insert into cf (k, tupleval) values (0, (1, null, 6bddc89a-5644-11e4-97fc-56847afe9799));").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, tupleval, asciival from mv_tupleval where tupleval = (1, 'foobar', 6bddc89a-5644-11e4-97fc-56847afe9799)").get0();
+        auto msg = e.execute_cql("select k, tupleval, asciival from mv_tupleval where tupleval = (1, 'foobar', 6bddc89a-5644-11e4-97fc-56847afe9799)").get();
         assert_that(msg).is_rows().with_size(0);
-        msg = e.execute_cql("select k, tupleval, asciival from mv_tupleval where tupleval = (1, null, 6bddc89a-5644-11e4-97fc-56847afe9799)").get0();
+        msg = e.execute_cql("select k, tupleval, asciival from mv_tupleval where tupleval = (1, null, 6bddc89a-5644-11e4-97fc-56847afe9799)").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_tuple_value(tuple_type, tuple_type_impl::native_type({
@@ -655,12 +660,30 @@ SEASTAR_TEST_CASE(test_all_types) {
                     utils::UUID("6bddc89a-5644-11e4-97fc-56847afe9799")})).serialize(), {ascii_type->decompose("ascii text")} });
         });
 
+        // ================ vectors ================
+        auto vector_type = s->get_column_definition(bytes("vectorval"))->type;
+        e.execute_cql("insert into cf (k, vectorval) values (0, [1, 2, 3]);").get();
+        eventually([&] {
+        auto msg = e.execute_cql("select k, vectorval, asciival from mv_vectorval where vectorval = [1, 2, 3]").get();
+        assert_that(msg).is_rows()
+                .with_size(1)
+                .with_row({ {int32_type->decompose(0)}, make_vector_value(vector_type, vector_type_impl::native_type({1, 2, 3})).serialize(), {ascii_type->decompose("ascii text")} });
+        });
+
+        e.execute_cql("insert into cf (k, vectorval) values (0, [3, 2, 1]);").get();
+        eventually([&] {
+        auto msg = e.execute_cql("select k, vectorval, asciival from mv_vectorval where vectorval = [3, 2, 1]").get();
+        assert_that(msg).is_rows()
+                .with_size(1)
+                .with_row({ {int32_type->decompose(0)}, make_vector_value(vector_type, vector_type_impl::native_type({3, 2, 1})).serialize(), {ascii_type->decompose("ascii text")} });
+        });
+
         // ================ UDTs ================
         auto udt_type = s->get_column_definition(bytes("udtval"))->type;
         auto udt_set_type = static_pointer_cast<const user_type_impl>(udt_type)->field_type(2);
         e.execute_cql("insert into cf (k, udtval) values (0, (1, 6bddc89a-5644-11e4-97fc-56847afe9799, {'foo', 'bar'}));").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, udtval.a, udtval.b, udtval.c, asciival from mv_udtval where udtval = (1, 6bddc89a-5644-11e4-97fc-56847afe9799, {'foo', 'bar'})").get0();
+        auto msg = e.execute_cql("select k, udtval.a, udtval.b, udtval.c, asciival from mv_udtval where udtval = (1, 6bddc89a-5644-11e4-97fc-56847afe9799, {'foo', 'bar'})").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_rows({{ {int32_type->decompose(0)}, {int32_type->decompose(1)}, {uuid_type->from_string("6bddc89a-5644-11e4-97fc-56847afe9799")},
@@ -670,7 +693,7 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("insert into cf (k, udtval) values (0, {b: 6bddc89a-5644-11e4-97fc-56847afe9799, a: 1, c: {'foo', 'bar'}});").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, udtval.a, udtval.b, udtval.c, asciival from mv_udtval where udtval = {b: 6bddc89a-5644-11e4-97fc-56847afe9799, a: 1, c: {'foo', 'bar'}}").get0();
+        auto msg = e.execute_cql("select k, udtval.a, udtval.b, udtval.c, asciival from mv_udtval where udtval = {b: 6bddc89a-5644-11e4-97fc-56847afe9799, a: 1, c: {'foo', 'bar'}}").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_rows({{ {int32_type->decompose(0)}, {int32_type->decompose(1)}, {uuid_type->from_string("6bddc89a-5644-11e4-97fc-56847afe9799")},
@@ -680,9 +703,9 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("insert into cf (k, udtval) values (0, {a: null, b: 6bddc89a-5644-11e4-97fc-56847afe9799, c: {'foo', 'bar'}});").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, udtval.a, udtval.b, udtval.c, asciival from mv_udtval where udtval = {a: 1, b: 6bddc89a-5644-11e4-97fc-56847afe9799, c: {'foo', 'bar'}}").get0();
+        auto msg = e.execute_cql("select k, udtval.a, udtval.b, udtval.c, asciival from mv_udtval where udtval = {a: 1, b: 6bddc89a-5644-11e4-97fc-56847afe9799, c: {'foo', 'bar'}}").get();
         assert_that(msg).is_rows().with_size(0);
-        msg = e.execute_cql("select k, udtval.a, udtval.b, udtval.c, asciival from mv_udtval where udtval = {a: null, b: 6bddc89a-5644-11e4-97fc-56847afe9799, c: {'foo', 'bar'}}").get0();
+        msg = e.execute_cql("select k, udtval.a, udtval.b, udtval.c, asciival from mv_udtval where udtval = {a: null, b: 6bddc89a-5644-11e4-97fc-56847afe9799, c: {'foo', 'bar'}}").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_rows({{ {int32_type->decompose(0)}, {}, {uuid_type->from_string("6bddc89a-5644-11e4-97fc-56847afe9799")},
@@ -692,9 +715,9 @@ SEASTAR_TEST_CASE(test_all_types) {
 
         e.execute_cql("insert into cf (k, udtval) values (0, {a: 1, b: 6bddc89a-5644-11e4-97fc-56847afe9799});").get();
         eventually([&] {
-        auto msg = e.execute_cql("select k, udtval.a, udtval.b, udtval.c, asciival from mv_udtval where udtval = {a: 1, b: 6bddc89a-5644-11e4-97fc-56847afe9799, c: {'foo', 'bar'}}").get0();
+        auto msg = e.execute_cql("select k, udtval.a, udtval.b, udtval.c, asciival from mv_udtval where udtval = {a: 1, b: 6bddc89a-5644-11e4-97fc-56847afe9799, c: {'foo', 'bar'}}").get();
         assert_that(msg).is_rows().with_size(0);
-        msg = e.execute_cql("select k, udtval.a, udtval.b, udtval.c, asciival from mv_udtval where udtval = {a: 1, b: 6bddc89a-5644-11e4-97fc-56847afe9799}").get0();
+        msg = e.execute_cql("select k, udtval.a, udtval.b, udtval.c, asciival from mv_udtval where udtval = {a: 1, b: 6bddc89a-5644-11e4-97fc-56847afe9799}").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_rows({{ {int32_type->decompose(0)}, {int32_type->decompose(1)}, {uuid_type->from_string("6bddc89a-5644-11e4-97fc-56847afe9799")},
@@ -792,7 +815,7 @@ SEASTAR_TEST_CASE(test_create_mv_with_unrestricted_pk_parts) {
                        "primary key (v, p, c)").get();
         e.execute_cql("insert into cf (p, c, v) values (0, 'foo', 1);").get();
         eventually([&] {
-        auto msg = e.execute_cql("select * from vcf").get0();
+        auto msg = e.execute_cql("select * from vcf").get();
         assert_that(msg).is_rows()
             .with_size(1)
             .with_row({ {long_type->decompose(1L)}, {int32_type->decompose(0)}, {utf8_type->decompose(sstring("foo"))} });
@@ -809,12 +832,12 @@ SEASTAR_TEST_CASE(test_partition_tombstone) {
         e.execute_cql("insert into cf (p, c, v) values (1, 2, 200);").get();
         e.execute_cql("insert into cf (p, c, v) values (1, 3, 300);").get();
         eventually([&] {
-        auto msg = e.execute_cql("select * from vcf").get0();
+        auto msg = e.execute_cql("select * from vcf").get();
         assert_that(msg).is_rows().with_size(2);
         });
         e.execute_cql("delete from cf where p = 1;").get();
         eventually([&] {
-        auto msg = e.execute_cql("select * from vcf").get0();
+        auto msg = e.execute_cql("select * from vcf").get();
         assert_that(msg).is_rows().with_size(0);
         });
     });
@@ -829,12 +852,12 @@ SEASTAR_TEST_CASE(test_ck_tombstone) {
         e.execute_cql("insert into cf (p, c, v) values (1, 2, 200);").get();
         e.execute_cql("insert into cf (p, c, v) values (1, 3, 300);").get();
         eventually([&] {
-        auto msg = e.execute_cql("select * from vcf").get0();
+        auto msg = e.execute_cql("select * from vcf").get();
         assert_that(msg).is_rows().with_size(2);
         });
         e.execute_cql("delete from cf where p = 1 and c = 3;").get();
         eventually([&] {
-        auto msg = e.execute_cql("select * from vcf").get0();
+        auto msg = e.execute_cql("select * from vcf").get();
         assert_that(msg).is_rows().with_size(1);
         });
     });
@@ -865,7 +888,7 @@ SEASTAR_TEST_CASE(test_static_table) {
         }
 
         eventually([&] {
-        auto msg = e.execute_cql("select * from vcf").get0();
+        auto msg = e.execute_cql("select * from vcf").get();
         assert_that(msg).is_rows().with_size(2);
         });
         try {
@@ -883,24 +906,24 @@ SEASTAR_TEST_CASE(test_static_data) {
                        "where a is not null and b is not null primary key (b,a) with clustering order by (a asc);").get();
 
         e.execute_cql("insert into ab (a, b) values (1, 2);").get();
-        auto msg = e.execute_cql("select a, b from ab where a = 1;").get0();
+        auto msg = e.execute_cql("select a, b from ab where a = 1;").get();
         assert_that(msg).is_rows()
             .with_size(1)
             .with_row({ {int32_type->decompose(1)}, {int32_type->decompose(2)} });
         eventually([&] {
-        auto msg = e.execute_cql("select a, b from ba where b = 2;").get0();
+        auto msg = e.execute_cql("select a, b from ba where b = 2;").get();
         assert_that(msg).is_rows()
             .with_size(1)
             .with_row({ {int32_type->decompose(1)}, {int32_type->decompose(2)} });
         });
 
         e.execute_cql("insert into ab (a , b , c) values (3, 4, 5);").get();
-        auto msg2 = e.execute_cql("select a, b from ab where a = 3;").get0();
+        auto msg2 = e.execute_cql("select a, b from ab where a = 3;").get();
         assert_that(msg2).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(3)}, {int32_type->decompose(4)} });
         eventually([&] {
-        auto msg = e.execute_cql("select a, b from ba where b = 4;").get0();
+        auto msg = e.execute_cql("select a, b from ba where b = 4;").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(3)}, {int32_type->decompose(4)} });
@@ -922,27 +945,27 @@ SEASTAR_TEST_CASE(test_old_timestamps) {
         }
 
         eventually([&] {
-        auto msg = e.execute_cql("select * from vcf").get0();
+        auto msg = e.execute_cql("select * from vcf").get();
         assert_that(msg).is_rows().with_size(2);
-        msg = e.execute_cql("select c from vcf where p = 0 and v = 1").get0();
+        msg = e.execute_cql("select c from vcf where p = 0 and v = 1").get();
         assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(0)} }, { {int32_type->decompose(1)} }});
         });
 
         //Make sure an old TS does nothing
         e.execute_cql("update cf using timestamp 100 set v = 5 where p = 0 and c = 0").get();
         eventually([&] {
-        auto msg = e.execute_cql("select c from vcf where p = 0 and v = 1").get0();
+        auto msg = e.execute_cql("select c from vcf where p = 0 and v = 1").get();
         assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(0)} }, { {int32_type->decompose(1)} }});
-        msg = e.execute_cql("select c from vcf where p = 0 and v = 5").get0();
+        msg = e.execute_cql("select c from vcf where p = 0 and v = 5").get();
         assert_that(msg).is_rows().with_size(0);
         });
 
         //Latest TS
         e.execute_cql("update cf set v = 5 where p = 0 and c = 0").get();
         eventually([&] {
-        auto msg = e.execute_cql("select c from vcf where p = 0 and v = 5").get0();
+        auto msg = e.execute_cql("select c from vcf where p = 0 and v = 5").get();
         assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(0)} }});
-        msg = e.execute_cql("select c from vcf where p = 0 and v = 1").get0();
+        msg = e.execute_cql("select c from vcf where p = 0 and v = 1").get();
         assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(1)} }});
         });
     });
@@ -959,7 +982,7 @@ SEASTAR_TEST_CASE(test_regular_column_timestamp_updates) {
         e.execute_cql("update cf using timestamp 1 set v2 = 1 where p = 0").get();
         e.execute_cql("update cf using timestamp 1 set v1 = 1 where p = 0").get();
         eventually([&] {
-        auto msg = e.execute_cql("select * from vcf").get0();
+        auto msg = e.execute_cql("select * from vcf").get();
         assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)} }});
         });
 
@@ -971,7 +994,7 @@ SEASTAR_TEST_CASE(test_regular_column_timestamp_updates) {
         e.execute_cql("update cf using timestamp 6 set v1 = 2 where p = 0").get();
         e.execute_cql("update cf using timestamp 7 set v2 = 2 where p = 0").get();
         eventually([&] {
-        auto msg = e.execute_cql("select * from vcf").get0();
+        auto msg = e.execute_cql("select * from vcf").get();
         assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(0)}, {int32_type->decompose(2)}, {int32_type->decompose(2)} }});
         });
     });
@@ -996,7 +1019,7 @@ void do_test_complex_timestamp_updates(cql_test_env& e, std::function<void()>&& 
     // Set initial values TS=0, leaving v3 null and verify view
     e.execute_cql("insert into cf (p, c, v1, v2) values (0, 0, 1, 0) using timestamp 0").get();
     eventually([&] {
-    auto msg = e.execute_cql("select * from vcf").get0();
+    auto msg = e.execute_cql("select * from vcf").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(0)}, {} }});
     });
 
@@ -1004,7 +1027,7 @@ void do_test_complex_timestamp_updates(cql_test_env& e, std::function<void()>&& 
     e.execute_cql("update cf using timestamp 2 set v1 = 1 where p = 0 and c = 0").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select v2 from vcf where v1 = 1 and p = 0 and c = 0").get0();
+    auto msg = e.execute_cql("select v2 from vcf where v1 = 1 and p = 0 and c = 0").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(0)} }});
     });
 
@@ -1012,7 +1035,7 @@ void do_test_complex_timestamp_updates(cql_test_env& e, std::function<void()>&& 
     e.execute_cql("update cf using timestamp 3 set v1 = 0 where p = 0 and c = 0").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select v2 from vcf where v1 = 1 and p = 0 and c = 0").get0();
+    auto msg = e.execute_cql("select v2 from vcf where v1 = 1 and p = 0 and c = 0").get();
     assert_that(msg).is_rows().with_size(0);
     });
 
@@ -1020,7 +1043,7 @@ void do_test_complex_timestamp_updates(cql_test_env& e, std::function<void()>&& 
     e.execute_cql("update cf using timestamp 4 set v1 = 1 where p = 0 and c = 0").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select v2, v3 from vcf where v1 = 1 and p = 0 and c = 0").get0();
+    auto msg = e.execute_cql("select v2, v3 from vcf where v1 = 1 and p = 0 and c = 0").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(0)}, {} }});
     });
 
@@ -1028,7 +1051,7 @@ void do_test_complex_timestamp_updates(cql_test_env& e, std::function<void()>&& 
     e.execute_cql("update cf using timestamp 1 set v3 = 1 where p = 0 and c = 0").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select v2, v3 from vcf where v1 = 1 and p = 0 and c = 0").get0();
+    auto msg = e.execute_cql("select v2, v3 from vcf where v1 = 1 and p = 0 and c = 0").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(0)}, {int32_type->decompose(1)} }});
     });
 
@@ -1036,7 +1059,7 @@ void do_test_complex_timestamp_updates(cql_test_env& e, std::function<void()>&& 
     e.execute_cql("update cf using timestamp 2 set v2 = 2 where p = 0 and c = 0").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select v2 from vcf where v1 = 1 and p = 0 and c = 0").get0();
+    auto msg = e.execute_cql("select v2 from vcf where v1 = 1 and p = 0 and c = 0").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(2)} }});
     });
 
@@ -1044,14 +1067,14 @@ void do_test_complex_timestamp_updates(cql_test_env& e, std::function<void()>&& 
     e.execute_cql("update cf using timestamp 3 set v2 = 4 where p = 0 and c = 0").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select v2 from vcf where v1 = 1 and p = 0 and c = 0").get0();
+    auto msg = e.execute_cql("select v2 from vcf where v1 = 1 and p = 0 and c = 0").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(4)} }});
     });
 
     // Tombstone v1
     e.execute_cql("delete from cf using timestamp 5 where p = 0 and c = 0").get();
     eventually([&] {
-    auto msg = e.execute_cql("select v2 from vcf").get0();
+    auto msg = e.execute_cql("select v2 from vcf").get();
     assert_that(msg).is_rows().with_size(0);
     });
 
@@ -1059,7 +1082,7 @@ void do_test_complex_timestamp_updates(cql_test_env& e, std::function<void()>&& 
     e.execute_cql("insert into cf (p, c, v1) values (0, 0, 1) using timestamp 6").get();
     // Make sure v2 doesn't pop back in.
     eventually([&] {
-    auto msg = e.execute_cql("select v2 from vcf where v1 = 1 and p = 0 and c = 0").get0();
+    auto msg = e.execute_cql("select v2 from vcf where v1 = 1 and p = 0 and c = 0").get();
     assert_that(msg).is_rows().with_rows({{ {} }});
     });
 
@@ -1073,7 +1096,7 @@ void do_test_complex_timestamp_updates(cql_test_env& e, std::function<void()>&& 
     // Delete @ TS=0 (which should only delete v2)
     e.execute_cql("delete from cf using timestamp 0 where p = 1 and c = 0").get();
     eventually([&] {
-    auto msg = e.execute_cql("select * from vcf where v1 = 0 and p = 1 and c = 0").get0();
+    auto msg = e.execute_cql("select * from vcf where v1 = 0 and p = 1 and c = 0").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {}, {int32_type->decompose(0)} }});
     });
 
@@ -1082,14 +1105,14 @@ void do_test_complex_timestamp_updates(cql_test_env& e, std::function<void()>&& 
     e.execute_cql("update cf using timestamp 3 set v1 = 0 where p = 1 and c = 0").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select * from vcf where v1 = 0 and p = 1 and c = 0").get0();
+    auto msg = e.execute_cql("select * from vcf where v1 = 0 and p = 1 and c = 0").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {}, {int32_type->decompose(0)} }});
     });
 
     e.execute_cql("update cf using timestamp 3 set v2 = 0 where p = 1 and c = 0").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select * from vcf where v1 = 0 and p = 1 and c = 0").get0();
+    auto msg = e.execute_cql("select * from vcf where v1 = 0 and p = 1 and c = 0").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(0)} }});
     });
 }
@@ -1122,19 +1145,19 @@ SEASTAR_TEST_CASE(test_range_tombstone) {
         }
 
         eventually([&] {
-        auto msg = e.execute_cql("select * from vcf").get0();
+        auto msg = e.execute_cql("select * from vcf").get();
         assert_that(msg).is_rows().with_size(100);
         });
 
         e.execute_cql("delete from cf where p = 0 and c1 = 0").get();
         eventually([&] {
-        auto msg = e.execute_cql("select * from vcf").get0();
+        auto msg = e.execute_cql("select * from vcf").get();
         assert_that(msg).is_rows().with_size(50);
         });
 
         e.execute_cql("delete from cf where p = 0 and c1 = 1 and c2 >= 50 and c2 < 101").get();
         eventually([&] {
-        auto msg = e.execute_cql("select * from vcf").get0();
+        auto msg = e.execute_cql("select * from vcf").get();
         assert_that(msg).is_rows().with_size(25);
         });
     });
@@ -1151,7 +1174,7 @@ SEASTAR_TEST_CASE(test_collections) {
         auto s = e.local_db().find_schema(sstring("ks"), sstring("cf"));
         auto list_type = s->get_column_definition(bytes("lv"))->type;
         eventually([&] {
-        auto msg = e.execute_cql("select p, lv from mv where v = 0").get0();
+        auto msg = e.execute_cql("select p, lv from mv where v = 0").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, make_list_value(list_type, list_type_impl::native_type({1, 2, 3})).serialize() });
@@ -1160,7 +1183,7 @@ SEASTAR_TEST_CASE(test_collections) {
         e.execute_cql("insert into cf (p, v) values (1, 1)").get();
         e.execute_cql("insert into cf (p, lv) values (1, [1, 2, 3])").get();
         eventually([&] {
-        auto msg = e.execute_cql("select p, lv from mv where v = 1").get0();
+        auto msg = e.execute_cql("select p, lv from mv where v = 1").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(1)}, make_list_value(list_type, list_type_impl::native_type({1, 2, 3})).serialize() });
@@ -1176,7 +1199,7 @@ SEASTAR_TEST_CASE(test_update) {
 
         e.execute_cql("insert into cf (p, v) values (0, 0)").get();
         eventually([&] {
-        auto msg = e.execute_cql("select * from mv where v = 0").get0();
+        auto msg = e.execute_cql("select * from mv where v = 0").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(0)}, {int32_type->decompose(0)} });
@@ -1184,7 +1207,7 @@ SEASTAR_TEST_CASE(test_update) {
 
         e.execute_cql("insert into cf (p, v) values (0, 1)").get();
         eventually([&] {
-        auto msg = e.execute_cql("select * from mv where v = 1").get0();
+        auto msg = e.execute_cql("select * from mv where v = 1").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(1)}, {int32_type->decompose(0)} });
@@ -1200,17 +1223,17 @@ SEASTAR_TEST_CASE(test_ttl) {
 
         e.execute_cql("insert into cf (p, c, v1, v2, v3) values (0, 0, 0, 0, 0) using ttl 3").get();
         eventually([&] {
-        auto msg = e.execute_cql("select * from mv").get0();
+        auto msg = e.execute_cql("select * from mv").get();
         assert_that(msg).is_rows().with_size(1);
         forward_jump_clocks(4s);
-        msg = e.execute_cql("select * from mv").get0();
+        msg = e.execute_cql("select * from mv").get();
         assert_that(msg).is_rows().with_size(0);
         });
 
         e.execute_cql("insert into cf (p, c, v1, v2, v3) values (1, 1, 1, 1, 1) using ttl 3").get();
         forward_jump_clocks(1s);
         eventually([&] {
-        auto msg = e.execute_cql("select v2 from mv").get0();
+        auto msg = e.execute_cql("select v2 from mv").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ {int32_type->decompose(1)} });
@@ -1219,7 +1242,7 @@ SEASTAR_TEST_CASE(test_ttl) {
         e.execute_cql("insert into cf (p, c, v1) values (1, 1, 1)").get();
         forward_jump_clocks(4s);
         eventually([&] {
-        auto msg = e.execute_cql("select v2 from mv").get0();
+        auto msg = e.execute_cql("select v2 from mv").get();
         assert_that(msg).is_rows()
                 .with_size(1)
                 .with_row({ { } });
@@ -1227,16 +1250,16 @@ SEASTAR_TEST_CASE(test_ttl) {
 
         e.execute_cql("insert into cf (p, c, v1, v2, v3) values (2, 2, 2, 2, 2) using ttl 3").get();
         eventually([&] {
-        auto msg = e.execute_cql("select * from mv where v1 = 2").get0();
+        auto msg = e.execute_cql("select * from mv where v1 = 2").get();
         assert_that(msg).is_rows().with_size(1);
         });
         forward_jump_clocks(2s);
         e.execute_cql("update cf using ttl 8 set v3 = 4 where p = 2 and c = 2").get();
         forward_jump_clocks(2s);
         eventually([&] {
-        auto msg = e.execute_cql("select * from mv where v1 = 2").get0();
+        auto msg = e.execute_cql("select * from mv where v1 = 2").get();
         assert_that(msg).is_rows().with_size(0);
-        msg = e.execute_cql("select * from cf where p = 2 and c = 2").get0();
+        msg = e.execute_cql("select * from cf where p = 2 and c = 2").get();
         assert_that(msg).is_rows()
             .with_size(1)
             .with_row({ {int32_type->decompose(2)}, {int32_type->decompose(2)}, { }, { }, {int32_type->decompose(4)} });
@@ -1253,7 +1276,7 @@ SEASTAR_TEST_CASE(test_row_deletion) {
         e.execute_cql("delete from cf using timestamp 6 where p = 1 and c = 1;").get();
         e.execute_cql("insert into cf (p, c, v1, v2) values (1, 1, 1, 1) using timestamp 3").get();
         eventually([&] {
-        auto msg = e.execute_cql("select * from mv").get0();
+        auto msg = e.execute_cql("select * from mv").get();
         assert_that(msg).is_rows().with_size(0);
         });
     });
@@ -1269,7 +1292,7 @@ SEASTAR_TEST_CASE(test_conflicting_timestamp) {
             e.execute_cql(format("insert into cf (p, c, v) values (1, 1, {:d})", i)).get();
         }
         eventually([&] {
-        auto msg = e.execute_cql("select * from mv").get0();
+        auto msg = e.execute_cql("select * from mv").get();
         assert_that(msg).is_rows()
             .with_size(1)
             .with_row({ {int32_type->decompose(49)}, {int32_type->decompose(1)}, {int32_type->decompose(1)} });
@@ -1293,7 +1316,7 @@ SEASTAR_TEST_CASE(test_clustering_order) {
         e.execute_cql("insert into cf (a, b, c, d) values (1, 2, 2, 2)").get();
 
         eventually([&] {
-        auto msg = e.execute_cql("select b from mv1").get0();
+        auto msg = e.execute_cql("select b from mv1").get();
         assert_that(msg).is_rows()
             .with_size(2)
             .with_rows({{ {int32_type->decompose(2)} },
@@ -1301,7 +1324,7 @@ SEASTAR_TEST_CASE(test_clustering_order) {
         });
 
         eventually([&] {
-        auto msg = e.execute_cql("select c from mv2").get0();
+        auto msg = e.execute_cql("select c from mv2").get();
         assert_that(msg).is_rows()
             .with_size(2)
             .with_rows({{ {int32_type->decompose(1)} },
@@ -1309,7 +1332,7 @@ SEASTAR_TEST_CASE(test_clustering_order) {
         });
 
         eventually([&] {
-        auto msg = e.execute_cql("select b from mv3").get0();
+        auto msg = e.execute_cql("select b from mv3").get();
         assert_that(msg).is_rows()
             .with_size(2)
             .with_rows({{ {int32_type->decompose(1)} },
@@ -1317,7 +1340,7 @@ SEASTAR_TEST_CASE(test_clustering_order) {
         });
 
         eventually([&] {
-        auto msg = e.execute_cql("select c from mv4").get0();
+        auto msg = e.execute_cql("select c from mv4").get();
         assert_that(msg).is_rows()
             .with_size(2)
             .with_rows({{ {int32_type->decompose(2)} },
@@ -1337,7 +1360,7 @@ SEASTAR_TEST_CASE(test_multiple_deletes) {
         e.execute_cql("insert into cf (p, c) values (1, 3)").get();
 
         eventually([&] {
-        auto msg = e.execute_cql("select p, c from mv").get0();
+        auto msg = e.execute_cql("select p, c from mv").get();
         assert_that(msg).is_rows()
             .with_size(3)
             .with_rows({ { {int32_type->decompose(1)}, {int32_type->decompose(1)} },
@@ -1347,7 +1370,7 @@ SEASTAR_TEST_CASE(test_multiple_deletes) {
 
         e.execute_cql("delete from cf where p = 1 and c > 1 and c < 3").get();
         eventually([&] {
-        auto msg = e.execute_cql("select p, c from mv").get0();
+        auto msg = e.execute_cql("select p, c from mv").get();
         assert_that(msg).is_rows()
             .with_size(2)
             .with_rows({ { {int32_type->decompose(1)}, {int32_type->decompose(1)} },
@@ -1356,7 +1379,7 @@ SEASTAR_TEST_CASE(test_multiple_deletes) {
 
         e.execute_cql("delete from cf where p = 1").get();
         eventually([&] {
-        auto msg = e.execute_cql("select p, c from mv").get0();
+        auto msg = e.execute_cql("select p, c from mv").get();
         assert_that(msg).is_rows().with_size(0);
         });
     });
@@ -1385,19 +1408,19 @@ SEASTAR_TEST_CASE(test_null_in_clustering_columns) {
 
         e.execute_cql("insert into cf (p, c, v1, v2) values (0, 1, 2, 3)").get();
         eventually([&] {
-        auto msg = e.execute_cql("select p, c, v1, v2 from vcf").get0();
+        auto msg = e.execute_cql("select p, c, v1, v2 from vcf").get();
         assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(2)}, {int32_type->decompose(3)} }});
         });
 
         e.execute_cql("update cf set v1 = null where p = 0 and c = 1").get();
         eventually([&] {
-        auto msg = e.execute_cql("select p, c, v1, v2 from vcf").get0();
+        auto msg = e.execute_cql("select p, c, v1, v2 from vcf").get();
         assert_that(msg).is_rows().with_size(0);
         });
 
         e.execute_cql("update cf set v2 = 9 where p = 0 and c = 1").get();
         eventually([&] {
-        auto msg = e.execute_cql("select p, c, v1, v2 from vcf").get0();
+        auto msg = e.execute_cql("select p, c, v1, v2 from vcf").get();
         assert_that(msg).is_rows().with_size(0);
         });
     });
@@ -1458,14 +1481,14 @@ SEASTAR_TEST_CASE(test_filter_with_function) {
         e.execute_cql("insert into cf (p, c, v) values (1, 1, 3)").get();
 
         eventually([&] {
-        auto msg = e.execute_cql("select p, c, v from vcf").get0();
+        auto msg = e.execute_cql("select p, c, v from vcf").get();
         assert_that(msg).is_rows()
                 .with_rows({{ {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(2)} },
                             { {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(3)} }});
         });
 
         e.execute_cql("alter table cf rename p to foo").get();
-        auto msg = e.execute_cql("select foo, c, v from vcf").get0();
+        auto msg = e.execute_cql("select foo, c, v from vcf").get();
         assert_that(msg).is_rows()
                 .with_rows({{ {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(2)} },
                             { {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(3)} }});
@@ -1485,14 +1508,14 @@ SEASTAR_TEST_CASE(test_filter_with_type_cast) {
         e.execute_cql("insert into cf (p, c, v) values (1, 1, 3)").get();
 
         eventually([&] {
-        auto msg = e.execute_cql("select p, c, v from vcf").get0();
+        auto msg = e.execute_cql("select p, c, v from vcf").get();
         assert_that(msg).is_rows()
                 .with_rows({{ {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(2)} },
                             { {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(3)} }});
         });
 
         e.execute_cql("alter table cf rename p to foo").get();
-        auto msg = e.execute_cql("select foo, c, v from vcf").get0();
+        auto msg = e.execute_cql("select foo, c, v from vcf").get();
         assert_that(msg).is_rows()
                 .with_rows({{ {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(2)} },
                             { {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(3)} }});
@@ -1524,6 +1547,7 @@ SEASTAR_TEST_CASE(test_restrictions_on_all_types) {
             "frozensetval",
             "frozenmapval",
             "tupleval",
+            "vectorval",
             "udtval"};
         e.execute_cql(fmt::format("create table cf ("
                     "asciival ascii, "
@@ -1547,6 +1571,7 @@ SEASTAR_TEST_CASE(test_restrictions_on_all_types) {
                     "frozensetval frozen<set<uuid>>, "
                     "frozenmapval frozen<map<ascii, int>>,"
                     "tupleval frozen<tuple<int, ascii, uuid>>,"
+                    "vectorval vector<int, 3>, "
                     "udtval frozen<myType>, primary key ({}))", fmt::join(column_names, ", "))).get();
 
         e.execute_cql(fmt::format("create materialized view vcf as select * from cf where "
@@ -1571,6 +1596,7 @@ SEASTAR_TEST_CASE(test_restrictions_on_all_types) {
                 "frozensetval = {{6BDDC89A-5644-11E4-97FC-56847AFE9799}} AND "
                 "frozenmapval = {{'a': 1, 'b': 2}} AND "
                 "tupleval = (1, 'foobar', 6BDDC89A-5644-11E4-97FC-56847AFE9799) AND "
+                "vectorval = [1, 2, 3] AND "
                 "udtval = {{a: 1, b: 6BDDC89A-5644-11E4-97FC-56847AFE9799, c: {{'foo', 'bar'}}}} "
                 "PRIMARY KEY ({})", fmt::join(column_names, ", "))).get();
 
@@ -1596,10 +1622,11 @@ SEASTAR_TEST_CASE(test_restrictions_on_all_types) {
                 "{{6BDDC89A-5644-11E4-97FC-56847AFE9799}},"
                 "{{'a': 1, 'b': 2}},"
                 "(1, 'foobar', 6BDDC89A-5644-11E4-97FC-56847AFE9799),"
+                "[1, 2, 3],"
                 "{{a: 1, b: 6BDDC89A-5644-11E4-97FC-56847AFE9799, c: {{'foo', 'bar'}}}})", fmt::join(column_names, ", "))).get();
 
         eventually([&] {
-        auto msg = e.execute_cql("select * from vcf").get0();
+        auto msg = e.execute_cql("select * from vcf").get();
         assert_that(msg).is_rows().with_size(1);
         });
     });
@@ -1628,7 +1655,7 @@ SEASTAR_TEST_CASE(test_non_primary_key_restrictions) {
 
         BOOST_TEST_PASSPOINT();
         eventually([&] {
-        auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+        auto msg = e.execute_cql("select a, b, c, d from vcf").get();
         assert_that(msg).is_rows().with_rows_ignore_order({
                         { {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
                         { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -1642,7 +1669,7 @@ SEASTAR_TEST_CASE(test_non_primary_key_restrictions) {
         e.execute_cql("insert into cf (a, b, c, d) values (2, 0, 0, 0)").get();
         e.execute_cql("insert into cf (a, b, c, d) values (2, 1, 2, 0)").get();
         eventually([&] {
-        auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+        auto msg = e.execute_cql("select a, b, c, d from vcf").get();
         assert_that(msg).is_rows().with_rows_ignore_order({
                         { {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
                         { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -1657,7 +1684,7 @@ SEASTAR_TEST_CASE(test_non_primary_key_restrictions) {
         e.execute_cql("insert into cf (a, b, c, d) values (1, 2, 1, 0)").get();
         e.execute_cql("insert into cf (a, b, c, d) values (1, 3, 1, 0)").get();
         eventually([&] {
-        auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+        auto msg = e.execute_cql("select a, b, c, d from vcf").get();
         assert_that(msg).is_rows().with_rows_ignore_order({
                         { {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
                         { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -1672,7 +1699,7 @@ SEASTAR_TEST_CASE(test_non_primary_key_restrictions) {
         BOOST_TEST_PASSPOINT();
         e.execute_cql("delete from cf where a = 1 and b = 2").get();
         eventually([&] {
-        auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+        auto msg = e.execute_cql("select a, b, c, d from vcf").get();
         assert_that(msg).is_rows().with_rows_ignore_order({
                         { {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
                         { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -1689,7 +1716,7 @@ SEASTAR_TEST_CASE(test_non_primary_key_restrictions) {
         BOOST_TEST_PASSPOINT();
         e.execute_cql("update cf set c = 0 where a = 1 and b = 3").get();
         eventually([&] {
-        auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+        auto msg = e.execute_cql("select a, b, c, d from vcf").get();
         assert_that(msg).is_rows().with_rows_ignore_order({
                         { {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
                         { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -1702,7 +1729,7 @@ SEASTAR_TEST_CASE(test_non_primary_key_restrictions) {
         BOOST_TEST_PASSPOINT();
         e.execute_cql("update cf set c = 1 where a = 1 and b = 3").get();
         eventually([&] {
-        auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+        auto msg = e.execute_cql("select a, b, c, d from vcf").get();
         assert_that(msg).is_rows().with_rows_ignore_order({
                         { {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
                         { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -1716,7 +1743,7 @@ SEASTAR_TEST_CASE(test_non_primary_key_restrictions) {
         BOOST_TEST_PASSPOINT();
         e.execute_cql("delete from cf where a = 1 and b = 3").get();
         eventually([&] {
-        auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+        auto msg = e.execute_cql("select a, b, c, d from vcf").get();
         assert_that(msg).is_rows().with_rows_ignore_order({
                         { {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
                         { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -1730,7 +1757,7 @@ SEASTAR_TEST_CASE(test_non_primary_key_restrictions) {
         BOOST_TEST_PASSPOINT();
         e.execute_cql("update cf set d = 1 where a = 0 and b = 2").get();
         eventually([&] {
-        auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+        auto msg = e.execute_cql("select a, b, c, d from vcf").get();
         assert_that(msg).is_rows().with_rows_ignore_order({
                         { {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
                         { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -1744,7 +1771,7 @@ SEASTAR_TEST_CASE(test_non_primary_key_restrictions) {
         e.execute_cql("update cf set d = 1 where a = 1 and b = 1").get();
         BOOST_TEST_PASSPOINT();
         eventually([&] {
-        auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+        auto msg = e.execute_cql("select a, b, c, d from vcf").get();
         assert_that(msg).is_rows().with_rows_ignore_order({
                         { {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
                         { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -1758,7 +1785,7 @@ SEASTAR_TEST_CASE(test_non_primary_key_restrictions) {
         e.execute_cql("delete from cf where a = 0 and b = 2").get();
         BOOST_TEST_PASSPOINT();
         eventually([&] {
-        auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+        auto msg = e.execute_cql("select a, b, c, d from vcf").get();
         assert_that(msg).is_rows().with_rows_ignore_order({
                         { {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
                         { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -1771,7 +1798,7 @@ SEASTAR_TEST_CASE(test_non_primary_key_restrictions) {
         e.execute_cql("delete from cf where a = 1 and b = 1").get();
         BOOST_TEST_PASSPOINT();
         eventually([&] {
-        auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+        auto msg = e.execute_cql("select a, b, c, d from vcf").get();
         assert_that(msg).is_rows().with_rows_ignore_order({
                         { {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
                         { {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} },
@@ -1783,7 +1810,7 @@ SEASTAR_TEST_CASE(test_non_primary_key_restrictions) {
         e.execute_cql("delete from cf where a = 0").get();
         BOOST_TEST_PASSPOINT();
         eventually([&] {
-        auto msg = e.execute_cql("select a, b, c, d from vcf").get0();
+        auto msg = e.execute_cql("select a, b, c, d from vcf").get();
         assert_that(msg).is_rows().with_rows_ignore_order({
                         { {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(1)}, {int32_type->decompose(0)} }});
         });
@@ -1836,20 +1863,20 @@ SEASTAR_TEST_CASE(test_non_primary_key_restrictions_update) {
         BOOST_TEST_PASSPOINT();
         e.execute_cql("insert into cf (a, b, c) values (1, 11, 0)").get();
         eventually([&] {
-            auto msg = e.execute_cql("select a, b, c from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c from vcf").get();
             assert_that(msg).is_rows().is_empty();
         });
         BOOST_TEST_PASSPOINT();
         e.execute_cql("update cf set c = 1 where a = 1").get();
         eventually([&] {
-            auto msg = e.execute_cql("select a, b, c from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                 { {int32_type->decompose(1)}, {int32_type->decompose(11)}, {int32_type->decompose(1)} }});
         });
         BOOST_TEST_PASSPOINT();
         e.execute_cql("update cf set c = 0 where a = 1").get();
         eventually([&] {
-            auto msg = e.execute_cql("select a, b, c from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c from vcf").get();
             assert_that(msg).is_rows().is_empty();
         });
         BOOST_TEST_PASSPOINT();
@@ -1857,7 +1884,7 @@ SEASTAR_TEST_CASE(test_non_primary_key_restrictions_update) {
         // view row re-added. And it isn't.
         e.execute_cql("update cf set c = 1 where a = 1").get();
         eventually([&] {
-            auto msg = e.execute_cql("select a, b, c from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                 { {int32_type->decompose(1)}, {int32_type->decompose(11)}, {int32_type->decompose(1)} }});
         });
@@ -1884,13 +1911,13 @@ SEASTAR_TEST_CASE(test_non_primary_key_restrictions_ttl) {
         BOOST_TEST_PASSPOINT();
         e.execute_cql("insert into cf (a, b, c) values (1, 11, 0)").get();
         eventually([&] {
-            auto msg = e.execute_cql("select a, b, c from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c from vcf").get();
             assert_that(msg).is_rows().is_empty();
         });
         BOOST_TEST_PASSPOINT();
         e.execute_cql("update cf using ttl 5 set c = 1 where a = 1").get();
         eventually([&] {
-            auto msg = e.execute_cql("select a, b, c from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                 { {int32_type->decompose(1)}, {int32_type->decompose(11)}, {int32_type->decompose(1)} }});
         });
@@ -1900,7 +1927,7 @@ SEASTAR_TEST_CASE(test_non_primary_key_restrictions_ttl) {
         // expired.
         forward_jump_clocks(6s);
         eventually([&] {
-            auto msg = e.execute_cql("select a, b, c from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c from vcf").get();
             assert_that(msg).is_rows().is_empty();
         });
         BOOST_TEST_PASSPOINT();
@@ -1908,7 +1935,7 @@ SEASTAR_TEST_CASE(test_non_primary_key_restrictions_ttl) {
         // view row back to life by setting c = 1.
         e.execute_cql("update cf set c = 1 where a = 1").get();
         eventually([&] {
-            auto msg = e.execute_cql("select a, b, c from vcf").get0();
+            auto msg = e.execute_cql("select a, b, c from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                 { {int32_type->decompose(1)}, {int32_type->decompose(11)}, {int32_type->decompose(1)} }});
         });
@@ -1939,20 +1966,20 @@ SEASTAR_TEST_CASE(test_non_primary_key_restrictions_update_vk) {
         BOOST_TEST_PASSPOINT();
         e.execute_cql("insert into cf (a, c) values (1, 0)").get();
         eventually([&] {
-            auto msg = e.execute_cql("select a, c from vcf").get0();
+            auto msg = e.execute_cql("select a, c from vcf").get();
             assert_that(msg).is_rows().is_empty();
         });
         BOOST_TEST_PASSPOINT();
         e.execute_cql("update cf set c = 1 where a = 1").get();
         eventually([&] {
-            auto msg = e.execute_cql("select a, c from vcf").get0();
+            auto msg = e.execute_cql("select a, c from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                 { {int32_type->decompose(1)}, {int32_type->decompose(1)} }});
         });
         BOOST_TEST_PASSPOINT();
         e.execute_cql("update cf set c = 0 where a = 1").get();
         eventually([&] {
-            auto msg = e.execute_cql("select a, c from vcf").get0();
+            auto msg = e.execute_cql("select a, c from vcf").get();
             assert_that(msg).is_rows().is_empty();
         });
         BOOST_TEST_PASSPOINT();
@@ -1960,7 +1987,7 @@ SEASTAR_TEST_CASE(test_non_primary_key_restrictions_update_vk) {
         // view row re-added. And it isn't.
         e.execute_cql("update cf set c = 1 where a = 1").get();
         eventually([&] {
-            auto msg = e.execute_cql("select a, c from vcf").get0();
+            auto msg = e.execute_cql("select a, c from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                 { {int32_type->decompose(1)}, {int32_type->decompose(1)} }});
         });
@@ -1979,26 +2006,26 @@ SEASTAR_TEST_CASE(test_non_primary_key_restrictions_ttl_vk) {
         BOOST_TEST_PASSPOINT();
         e.execute_cql("insert into cf (a, c) values (1, 0)").get();
         eventually([&] {
-            auto msg = e.execute_cql("select a, c from vcf").get0();
+            auto msg = e.execute_cql("select a, c from vcf").get();
             assert_that(msg).is_rows().is_empty();
         });
         BOOST_TEST_PASSPOINT();
         e.execute_cql("update cf using ttl 5 set c = 1 where a = 1").get();
         eventually([&] {
-            auto msg = e.execute_cql("select a, c from vcf").get0();
+            auto msg = e.execute_cql("select a, c from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                 { {int32_type->decompose(1)}, {int32_type->decompose(1)} }});
         });
         BOOST_TEST_PASSPOINT();
         forward_jump_clocks(6s);
         eventually([&] {
-            auto msg = e.execute_cql("select a, c from vcf").get0();
+            auto msg = e.execute_cql("select a, c from vcf").get();
             assert_that(msg).is_rows().is_empty();
         });
         BOOST_TEST_PASSPOINT();
         e.execute_cql("update cf set c = 1 where a = 1").get();
         eventually([&] {
-            auto msg = e.execute_cql("select a, c from vcf").get0();
+            auto msg = e.execute_cql("select a, c from vcf").get();
             assert_that(msg).is_rows().with_rows_ignore_order({
                 { {int32_type->decompose(1)}, {int32_type->decompose(1)} }});
         });
@@ -2019,7 +2046,7 @@ SEASTAR_TEST_CASE(test_restricted_regular_column_timestamp_updates) {
         e.execute_cql("update cf using timestamp 4 set c = 1 where k = 0").get();
         e.execute_cql("update cf using timestamp 3 set val = 2 where k = 0").get();
         eventually([&] {
-        auto msg = e.execute_cql("select c, k, val from vcf").get0();
+        auto msg = e.execute_cql("select c, k, val from vcf").get();
         assert_that(msg).is_rows().with_rows_ignore_order({{ {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(2)} }});
         });
     });
@@ -2037,27 +2064,27 @@ SEASTAR_TEST_CASE(test_old_timestamps_with_restrictions) {
         }
 
         eventually([&] {
-        auto msg = e.execute_cql("select * from vcf").get0();
+        auto msg = e.execute_cql("select * from vcf").get();
         assert_that(msg).is_rows().with_size(2);
-        msg = e.execute_cql("select c from vcf where val = 'baz'").get0();
+        msg = e.execute_cql("select c from vcf where val = 'baz'").get();
         assert_that(msg).is_rows().with_rows({ {{int32_type->decompose(0)}}, {{int32_type->decompose(1)}} });
         });
 
         // Make sure an old TS does nothing
         e.execute_cql("update cf using timestamp 100 set val = 'bar' where k = 0 and c = 1").get();
         eventually([&] {
-        auto msg = e.execute_cql("select c from vcf where val = 'baz'").get0();
+        auto msg = e.execute_cql("select c from vcf where val = 'baz'").get();
         assert_that(msg).is_rows().with_rows({ {{int32_type->decompose(0)}}, {{int32_type->decompose(1)}} });
-        msg = e.execute_cql("select c from vcf where val = 'bar'").get0();
+        msg = e.execute_cql("select c from vcf where val = 'bar'").get();
         assert_that(msg).is_rows().with_size(0);
         });
 
         // Latest TS
         e.execute_cql("update cf using timestamp 500 set val = 'bar' where k = 0 and c = 1").get();
         eventually([&] {
-        auto msg = e.execute_cql("select c from vcf where val = 'baz'").get0();
+        auto msg = e.execute_cql("select c from vcf where val = 'baz'").get();
         assert_that(msg).is_rows().with_rows({ {{int32_type->decompose(0)}} });
-        msg = e.execute_cql("select c from vcf where val = 'bar'").get0();
+        msg = e.execute_cql("select c from vcf where val = 'bar'").get();
         assert_that(msg).is_rows().with_rows({ {{int32_type->decompose(1)}} });
         });
     });
@@ -2072,7 +2099,7 @@ void do_complex_restricted_timestamp_update_test(cql_test_env& e, std::function<
     // Set initial values TS=0, matching the restriction and verify view
     e.execute_cql("insert into cf (p, c, v1, v2) values (0, 0, 1, 0) using timestamp 0").get();
     eventually([&] {
-    auto msg = e.execute_cql("select * from vcf").get0();
+    auto msg = e.execute_cql("select * from vcf").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(0)}, {} }});
     });
 
@@ -2080,7 +2107,7 @@ void do_complex_restricted_timestamp_update_test(cql_test_env& e, std::function<
     e.execute_cql("update cf using timestamp 2 set v1 = 1 where p = 0 and c = 0").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select v2 from vcf where v1 = 1 and p = 0 and c = 0").get0();
+    auto msg = e.execute_cql("select v2 from vcf where v1 = 1 and p = 0 and c = 0").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(0)} }});
     });
 
@@ -2088,7 +2115,7 @@ void do_complex_restricted_timestamp_update_test(cql_test_env& e, std::function<
     e.execute_cql("update cf using timestamp 3 set v1 = 0 where p = 0 and c = 0").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select v2 from vcf where v1 = 0 and p = 0 and c = 0").get0();
+    auto msg = e.execute_cql("select v2 from vcf where v1 = 0 and p = 0 and c = 0").get();
     assert_that(msg).is_rows().with_size(1);
     });
 
@@ -2096,7 +2123,7 @@ void do_complex_restricted_timestamp_update_test(cql_test_env& e, std::function<
     e.execute_cql("update cf using timestamp 4 set v1 = 1 where p = 0 and c = 0").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select v2, v3 from vcf where v1 = 1 and p = 0 and c = 0").get0();
+    auto msg = e.execute_cql("select v2, v3 from vcf where v1 = 1 and p = 0 and c = 0").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(0)}, {} }});
     });
 
@@ -2104,7 +2131,7 @@ void do_complex_restricted_timestamp_update_test(cql_test_env& e, std::function<
     e.execute_cql("update cf using timestamp 1 set v3 = 1 where p = 0 and c = 0").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select v2, v3 from vcf where v1 = 1 and p = 0 and c = 0").get0();
+    auto msg = e.execute_cql("select v2, v3 from vcf where v1 = 1 and p = 0 and c = 0").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(0)}, {int32_type->decompose(1)} }});
     });
 
@@ -2112,7 +2139,7 @@ void do_complex_restricted_timestamp_update_test(cql_test_env& e, std::function<
     e.execute_cql("update cf using timestamp 2 set v2 = 2 where p = 0 and c = 0").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select v2 from vcf where v1 = 1 and p = 0 and c = 0").get0();
+    auto msg = e.execute_cql("select v2 from vcf where v1 = 1 and p = 0 and c = 0").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(2)} }});
     });
 
@@ -2120,14 +2147,14 @@ void do_complex_restricted_timestamp_update_test(cql_test_env& e, std::function<
     e.execute_cql("update cf using timestamp 3 set v2 = 1 where p = 0 and c = 0").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select v2 from vcf where v1 = 1 and p = 0 and c = 0").get0();
+    auto msg = e.execute_cql("select v2 from vcf where v1 = 1 and p = 0 and c = 0").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(1)} }});
     });
 
     // Tombstone v1
     e.execute_cql("delete from cf using timestamp 5 where p = 0 and c = 0").get();
     eventually([&] {
-    auto msg = e.execute_cql("select v2 from vcf").get0();
+    auto msg = e.execute_cql("select v2 from vcf").get();
     assert_that(msg).is_rows().with_size(0);
     });
 
@@ -2135,7 +2162,7 @@ void do_complex_restricted_timestamp_update_test(cql_test_env& e, std::function<
     e.execute_cql("insert into cf (p, c, v1) values (0, 0, 1) using timestamp 6").get();
     // Make sure v2 doesn't pop back in.
     eventually([&] {
-    auto msg = e.execute_cql("select v2 from vcf where v1 = 1 and p = 0 and c = 0").get0();
+    auto msg = e.execute_cql("select v2 from vcf where v1 = 1 and p = 0 and c = 0").get();
     assert_that(msg).is_rows().with_rows({{ {} }});
     });
 
@@ -2149,7 +2176,7 @@ void do_complex_restricted_timestamp_update_test(cql_test_env& e, std::function<
     // Delete @ TS=0 (which should only delete v2)
     e.execute_cql("delete from cf using timestamp 0 where p = 1 and c = 0").get();
     eventually([&] {
-    auto msg = e.execute_cql("select * from vcf where v1 = 1 and p = 1 and c = 0").get0();
+    auto msg = e.execute_cql("select * from vcf where v1 = 1 and p = 1 and c = 0").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {}, {int32_type->decompose(0)} }});
     });
 
@@ -2158,14 +2185,14 @@ void do_complex_restricted_timestamp_update_test(cql_test_env& e, std::function<
     e.execute_cql("update cf using timestamp 3 set v1 = 1 where p = 1 and c = 0").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select * from vcf where v1 = 1 and p = 1 and c = 0").get0();
+    auto msg = e.execute_cql("select * from vcf where v1 = 1 and p = 1 and c = 0").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {}, {int32_type->decompose(0)} }});
     });
 
     e.execute_cql("update cf using timestamp 3 set v2 = 0 where p = 1 and c = 0").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select * from vcf where v1 = 1 and p = 1 and c = 0").get0();
+    auto msg = e.execute_cql("select * from vcf where v1 = 1 and p = 1 and c = 0").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(1)}, {int32_type->decompose(1)}, {int32_type->decompose(0)}, {int32_type->decompose(0)}, {int32_type->decompose(0)} }});
     });
 }
@@ -2196,7 +2223,7 @@ void complex_timestamp_with_base_pk_columns_in_view_pk_deletion_test(cql_test_en
     e.execute_cql("insert into cf (p, c, v1, v2) values (1, 2, 3, 4) using timestamp 1").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select v1, v2, WRITETIME(v2) from vcf where p = 1 and c = 2").get0();
+    auto msg = e.execute_cql("select v1, v2, WRITETIME(v2) from vcf where p = 1 and c = 2").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(3)}, {int32_type->decompose(4)}, {long_type->decompose(1L)} }});
     });
 
@@ -2204,7 +2231,7 @@ void complex_timestamp_with_base_pk_columns_in_view_pk_deletion_test(cql_test_en
     e.execute_cql("delete from cf using timestamp 2 where p = 1 and c = 2").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select * from vcf").get0();
+    auto msg = e.execute_cql("select * from vcf").get();
     assert_that(msg).is_rows().with_size(0);
     });
 
@@ -2212,7 +2239,7 @@ void complex_timestamp_with_base_pk_columns_in_view_pk_deletion_test(cql_test_en
     e.execute_cql("insert into cf (p, c) values (1, 2) using timestamp 3").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select * from vcf").get0();
+    auto msg = e.execute_cql("select * from vcf").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(2)}, {int32_type->decompose(1)}, {}, {} }});
     });
 
@@ -2220,7 +2247,7 @@ void complex_timestamp_with_base_pk_columns_in_view_pk_deletion_test(cql_test_en
     e.execute_cql("insert into cf (p, c, v1, v2) values (1, 2, 3, 4) using timestamp 10").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select v1, v2, WRITETIME(v2) from vcf where p = 1 and c = 2").get0();
+    auto msg = e.execute_cql("select v1, v2, WRITETIME(v2) from vcf where p = 1 and c = 2").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(3)}, {int32_type->decompose(4)}, {long_type->decompose(10L)} }});
     });
 
@@ -2228,7 +2255,7 @@ void complex_timestamp_with_base_pk_columns_in_view_pk_deletion_test(cql_test_en
     e.execute_cql("update cf using timestamp 20 set v2 = 5 where p = 1 and c = 2").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select v1, v2, WRITETIME(v2) from vcf where p = 1 and c = 2").get0();
+    auto msg = e.execute_cql("select v1, v2, WRITETIME(v2) from vcf where p = 1 and c = 2").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(3)}, {int32_type->decompose(5)}, {long_type->decompose(20L)} }});
     });
 
@@ -2236,7 +2263,7 @@ void complex_timestamp_with_base_pk_columns_in_view_pk_deletion_test(cql_test_en
     e.execute_cql("delete from cf using timestamp 10 where p = 1 and c = 2").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select v1, v2, WRITETIME(v2) from vcf").get0();
+    auto msg = e.execute_cql("select v1, v2, WRITETIME(v2) from vcf").get();
     assert_that(msg).is_rows().with_rows({{ { }, {int32_type->decompose(5)}, {long_type->decompose(20L)} }});
     });
 
@@ -2254,7 +2281,7 @@ void complex_timestamp_with_base_non_pk_columns_in_view_pk_deletion_test(cql_tes
     e.execute_cql("insert into cf (p, v1, v2) values (3, 1, 5) using timestamp 1").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select v2, WRITETIME(v2) from vcf where v1 = 1 and p = 3").get0();
+    auto msg = e.execute_cql("select v2, WRITETIME(v2) from vcf where v1 = 1 and p = 3").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(5)}, {long_type->decompose(1L)} }});
     });
 
@@ -2262,7 +2289,7 @@ void complex_timestamp_with_base_non_pk_columns_in_view_pk_deletion_test(cql_tes
     e.execute_cql("delete from cf using timestamp 2 where p = 3").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select * from vcf").get0();
+    auto msg = e.execute_cql("select * from vcf").get();
     assert_that(msg).is_rows().with_size(0);
     });
 
@@ -2270,7 +2297,7 @@ void complex_timestamp_with_base_non_pk_columns_in_view_pk_deletion_test(cql_tes
     e.execute_cql("insert into cf (p, v1) values (3, 1) using timestamp 3").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select * from vcf").get0();
+    auto msg = e.execute_cql("select * from vcf").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(1)}, {int32_type->decompose(3)}, {} }});
     });
 
@@ -2278,7 +2305,7 @@ void complex_timestamp_with_base_non_pk_columns_in_view_pk_deletion_test(cql_tes
     e.execute_cql("insert into cf (p, v1, v2) values (3, 1, 4) using timestamp 2").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select * from vcf").get0();
+    auto msg = e.execute_cql("select * from vcf").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(1)}, {int32_type->decompose(3)}, {} }});
     });
 
@@ -2286,7 +2313,7 @@ void complex_timestamp_with_base_non_pk_columns_in_view_pk_deletion_test(cql_tes
     e.execute_cql("update cf using timestamp 3 set v2 = 4 where p = 3").get();
     maybe_flush();
     eventually([&] {
-    auto msg = e.execute_cql("select v1, p, v2, WRITETIME(v2) from vcf").get0();
+    auto msg = e.execute_cql("select v1, p, v2, WRITETIME(v2) from vcf").get();
     assert_that(msg).is_rows().with_rows({{ {int32_type->decompose(1)}, {int32_type->decompose(3)}, {int32_type->decompose(4)}, {long_type->decompose(3L)} }});
     });
 
@@ -2484,7 +2511,7 @@ SEASTAR_TEST_CASE(test_alter_table_with_updates) {
         e.execute_cql("alter table cf add z int;").get();
         e.execute_cql("update cf set v2 = 7 where p = 1 and c = 1").get();
         eventually([&] {
-            auto msg = e.execute_cql("select p, c, v1, v2 from vcf").get0();
+            auto msg = e.execute_cql("select p, c, v1, v2 from vcf").get();
             assert_that(msg).is_rows()
                     .with_size(1)
                     .with_row({
@@ -2509,14 +2536,14 @@ SEASTAR_TEST_CASE(test_unselected_column) {
                       "primary key (c, p)").get();
         e.execute_cql("insert into cf (p, c, x) values (1, 2, 3)").get();
         BOOST_TEST_PASSPOINT();
-        auto msg = e.execute_cql("select * from cf").get0();
+        auto msg = e.execute_cql("select * from cf").get();
         assert_that(msg).is_rows().with_size(1)
                 .with_row({{int32_type->decompose(1)}, {int32_type->decompose(2)}, {}, {int32_type->decompose(3)}, {}, {}});
         BOOST_TEST_PASSPOINT();
         // Check that when we ask for all of vcf's columns, we only get the
         // ones we actually selected - c and p, not x, y, z, or w:
         eventually([&] {
-            auto msg = e.execute_cql("select * from vcf").get0();
+            auto msg = e.execute_cql("select * from vcf").get();
             assert_that(msg).is_rows().with_size(1)
                     .with_row({{int32_type->decompose(2)}, {int32_type->decompose(1)}});
         });
@@ -2572,13 +2599,22 @@ SEASTAR_TEST_CASE(test_unselected_column) {
 }
 
 SEASTAR_THREAD_TEST_CASE(node_view_update_backlog) {
-    db::view::node_update_backlog b(2, 10ms);
+    db::view::node_update_backlog b(2, 100ms);
     auto backlog = [] (size_t size) { return db::view::update_backlog{size, 1000}; };
-    b.add_fetch(0, backlog(10));
-    b.add_fetch(1, backlog(50));
+    smp::submit_to(0, [&b, &backlog] {
+        b.add(backlog(10));
+        b.fetch();
+    }).get();
+    smp::submit_to(1, [&b, &backlog] {
+        b.add(backlog(50));
+        b.fetch();
+    }).get();
     BOOST_REQUIRE(b.load() == backlog(10));
-    sleep(11ms).get();
-    b.add_fetch(1, backlog(100));
+    sleep(101ms).get();
+    smp::submit_to(1, [&b, &backlog] {
+        b.add(backlog(100));
+        b.fetch();
+    }).get();
     BOOST_REQUIRE(b.load() == backlog(100));
 }
 
@@ -2609,12 +2645,12 @@ SEASTAR_TEST_CASE(test_no_base_column_in_view_pk_complex_timestamp) {
         // update unselected, view row should be alive
         e.execute_cql("UPDATE t USING TIMESTAMP 1 SET e=1 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), {}, {}, int32_type->decompose(1), {} },
             });
 
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), {}, {} },
             });
@@ -2623,12 +2659,12 @@ SEASTAR_TEST_CASE(test_no_base_column_in_view_pk_complex_timestamp) {
         // remove unselected, add selected column, view row should be alive
         e.execute_cql("UPDATE t USING TIMESTAMP 2 SET e=null, b=1 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), {}, int32_type->decompose(1), {}, {} },
             });
 
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), {}, int32_type->decompose(1) },
             });
@@ -2637,20 +2673,20 @@ SEASTAR_TEST_CASE(test_no_base_column_in_view_pk_complex_timestamp) {
         // remove selected column, view row is removed
         e.execute_cql("UPDATE t USING TIMESTAMP 2 SET e=null, b=null WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_size(0);
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_size(0);
         });
 
         // update unselected with ts=3, view row should be alive
         e.execute_cql("UPDATE t USING TIMESTAMP 3 SET f=1 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), {}, {}, {}, int32_type->decompose(1) },
             });
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), {}, {} },
             });
@@ -2659,11 +2695,11 @@ SEASTAR_TEST_CASE(test_no_base_column_in_view_pk_complex_timestamp) {
         // insert livenesssInfo, view row should be alive
         e.execute_cql("INSERT INTO t(k,c) VALUES(1,1) USING TIMESTAMP 3").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), {}, {}, {}, int32_type->decompose(1) },
             });
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), {}, {} },
             });
@@ -2672,11 +2708,11 @@ SEASTAR_TEST_CASE(test_no_base_column_in_view_pk_complex_timestamp) {
         // remove unselected, view row should be alive because of base livenessInfo alive
         e.execute_cql("UPDATE t USING TIMESTAMP 3 SET f=null WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), {}, {}, {}, {} },
             });
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), {}, {} },
             });
@@ -2685,11 +2721,11 @@ SEASTAR_TEST_CASE(test_no_base_column_in_view_pk_complex_timestamp) {
         // add selected column, view row should be alive
         e.execute_cql("UPDATE t USING TIMESTAMP 3 SET a=1 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {}, {}, {} },
             });
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {} },
             });
@@ -2698,11 +2734,11 @@ SEASTAR_TEST_CASE(test_no_base_column_in_view_pk_complex_timestamp) {
         // update unselected, view row should be alive
         e.execute_cql("UPDATE t USING TIMESTAMP 4 SET f=1 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {}, {}, int32_type->decompose(1) },
             });
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {} },
             });
@@ -2711,12 +2747,12 @@ SEASTAR_TEST_CASE(test_no_base_column_in_view_pk_complex_timestamp) {
         // delete with ts=3, view row should be alive due to unselected@ts4
         e.execute_cql("DELETE FROM t USING TIMESTAMP 3 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), {}, {}, {}, int32_type->decompose(1) },
             });
 
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), {}, {} },
             });
@@ -2725,20 +2761,20 @@ SEASTAR_TEST_CASE(test_no_base_column_in_view_pk_complex_timestamp) {
         // remove unselected, view row should be removed
         e.execute_cql("UPDATE t USING TIMESTAMP 4 SET f=null WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_size(0);
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_size(0);
         });
 
         // add selected with ts=7, view row is alive
         e.execute_cql("UPDATE t USING TIMESTAMP 7 SET b=1 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), {}, int32_type->decompose(1), {}, {} },
             });
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), {}, int32_type->decompose(1) },
             });
@@ -2747,20 +2783,20 @@ SEASTAR_TEST_CASE(test_no_base_column_in_view_pk_complex_timestamp) {
         // remove selected with ts=7, view row is dead
         e.execute_cql("UPDATE t USING TIMESTAMP 7 SET b=null WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_size(0);
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_size(0);
         });
 
         // add selected with ts=5, view row is alive (selected column should not affects each other)
         e.execute_cql("UPDATE t USING TIMESTAMP 5 SET a=1 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {}, {}, {} },
             });
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {} },
             });
@@ -2769,11 +2805,11 @@ SEASTAR_TEST_CASE(test_no_base_column_in_view_pk_complex_timestamp) {
         // add selected with ttl=1
         e.execute_cql("UPDATE t USING TTL 30 SET a=1 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {}, {}, {} },
             });
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {} },
             });
@@ -2782,7 +2818,7 @@ SEASTAR_TEST_CASE(test_no_base_column_in_view_pk_complex_timestamp) {
         forward_jump_clocks(31s);
 
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_size(0);
         });
 
@@ -2790,11 +2826,11 @@ SEASTAR_TEST_CASE(test_no_base_column_in_view_pk_complex_timestamp) {
         e.execute_cql("UPDATE t USING TTL 30 SET f=1 WHERE k=1 AND c=1;").get();
 
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), {}, {}, {}, int32_type->decompose(1) },
             });
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), {}, {} },
             });
@@ -2803,9 +2839,9 @@ SEASTAR_TEST_CASE(test_no_base_column_in_view_pk_complex_timestamp) {
         forward_jump_clocks(31s);
 
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_size(0);
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_size(0);
         });
     });
@@ -2823,19 +2859,19 @@ SEASTAR_TEST_CASE(test_base_column_in_view_pk_complex_timestamp) {
         // update unselected, view row should not be here
         e.execute_cql("UPDATE t USING TIMESTAMP 1 SET e=1 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_size(0);
         });
 
         // Set selected, view row should appear
         e.execute_cql("UPDATE t USING TIMESTAMP 1 SET a=1, e=1 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {}, int32_type->decompose(1), {} },
             });
 
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {} },
             });
@@ -2844,12 +2880,12 @@ SEASTAR_TEST_CASE(test_base_column_in_view_pk_complex_timestamp) {
         // remove unselected, add selected column, view row should be alive
         e.execute_cql("UPDATE t USING TIMESTAMP 2 SET e=null, b=1 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {}, {} },
             });
 
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1) },
             });
@@ -2858,20 +2894,20 @@ SEASTAR_TEST_CASE(test_base_column_in_view_pk_complex_timestamp) {
         // remove selected column, view row is removed
         e.execute_cql("UPDATE t USING TIMESTAMP 2 SET a=null, e=null, b=null WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_size(0);
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_size(0);
         });
 
         // update unselected with ts=3, view row should be alive
         e.execute_cql("UPDATE t USING TIMESTAMP 3 SET a=1, f=1 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {}, {}, int32_type->decompose(1) },
             });
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {} },
             });
@@ -2880,11 +2916,11 @@ SEASTAR_TEST_CASE(test_base_column_in_view_pk_complex_timestamp) {
         // insert livenesssInfo, view row should be alive
         e.execute_cql("INSERT INTO t(k,c,a) VALUES(1,1,1) USING TIMESTAMP 3").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {}, {}, int32_type->decompose(1) },
             });
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {} },
             });
@@ -2893,11 +2929,11 @@ SEASTAR_TEST_CASE(test_base_column_in_view_pk_complex_timestamp) {
         // remove unselected, view row should be alive because of base livenessInfo alive
         e.execute_cql("UPDATE t USING TIMESTAMP 3 SET a=1, f=null WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {}, {}, {} },
             });
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {} },
             });
@@ -2906,11 +2942,11 @@ SEASTAR_TEST_CASE(test_base_column_in_view_pk_complex_timestamp) {
         // update unselected, view row should be alive
         e.execute_cql("UPDATE t USING TIMESTAMP 4 SET a=1, f=1 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {}, {}, int32_type->decompose(1) },
             });
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {} },
             });
@@ -2919,12 +2955,12 @@ SEASTAR_TEST_CASE(test_base_column_in_view_pk_complex_timestamp) {
         // delete with ts=3, view row should be alive due to unselected@ts4
         e.execute_cql("DELETE FROM t USING TIMESTAMP 3 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {}, {}, int32_type->decompose(1) },
             });
 
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {} },
             });
@@ -2933,20 +2969,20 @@ SEASTAR_TEST_CASE(test_base_column_in_view_pk_complex_timestamp) {
         // remove unselected, view row should be removed
         e.execute_cql("UPDATE t USING TIMESTAMP 4 SET a=null, f=null WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_size(0);
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_size(0);
         });
 
         // add selected with ts=7, view row is alive
         e.execute_cql("UPDATE t USING TIMESTAMP 7 SET a=1, b=1 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {}, {} },
             });
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1) },
             });
@@ -2955,20 +2991,20 @@ SEASTAR_TEST_CASE(test_base_column_in_view_pk_complex_timestamp) {
         // remove selected with ts=7, view row is dead
         e.execute_cql("UPDATE t USING TIMESTAMP 7 SET a=null, b=null WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_size(0);
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_size(0);
         });
 
         // add selected with ttl=1
         e.execute_cql("UPDATE t USING TTL 30 SET a=1, b=1 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM t").get0();
+            msg = e.execute_cql("SELECT * FROM t").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), {}, {} },
             });
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(1) },
             });
@@ -2977,13 +3013,47 @@ SEASTAR_TEST_CASE(test_base_column_in_view_pk_complex_timestamp) {
         forward_jump_clocks(31s);
 
         eventually([&] {
-            msg = e.execute_cql("SELECT * FROM mv").get0();
+            msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_size(0);
         });
     });
 }
 
+// Used by `test_view_update_generating_writetime` below.
+struct update_counter {
+    // View update count towards mv1.
+    unsigned mv1;
+    // View update count towards mv2.
+    unsigned mv2;
+    // Total view update count.
+    unsigned total;
+
+    bool operator==(const update_counter&) const noexcept = default;
+
+    friend std::ostream& operator<<(std::ostream& os, const update_counter& uc) {
+        std::print(os, "{{mv1: {}, mv2: {}, total: {}}}", uc.mv1, uc.mv2, uc.total);
+        return os;
+    }
+};
+
 SEASTAR_TEST_CASE(test_view_update_generating_writetime) {
+    // The test revolves around timestamps in materialized views and their relation to timestamps
+    // in the base table. Values in an MV should have the same timestamp as the corresponding
+    // ones in the base table. However, that only applies to values that are readable with `WRITETIME`.
+    // Those that are not readable encompass unselected columns, even if a view has virtual columns
+    // that correspond to them. Because of that, Scylla employs an optimization that prevents emitting
+    // redundant view updates -- that's what this test verifies. For that end, we use two MVs:
+    //
+    // * mv1: its primary key is a permutation of the base table's primary key. Because of that,
+    //        it will have virtual columns corresponding to unselected columns from the base table.
+    //        Creating a value in such a column (in the base table) will generate a view update
+    //        to the MV. However, updating it will not generate an update UNLESS it changes
+    //        the cell's TTL.
+    // * mv2: its primary key consists of the columns from the base table's primary key and one
+    //        regular column. Because of that, the MV will NOT have any virtual columns corresponding
+    //        to the unselected columns from the base table. As a result, no view updates will be
+    //        generated for unselected columns as a result.
+
     return do_with_cql_env_thread([] (cql_test_env& e) {
 
         e.execute_cql("CREATE TABLE t (k int, c int, a int, b int, e int, f int, g int, primary key(k, c))").get();
@@ -2992,79 +3062,141 @@ SEASTAR_TEST_CASE(test_view_update_generating_writetime) {
         e.execute_cql("CREATE MATERIALIZED VIEW mv2 AS SELECT k,c,a,b FROM t "
                          "WHERE k IS NOT NULL AND c IS NOT NULL AND a IS NOT NULL PRIMARY KEY (c, k, a)").get();
 
+        e.local_view_builder().wait_until_built("ks", "mv1").get();
+        e.local_view_builder().wait_until_built("ks", "mv2").get();
+
         auto total_t_view_updates = [&] {
             return e.db().map_reduce0([] (replica::database& local_db) {
                 const db::view::stats& local_stats = local_db.find_column_family("ks", "t").get_view_stats();
                 return local_stats.view_updates_pushed_local + local_stats.view_updates_pushed_remote;
-            }, 0, std::plus<int64_t>()).get0();
+            }, 0, std::plus<int64_t>()).get();
         };
 
         auto total_mv1_updates = [&] {
             return e.db().map_reduce0([] (replica::database& local_db) {
                 return local_db.find_column_family("ks", "mv1").get_stats().writes.hist.count;
-            }, 0, std::plus<int64_t>()).get0();
+            }, 0, std::plus<int64_t>()).get();
         };
 
         auto total_mv2_updates = [&] {
             return e.db().map_reduce0([] (replica::database& local_db) {
                 return local_db.find_column_family("ks", "mv2").get_stats().writes.hist.count;
-            }, 0, std::plus<int64_t>()).get0();
+            }, 0, std::plus<int64_t>()).get();
         };
 
         ::shared_ptr<cql_transport::messages::result_message> msg;
 
-        // Updating timestamp for unselected column will not be propagated,
-        // and its creation will be propagated for a virtual column only
+        // A view update is generated for mv1 because the row has a complete primary key in that view
+        // and we need to mark that the value in the corresponding virtual column is present.
+        //
+        // A view update is NOT generated for mv2 because the row still has an incomplete primary key
+        // in that view (it lacks `a`).
         e.execute_cql("UPDATE t USING TIMESTAMP 1 SET e=1 WHERE k=1 AND c=1;").get();
+        eventually([&] {
+            msg = e.execute_cql("SELECT WRITETIME(e) FROM t").get();
+            assert_that(msg).is_rows().with_row({long_type->decompose(int64_t(1))});
+
+            const update_counter results{total_mv1_updates(), total_mv2_updates(), total_t_view_updates()};
+            const update_counter expected{1, 0, 1};
+
+            BOOST_REQUIRE_EQUAL(results, expected);
+        });
+
+        // The row still doesn't have a complete PK for mv2.
+        //
+        // Updating an unselected column will NOT produce a view update, so no update for mv1 either.
         e.execute_cql("UPDATE t USING TIMESTAMP 2 SET e=1 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT WRITETIME(e) FROM t").get0();
+            msg = e.execute_cql("SELECT WRITETIME(e) FROM t").get();
             assert_that(msg).is_rows().with_row({long_type->decompose(int64_t(2))});
-            BOOST_REQUIRE_EQUAL(total_t_view_updates(), 1);
-            BOOST_REQUIRE_EQUAL(total_mv1_updates(), 1);
-            BOOST_REQUIRE_EQUAL(total_mv2_updates(), 0);
+
+            const update_counter results{total_mv1_updates(), total_mv2_updates(), total_t_view_updates()};
+            const update_counter expected{1, 0, 1};
+
+            BOOST_REQUIRE_EQUAL(results, expected);
         });
 
-        // Updating timestamp for a selected column will propagate for existing columns
+        // A view update is generated for mv1 because the `b` column is part of the view.
+        //
+        // A view update is NOT generated for mv2 because the row still has an incomplete primary key in that view.
         e.execute_cql("UPDATE t USING TIMESTAMP 3 SET b=1 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT WRITETIME(b) FROM t").get0();
+            msg = e.execute_cql("SELECT WRITETIME(b) FROM t").get();
             assert_that(msg).is_rows().with_row({long_type->decompose(int64_t(3))});
-            BOOST_REQUIRE_EQUAL(total_t_view_updates(), 2);
-            BOOST_REQUIRE_EQUAL(total_mv1_updates(), 2);
-            BOOST_REQUIRE_EQUAL(total_mv2_updates(), 0);
+
+            const update_counter results{total_mv1_updates(), total_mv2_updates(), total_t_view_updates()};
+            const update_counter expected{2, 0, 2};
+
+            BOOST_REQUIRE_EQUAL(results, expected);
         });
-        // After instantiating view row a, selected column's timestamp from previous example will propagate to mv2
+
+        // A view update is generated for mv1 because `a` is part of the view.
+        //
+        // A view update is generated for mv2 because `a` is part of the view
+        // AND the row has finally a complete primary key.
+        //
+        // The timestamp from the previous CQL statement is preserved for `b`.
         e.execute_cql("UPDATE t USING TIMESTAMP 4 SET a=1 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT WRITETIME(b) FROM t").get0();
+            msg = e.execute_cql("SELECT WRITETIME(b) FROM t").get();
             assert_that(msg).is_rows().with_row({long_type->decompose(int64_t(3))});
-            BOOST_REQUIRE_EQUAL(total_t_view_updates(), 4);
-            BOOST_REQUIRE_EQUAL(total_mv1_updates(), 3);
-            BOOST_REQUIRE_EQUAL(total_mv2_updates(), 1);
+
+            const update_counter results{total_mv1_updates(), total_mv2_updates(), total_t_view_updates()};
+            const update_counter expected{3, 1, 4};
+
+            BOOST_REQUIRE_EQUAL(results, expected);
         });
 
-        // Updating column value without touching TTL will not propagate
-        // if it's either unselected or virtual
+        // `f` is an unselected column for both MVs, so a view update will only be generated
+        // to mv1 (to the corresponding virtual column) because the value in the cell is
+        // only created now.
         e.execute_cql("UPDATE t USING TIMESTAMP 5 SET f=40 WHERE k=1 AND c=1;").get();
+        eventually([&] {
+            msg = e.execute_cql("SELECT WRITETIME(f) FROM t").get();
+            assert_that(msg).is_rows().with_row({long_type->decompose(int64_t(5))});
+
+            const update_counter results{total_mv1_updates(), total_mv2_updates(), total_t_view_updates()};
+            const update_counter expected{4, 1, 5};
+
+            BOOST_REQUIRE_EQUAL(results, expected);
+        });
+
+        // Updating an unselected column will not produce view updates.
         e.execute_cql("UPDATE t USING TIMESTAMP 6 SET f=40 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT WRITETIME(f) FROM t").get0();
+            msg = e.execute_cql("SELECT WRITETIME(f) FROM t").get();
             assert_that(msg).is_rows().with_row({long_type->decompose(int64_t(6))});
-            BOOST_REQUIRE_EQUAL(total_t_view_updates(), 6);
-            BOOST_REQUIRE_EQUAL(total_mv1_updates(), 4); // only one update for creation, update does not generate one
-            BOOST_REQUIRE_EQUAL(total_mv2_updates(), 2);
+
+            const update_counter results{total_mv1_updates(), total_mv2_updates(), total_t_view_updates()};
+            const update_counter expected{4, 1, 5};
+
+            BOOST_REQUIRE_EQUAL(results, expected);
         });
 
-        // Updating column value with TTL will propagate for virtual columns
+        // `g` is an unselected column for both MVs, so a view update will only be generated
+        // to mv1 (to the corresponding virtual column) because the value in the cell is
+        // only created now.
         e.execute_cql("UPDATE t USING TIMESTAMP 7 SET g=40 WHERE k=1 AND c=1;").get();
-        e.execute_cql("UPDATE t USING TTL 10 AND TIMESTAMP 8 SET g=40 WHERE k=1 AND c=1;").get();
         eventually([&] {
-            msg = e.execute_cql("SELECT WRITETIME(g) FROM t").get0();
+            msg = e.execute_cql("SELECT WRITETIME(g) FROM t").get();
+            assert_that(msg).is_rows().with_row({long_type->decompose(int64_t(7))});
+
+            const update_counter results{total_mv1_updates(), total_mv2_updates(), total_t_view_updates()};
+            const update_counter expected{5, 1, 6};
+
+            BOOST_REQUIRE_EQUAL(results, expected);
+        });
+
+        // Updating the TTL of an unselected column will produce a view update to the virtual column.
+        e.execute_cql("UPDATE t USING TTL 300 AND TIMESTAMP 8 SET g=40 WHERE k=1 AND c=1;").get();
+        eventually([&] {
+            msg = e.execute_cql("SELECT WRITETIME(g) FROM t").get();
             assert_that(msg).is_rows().with_row({long_type->decompose(int64_t(8))});
-            BOOST_REQUIRE_EQUAL(total_t_view_updates(), 10);
-            BOOST_REQUIRE_EQUAL(total_mv1_updates(), 6); // two updates - one for creation, one for updating the TTL
-            BOOST_REQUIRE_EQUAL(total_mv2_updates(), 4);
+
+            const update_counter results{total_mv1_updates(), total_mv2_updates(), total_t_view_updates()};
+            const update_counter expected{6, 1, 7};
+
+            BOOST_REQUIRE_EQUAL(results, expected);
         });
     });
 }
@@ -3080,7 +3212,7 @@ SEASTAR_TEST_CASE(test_conflicting_batch) {
 
         e.execute_cql("INSERT INTO t (p, c, v) VALUES (0, 0, 0)").get();
         eventually([&] {
-            auto msg = e.execute_cql("SELECT * FROM mv").get0();
+            auto msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().with_rows({
                 { int32_type->decompose(0), int32_type->decompose(0), int32_type->decompose(0) },
             });
@@ -3095,13 +3227,13 @@ SEASTAR_TEST_CASE(test_conflicting_batch) {
             "  DELETE FROM t WHERE p = 0 AND c = 0; \n"
             "apply batch;").get();
 
-        auto msg = e.execute_cql("SELECT * FROM t").get0();
+        auto msg = e.execute_cql("SELECT * FROM t").get();
         assert_that(msg).is_rows().is_empty();
 
         BOOST_TEST_PASSPOINT();
 
         eventually([&] {
-            auto msg = e.execute_cql("SELECT * FROM mv").get0();
+            auto msg = e.execute_cql("SELECT * FROM mv").get();
             assert_that(msg).is_rows().is_empty();
         });
     });
@@ -3126,16 +3258,16 @@ SEASTAR_TEST_CASE(test_mv_allow_some_column_drops) {
         e.execute_cql("create materialized view mv as select c from cf where a is not null primary key (a, p)").get();
         e.execute_cql("insert into cf (p, a, b, c) VALUES (1, 2, 3, 4)").get();
         BOOST_TEST_PASSPOINT();
-        auto res = e.execute_cql("select * from cf").get0();
+        auto res = e.execute_cql("select * from cf").get();
         assert_that(res).is_rows().with_rows({
             {{int32_type->decompose(1)}, {int32_type->decompose(2)}, {int32_type->decompose(3)}, {int32_type->decompose(4)}}});
         e.execute_cql("alter table cf drop b").get();
         BOOST_TEST_PASSPOINT();
-        res = e.execute_cql("select * from cf").get0();
+        res = e.execute_cql("select * from cf").get();
         assert_that(res).is_rows().with_rows({
             {{int32_type->decompose(1)}, {int32_type->decompose(2)}, {int32_type->decompose(4)}}});
         eventually([&] {
-            auto res = e.execute_cql("select * from mv where a = 2").get0();
+            auto res = e.execute_cql("select * from mv where a = 2").get();
             assert_that(res).is_rows().with_rows({
                 {{int32_type->decompose(2)}, {int32_type->decompose(1)}, {int32_type->decompose(4)}}});
         });
@@ -3162,3 +3294,5 @@ SEASTAR_TEST_CASE(test_mv_allow_some_column_drops) {
         BOOST_REQUIRE_THROW(e.execute_cql("alter table cf2 drop d").get(), exceptions::invalid_request_exception);
     });
 }
+
+BOOST_AUTO_TEST_SUITE_END()

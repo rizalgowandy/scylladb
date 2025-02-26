@@ -3,12 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
+
+#pragma once
 
 #include "replica/database.hh"
 #include "db/system_keyspace.hh"
-#include "readers/flat_mutation_reader_v2.hh"
+#include "readers/mutation_reader.hh"
 #include "mutation/mutation_fragment_v2.hh"
 #include "query-request.hh"
 #include "schema/schema_fwd.hh"
@@ -24,11 +26,11 @@ namespace db::index {
 class built_indexes_virtual_reader {
     replica::database& _db;
 
-    struct built_indexes_reader : flat_mutation_reader_v2::impl {
+    struct built_indexes_reader : mutation_reader::impl {
         replica::database& _db;
         schema_ptr _schema;
         query::partition_slice _view_names_slice;
-        flat_mutation_reader_v2 _underlying;
+        mutation_reader _underlying;
         sstring _current_keyspace;
 
         // Convert a key holding an index name (e.g., xyz) to a key holding
@@ -107,7 +109,7 @@ class built_indexes_virtual_reader {
                 tracing::trace_state_ptr trace_state,
                 streamed_mutation::forwarding fwd,
                 mutation_reader::forwarding fwd_mr)
-                : flat_mutation_reader_v2::impl(schema, permit)
+                : mutation_reader::impl(schema, permit)
                 , _db(db)
                 , _schema(std::move(schema))
                 , _view_names_slice(index_slice_to_view_slice(slice, *built_views.schema(), *_schema))
@@ -211,7 +213,7 @@ public:
             : _db(db) {
     }
 
-    flat_mutation_reader_v2 operator()(
+    mutation_reader operator()(
             schema_ptr s,
             reader_permit permit,
             const dht::partition_range& range,
@@ -219,7 +221,9 @@ public:
             tracing::trace_state_ptr trace_state,
             streamed_mutation::forwarding fwd,
             mutation_reader::forwarding fwd_mr) {
-        return make_flat_mutation_reader_v2<built_indexes_reader>(
+        // Use of BUILT_VIEWS as filtering table should be in sync with
+        // cf::get_built_indexes's filtering with load_built_views()
+        return make_mutation_reader<built_indexes_reader>(
                 _db,
                 s,
                 std::move(permit),

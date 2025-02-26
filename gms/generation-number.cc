@@ -3,13 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include <cassert>
 #include <chrono>
 #include <utility>
-#include <exception>
 
 #include <fmt/format.h>
 
@@ -23,7 +23,7 @@ generation_type get_generation_number() {
     int generation_number = duration_cast<seconds>(now).count();
     auto ret = generation_type(generation_number);
     // Make sure the clock didn't overflow the 32 bits value
-    assert(ret.value() == generation_number);
+    SCYLLA_ASSERT(ret.value() == generation_number);
     return ret;
 }
 

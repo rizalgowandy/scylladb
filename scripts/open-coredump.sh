@@ -5,7 +5,7 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
 #
@@ -16,6 +16,8 @@
 # * git
 
 set -e
+
+trap 'echo "error $? in $0 line $LINENO"' ERR
 
 SCRIPT_NAME=$(basename $0)
 SCYLLA_S3_RELOC_SERVER_DEFAULT_URL=http://backtrace.scylladb.com
@@ -53,6 +55,14 @@ Options:
     Print progress information when downloading the package and cloning
     the git repo.
 
+--ci
+    Designate the coredump as one coming from CI. These coredumps are
+    produced by a merge commit between the main branch (master or
+    enterprise) and the tested branch and this commit will not be
+    present in origin. Using this flag will force the main branch to
+    be checked out, instead of the commit hash obtained from the
+    ScyllaDB vesrsion.
+
 --artifact-dir,-d ARTIFACT_DIR
     Directory where the script will store all downloaded artifacts. If
     the directory doesn't exist, it will be created.
@@ -65,6 +75,12 @@ Options:
     the script's working directory.
     Can be also provided via env variable ARTIFACT_DIR.
     If both are provided, command line has precedence.
+
+--scylla-package-url,-p SCYLLA_PACKAGE_URL
+    Instead of querying the s3-reloc-server (see below) and downloading the
+    package from the obtained URL, download it directly from the provided URL
+    and extract the scylla version metadata from the package.
+    If the package is already downloaded, it is not downloaded again.
 
 --scylla-s3-reloc-server-url,-u SCYLLA_S3_RELOC_SERVER_URL
     The URL of the s3 reloc server to connect to. Needed to fetch the
@@ -126,6 +142,8 @@ for required in eu-unstrip jq curl git; do
 done
 
 VERBOSE_LEVEL=1
+CORE_FROM_CI=0
+PACKAGE_URL="${SCYLLA_PACKAGE_URL}"
 SCYLLA_S3_RELOC_SERVER_URL="${SCYLLA_S3_RELOC_SERVER_URL:-$SCYLLA_S3_RELOC_SERVER_DEFAULT_URL}"
 SCYLLA_REPO_PATH="${SCYLLA_REPO_PATH}"
 SCYLLA_BUILD_ID="${SCYLLA_BUILD_ID}"
@@ -148,8 +166,16 @@ do
             VERBOSE_LEVEL=0
             shift 1
             ;;
+        "--ci")
+            CORE_FROM_CI=1
+            shift 1
+            ;;
         "--artifact-dir"|"-d")
             ARTIFACT_DIR=$2
+            shift 2
+            ;;
+        "--scylla-package-url"|"-p")
+            PACKAGE_URL=$2
             shift 2
             ;;
         "--scylla-s3-reloc-server-url"|"-u")
@@ -212,36 +238,39 @@ case "${SCYLLA_GDB_PY_SOURCE}" in
         ;;
 esac
 
-BUILD_ID="${SCYLLA_BUILD_ID}"
-if [[ -z "${BUILD_ID}" ]]; then
-    BUILD_ID=$(eu-unstrip -n --core ${COREFILE} | grep 'scylla$' | cut -f2 -d' ' | cut -f1 -d@)
-fi
-
-log "Build id: ${BUILD_ID}"
-
-BUILD=$(curl -s -X GET "${SCYLLA_S3_RELOC_SERVER_URL}/build.json?build_id=${BUILD_ID}")
-
-if [[ -z "$BUILD" ]]
+if [[ -z "${PACKAGE_URL}" ]]
 then
-    echo "error: failed to retrieve build information from ${SCYLLA_S3_RELOC_SERVER_URL}" >&2
-    exit 1
+    BUILD_ID="${SCYLLA_BUILD_ID}"
+    if [[ -z "${BUILD_ID}" ]]; then
+        BUILD_ID=$(eu-unstrip -n --core ${COREFILE} | grep 'scylla$' | cut -f2 -d' ' | cut -f1 -d@)
+    fi
+
+    log "Build id: ${BUILD_ID}"
+
+    BUILD=$(curl -s -X GET "${SCYLLA_S3_RELOC_SERVER_URL}/build.json?build_id=${BUILD_ID}")
+
+    if [[ -z "$BUILD" ]]
+    then
+        echo "error: failed to retrieve build information from ${SCYLLA_S3_RELOC_SERVER_URL}" >&2
+        exit 1
+    fi
+
+    RESPONSE_BUILD_ID=$(get_json_field "$BUILD" "build_id")
+    VERSION=$(get_json_field "$BUILD" "version")
+    PRODUCT=$(get_json_field "$BUILD" "product")
+    RELEASE=$(get_json_field "$BUILD" "release")
+    ARCH=$(get_json_field "$BUILD" "arch")
+    BUILD_MODE=$(get_json_field "$BUILD" "build_mode")
+    PACKAGE_URL=$(get_json_field "$BUILD" "package_url" 1)
+
+    if [[ "$RESPONSE_BUILD_ID" != "$BUILD_ID" ]]
+    then
+        echo "error: mismatching build id: requested ${BUILD_ID} but got ${RESPONSE_BUILD_ID}" >&2
+        exit 1
+    fi
+
+    log "Matching build is ${PRODUCT}-${VERSION} ${RELEASE} ${BUILD_MODE}-${ARCH}"
 fi
-
-RESPONSE_BUILD_ID=$(get_json_field "$BUILD" "build_id")
-VERSION=$(get_json_field "$BUILD" "version")
-PRODUCT=$(get_json_field "$BUILD" "product")
-RELEASE=$(get_json_field "$BUILD" "release")
-ARCH=$(get_json_field "$BUILD" "arch")
-BUILD_MODE=$(get_json_field "$BUILD" "build_mode")
-PACKAGE_URL=$(get_json_field "$BUILD" "package_url" 1)
-
-if [[ "$RESPONSE_BUILD_ID" != "$BUILD_ID" ]]
-then
-    echo "error: mismatching build id: requested ${BUILD_ID} but got ${RESPONSE_BUILD_ID}" >&2
-    exit 1
-fi
-
-log "Matching build is ${PRODUCT}-${VERSION} ${RELEASE} ${BUILD_MODE}-${ARCH}"
 
 if ! [[ -d ${ARTIFACT_DIR}/scylla.package ]]
 then
@@ -256,7 +285,7 @@ then
     if ! [[ -f ${ARTIFACT_DIR}/${PACKAGE_FILE} ]]
     then
         log "Downloading relocatable package from ${PACKAGE_URL}"
-        curl ${CURL_QUIET_FLAG} --output ${ARTIFACT_DIR}/${PACKAGE_FILE} ${PACKAGE_URL}
+        curl -L ${CURL_QUIET_FLAG} --output ${ARTIFACT_DIR}/${PACKAGE_FILE} ${PACKAGE_URL}
     else
         log "Relocatable package ${PACKAGE_URL} already downloaded"
     fi
@@ -270,10 +299,30 @@ else
     log "Relocatable package ${PACKAGE_URL} already downloaded and extracted"
 fi
 
+# If the package was provided directly we bypassed talking to the S3 server and
+# the version metadata has to be loaded from the package itself.
+if [[ -z "$VERSION" ]]
+then
+    VERSION=$(cat ${ARTIFACT_DIR}/scylla.package/SCYLLA-VERSION-FILE)
+    PRODUCT=$(cat ${ARTIFACT_DIR}/scylla.package/SCYLLA-PRODUCT-FILE)
+    RELEASE=$(cat ${ARTIFACT_DIR}/scylla.package/SCYLLA-RELEASE-FILE)
+fi
+
+if [[ "${PRODUCT}" == "scylla-enterprise" ]]
+then
+    MAIN_BRANCH=enterprise
+else
+    MAIN_BRANCH=master
+fi
+
 COMMIT_HASH=$(cut -f3 -d. <<< $RELEASE)
+if [ $CORE_FROM_CI -eq 1 ]
+then
+    COMMIT_HASH=${MAIN_BRANCH}
+fi
 if [ "$(grep -o ~dev <<< $VERSION)" == "~dev" ]
 then
-    BRANCH=master
+    BRANCH=${MAIN_BRANCH}
 else
     BASE_VERSION=$(grep -o "^[0-9]\+\.[0-9]\+" <<< $VERSION)
     BRANCH=branch-${BASE_VERSION}
@@ -302,13 +351,6 @@ if ! [[ -f ${COREDIR}/scylla-gdb.py ]]
 then
     if [[ "${SCYLLA_GDB_PY_SOURCE}" == "repo" ]]
     then
-        if [[ "${PRODUCT}" == "scylla-enterprise" ]]
-        then
-            MAIN_BRANCH=enterprise
-        else
-            MAIN_BRANCH=master
-        fi
-
         WORKDIR=$(pwd)
         cd ${SCYLLA_REPO_PATH}
         git checkout -q $MAIN_BRANCH

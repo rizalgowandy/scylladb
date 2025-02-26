@@ -15,22 +15,11 @@ number of requests per second you'll need - or at an extra cost not even
 provision that - Scylla requires you to provision your cluster. You need
 to reason about the number and size of your nodes - not the throughput.
 
-When creating a table, the BillingMode and ProvisionedThroughput options
-are ignored by Scylla. Tables default to a Billing mode of `PAY_PER_REQUEST`
-and `DescribeTable` API calls will return a value of 0 for the RCUs, WCUs
-and NumberOfDecreasesToday within the response.
-
-## Scan ordering
-
-In DynamoDB, the Hash key (or partition key) determines where the item will
-be stored within DynamoDB's internal storage. Another notable difference between
-DynamoDB and Scylla comes down to the underlying hashing algorithm.
-While DynamoDB uses a proprietary hashing function, ScyllaDB implements the well-known
-[Murmur3](https://docs.scylladb.com/stable/glossary.html#term-Partitioner) algorithm.
-
-Even though regular users should not typically care about the underlying
-implementation details, particularly such difference causes Scan operations
-to return results in a different order between DynamoDB and Alternator.
+Moreover, DynamoDB's per-table provisioning (`BillingMode=PROVISIONED`) is
+not yet supported by Scylla. The BillingMode and ProvisionedThroughput options
+on a table need to be valid but are ignored, and Scylla behaves like DynamoDB's
+`BillingMode=PAY_PER_REQUEST`: All requests are accepted without a per-table
+throughput cap.
 
 ## Load balancing
 
@@ -45,7 +34,7 @@ Instructions for doing this can be found in:
 ## Write isolation policies
 
 Scylla was designed to optimize the performance of pure write operations -
-writes which do not need to read the the previous value of the item.
+writes which do not need to read the previous value of the item.
 In CQL, writes which do need the previous value of the item must explicitly
 use the slower LWT ("LightWeight Transaction") feature to be correctly
 isolated from each other. It is not allowed to mix LWT and non-LWT writes
@@ -63,10 +52,11 @@ it could use LWT only for the read-modify-write operations.
 Therefore, Alternator must be explicitly configured to tell it which of the
 above assumptions it may make on the write workload. This configuration is
 mandatory, and described in the "Write isolation policies" section of
-alternator.md. One of the options, `always_use_lwt`, is always safe, but the
-other options result in significantly better write performance and should be
-considered when the workload involves pure writes (e.g., ingestion of new
-data) or if pure writes and read-modify-writes go to distinct items.
+[Alternator-specific APIs](new-apis.md). One of the options, `always_use_lwt`,
+is always safe, but the other options result in significantly better write
+performance and should be considered when the workload involves pure writes
+(e.g., ingestion of new data) or if pure writes and read-modify-writes go
+to distinct items.
 
 ## Avoiding write reordering
 
@@ -99,16 +89,25 @@ one or more of the following:
 3. Consider using the `always_use_lwt` write isolation policy.
    It is slower, but has better guarantees.
 
-Another guarantee that that `always_use_lwt` can make and other write
+Another guarantee that `always_use_lwt` can make and other write
 isolation modes do not is that writes to the same item are _serialized_:
 Even if the two write are sent at exactly the same time to two different
 nodes, the result will appear as if one write happened first, and then
 the other. But in other modes (with non-LWT writes), two writes can get
-exactly the same microsecond-resolution timestamp, the the result may be
+exactly the same microsecond-resolution timestamp, the result may be
 a mixture of both writes - some attributes from one and some from the
 other - instead of being just one or the other.
 
-## Authorization
+## Authentication and Authorization
+
+By default, Alternator does not enforce authentication or authorization,
+and any request from any connected client will be allowed. To enforce
+client authentication, and authorization of which client is allowed
+to do what, configure the following in ScyllaDB's configuration:
+
+```
+    alternator_enforce_authorization: true
+```
 
 Alternator implements the same [signature protocol](https://docs.aws.amazon.com/general/latest/gr/signature-version-4.html)
 as DynamoDB and the rest of AWS. Clients use, as usual, an access key ID and
@@ -116,24 +115,80 @@ a secret access key to prove their identity and the authenticity of their
 request. Alternator can then validate the authenticity and authorization of
 each request using a known list of authorized key pairs.
 
-In the current implementation, the user stores the list of allowed key pairs
-in the `system_auth.roles` table: The access key ID is the `role` column, and
-the secret key is the `salted_hash`, i.e., the secret key can be found by
-`SELECT salted_hash from system_auth.roles WHERE role = ID;`.
+To create a user for authentication, use the CQL "CREATE ROLE" command.
+When a client signs a request, it uses the name of this role as the access
+key ID, and the _salted hash_ of the role's password is the secret key.
+This secret key for role XYZ can be retrieved by the CQL request
+`SELECT salted_hash from system.roles WHERE role = XYZ;`.
 
-By default, authorization is not enforced at all. It can be turned on
-by providing an entry in Scylla configuration:
-    `alternator_enforce_authorization: true`
+Alternator also implements authorization, or _access control_ - defining
+which authenticated user is allowed to do which operation, such as reading
+or writing to a specific table. The way this is supported in Alternator is
+currently _not_ compatible with DynamoDB's APIs (IAM or PutResourcePolicy).
+Instead, one needs to grant permissions to specific roles using CQL, with
+the `GRANT` command. For example, an Alternator table "xyz" is visible to
+CQL as `alternator_xyz.xyz`, and the following command will allow requests
+from user "myrole" to read this table (with GetItem and other read operations):
+`GRANT SELECT ON alternator_xyz.xyz TO myrole`. Refer to the CQL documentation
+on how to use GRANT and REVOKE to control permissions:
+<https://docs.scylladb.com/stable/operating-scylla/security/authorization.html>
 
-Although Alternator implements DynamoDB's authentication, including the
-possibility of listing multiple allowed key pairs, there is currently no
-implementation of _access control_. All authenticated key pairs currently get
-full access to the entire database. This is in contrast with DynamoDB which
-supports fine-grain access controls via "IAM policies" - which give each
-authenticated user access to a different subset of the tables, different
-allowed operations, and even different permissions for individual items.
-All of this is not yet implemented in Alternator.
-See <https://github.com/scylladb/scylla/issues/5047>.
+The following permissions are needed to run the following API operations:
+
+ * `SELECT`:      GetItem, Query, Scan, BatchGetItem, GetRecords
+ * `MODIFY`:      PutItem, DeleteItem, UpdateItem, BatchWriteItem
+ * `CREATE`:      CreateTable
+ * `DROP`:        DeleteTable
+ * `ALTER`:       UpdateTable, TagResource, UntagResource, UpdateTimeToLive
+ * _none needed_: ListTables, DescribeTable, DescribeEndpoints,
+                  ListTagsOfResource, DescribeTimeToLive,
+                  DescribeContinuousBackups, ListStreams, DescribeStream,
+                  GetShardIterator
+
+Note that the required permissions depend on the type of operation, not on
+what it does. For example, even though the PutItem operation can read the
+value of an item (when used with `ReturnValues=ALL_OLD`), it still requires
+the MODIFY permission, not the SELECT permission.
+
+Permissions are separate for a base table and each of its GSI/LSI and CDC
+log, so it's possible to give a role permissions to read one index and
+not the base, or vice versa, and so on. To build the GRANT command, you
+need to know the CQL name of each of these objects. For example, the CQL
+name of GSI "abc" of Alternator table "xyz" is `alternator_xyz.xyz:abc`.
+If you don't know the name of the table, you can try a forbidden operation
+and the AccessDeniedException error will contain the name of the table
+that was lacking permissions.
+
+## Workload Isolation
+
+In DynamoDB read/write capacity of each table can be defined either to a fixed
+value (provisioned mode) or to be adaptive (on-demand). On top of that requests
+are also subject to per table and per account quotas.
+
+Due to the nature of Alternator deployment the whole cluster is available to serve
+user requests and underlying hardware can be utilized to its full capacity. When
+there is a need to allow more resources to given workload on the expense of some competing
+one we offer feature called **Workload Prioritization**.
+
+To use this feature define service level with a fixed amount of shares
+(higher value means proportionally more capacity) and attach it to a role
+which then will be used to authorize requests. This can be currently done
+only via CQL API, here is an example on how to do that:
+```cql
+CREATE ROLE alice WITH PASSWORD = 'abcd' AND LOGIN = true;
+CREATE ROLE bob WITH PASSWORD = 'abcd' AND LOGIN = true;
+
+CREATE SERVICE_LEVEL IF NOT EXISTS olap WITH SHARES = 100;
+CREATE SERVICE_LEVEL IF NOT EXISTS oltp WITH SHARES = 1000;
+
+ATTACH SERVICE_LEVEL olap TO alice;
+ATTACH SERVICE_LEVEL oltp TO bob;
+```
+Note that `alternator_enforce_authorization` has to be enabled in Scylla configuration.
+
+See [Authorization](##Authorization) section to learn more about roles and authorization.
+See [Workload Prioritization](../features/workload-prioritization)
+to read about Workload Prioritization in detail.
 
 ## Metrics
 
@@ -161,9 +216,18 @@ events appear in the Streams API as normal deletions - without the
 distinctive marker on deletions which are really expirations.
 See <https://github.com/scylladb/scylla/issues/5060>.
 
-<!--- REMOVE IN FUTURE VERSIONS - Remove the note below in version 5.3/2023.1 -->
+## Scan ordering
 
-> **Note** This feature is experimental in versions earlier than ScyllaDB Open Source 5.2 and ScyllaDB Enterprise 2022.2.
+In DynamoDB, scanning the _entire_ table returns the partitions sorted by
+some undocumented hash function of the partition key - which is why this key
+is also sometimes called the _hash key_. Alternator uses a different hash
+function, Cassandra's variant of the 128-bit Mumur3 hash function.
+So `Scan`ing the same data on DynamoDB and Alternator will return the same
+data in different partition order. Applications mustn't rely on that
+undocumented order.
+
+Note that inside each partition, the individual items will be sorted the same
+in DynamoDB and Scylla - determined by the _sort key_ defined for that table.
 
 ---
 
@@ -178,7 +242,7 @@ feature's implementation is still subject to change and upgrades may not be
 possible if such a feature is used. For these reasons, experimental features
 are not recommended for mission-critical uses, and they need to be
 individually enabled with the "--experimental-features" configuration option.
-See [Enabling Experimental Features](/operating-scylla/admin#enabling-experimental-features) for details.
+See [Enabling Experimental Features](../operating-scylla/admin.rst#enabling-experimental-features) for details.
 
 In this release, the following DynamoDB API features are considered
 experimental:
@@ -207,12 +271,6 @@ In general, every DynamoDB API feature available in Amazon DynamoDB should
 behave the same in Alternator. However, there are a few features which we have
 not implemented yet. Unimplemented features return an error when used, so
 they should be easy to detect. Here is a list of these unimplemented features:
-
-* Currently in Alternator, a GSI (Global Secondary Index) can only be added
-  to a table at table creation time. DynamoDB allows adding a GSI (but not an
-  LSI) to an existing table using an UpdateTable operation, and similarly it
-  allows removing a GSI from a table.
-  <https://github.com/scylladb/scylla/issues/11567>
 
 * GSI (Global Secondary Index) and LSI (Local Secondary Index) may be
   configured to project only a subset of the base-table attributes to the
@@ -255,7 +313,7 @@ they should be easy to detect. Here is a list of these unimplemented features:
   RestoreTableToPointInTime
 
 * DynamoDB's encryption-at-rest settings are not supported. The Encryption-
-  at-rest feature is available in Scylla Enterprise, but needs to be
+  at-rest feature is available in ScyllaDB, but needs to be
   enabled and configured separately, not through the DynamoDB API.
 
 * No support for throughput accounting or capping. As mentioned above, the
@@ -270,7 +328,7 @@ they should be easy to detect. Here is a list of these unimplemented features:
   another cache in front of the it. We wrote more about this here:
   <https://www.scylladb.com/2017/07/31/database-caches-not-good/>
 
-* The DescribeTable is missing information about creation data and size
+* The DescribeTable is missing information about creation date and size
   estimates, and also part of the information about indexes enabled on 
   the table.
   <https://github.com/scylladb/scylla/issues/5013>
@@ -314,3 +372,14 @@ they should be easy to detect. Here is a list of these unimplemented features:
   that can be used to forbid table deletion. This table option was added to
   DynamoDB in March 2023.
   <https://github.com/scylladb/scylla/issues/14482>
+
+* Alternator does not support the table option WarmThroughput that can be
+  used to check or guarantee that the database has "warmed" to handle a
+  particular throughput. This table option was added to DynamoDB in
+  November 2024.
+  <https://github.com/scylladb/scylladb/issues/21853>
+
+* Alternator does not support the table option MultiRegionConsistency
+  that can be used to achieve consistent reads on global (multi-region) tables.
+  This table option was added as a preview to DynamoDB in December 2024.
+  <https://github.com/scylladb/scylladb/issues/21852>

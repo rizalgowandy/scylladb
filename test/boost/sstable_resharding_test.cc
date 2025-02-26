@@ -1,4 +1,5 @@
 #include <boost/test/unit_test.hpp>
+#include <fmt/ranges.h>
 #include <memory>
 #include <utility>
 
@@ -12,7 +13,7 @@
 #include "replica/database.hh"
 #include "compaction/compaction_manager.hh"
 #include "test/boost/sstable_test.hh"
-#include "test/lib/flat_mutation_reader_assertions.hh"
+#include "test/lib/mutation_reader_assertions.hh"
 #include "test/lib/key_utils.hh"
 #include "test/lib/sstable_utils.hh"
 #include "test/lib/test_services.hh"
@@ -48,7 +49,7 @@ void run_sstable_resharding_test(sstables::test_env& env) {
     auto s = get_schema();
     auto cf = env.make_table_for_tests(s);
     auto close_cf = deferred_stop(cf);
-    auto sst_gen = cf.make_sst_factory(version);
+    auto sst_gen = env.make_sst_factory(s, version);
     std::unordered_map<shard_id, std::vector<mutation>> muts;
     static constexpr auto keys_per_shard = 1000u;
 
@@ -61,24 +62,24 @@ void run_sstable_resharding_test(sstables::test_env& env) {
             return m;
         };
         auto cfg = std::make_unique<db::config>();
-        for (auto i : boost::irange(0u, smp::count)) {
+        for (auto i : std::views::iota(0u, smp::count)) {
             const auto keys = tests::generate_partition_keys(keys_per_shard, s, i);
             BOOST_REQUIRE(keys.size() == keys_per_shard);
             muts[i].reserve(keys_per_shard);
-            for (auto k : boost::irange(0u, keys_per_shard)) {
+            for (auto k : std::views::iota(0u, keys_per_shard)) {
                 auto m = get_mutation(keys[k], i);
                 muts[i].push_back(m);
                 mt->apply(std::move(m));
             }
         }
-        return make_sstable_containing(cf.make_sstable(version), mt);
+        return make_sstable_containing(env.make_sstable(s, version), mt);
     });
 
     // FIXME: sstable write has a limitation in which it will generate sharding metadata only
     // for a single shard. workaround that by setting shards manually. from this test perspective,
     // it doesn't matter because we check each partition individually of each sstable created
     // for a shard that owns the shared input sstable.
-    sstables::test(sst).set_shards(boost::copy_range<std::vector<unsigned>>(boost::irange(0u, smp::count)));
+    sstables::test(sst).set_shards(std::views::iota(0u, smp::count) | std::ranges::to<std::vector<unsigned>>());
 
     auto filter_size = [&env] (shared_sstable sst) -> uint64_t {
         if (!env.get_storage_options().is_local_type()) {
@@ -87,7 +88,7 @@ void run_sstable_resharding_test(sstables::test_env& env) {
         }
 
         auto filter_fname = sstables::test(sst).filename(component_type::Filter);
-        return file_size(filter_fname.native()).get0();
+        return file_size(filter_fname.native()).get();
     };
 
     uint64_t bloom_filter_size_before = filter_size(sst);
@@ -102,13 +103,13 @@ void run_sstable_resharding_test(sstables::test_env& env) {
         // or resource usage wouldn't be fairly distributed among shards.
         auto gen = smp::submit_to(shard, [&cf] () {
             return column_family_test::calculate_generation_for_new_table(*cf);
-        }).get0();
+        }).get();
 
         return env.make_sstable(cf->schema(), gen, version);
     };
     auto cdata = compaction_manager::create_compaction_data();
     compaction_progress_monitor progress_monitor;
-    auto res = sstables::compact_sstables(std::move(descriptor), cdata, cf.as_table_state(), progress_monitor).get0();
+    auto res = sstables::compact_sstables(std::move(descriptor), cdata, cf.as_table_state(), progress_monitor).get();
     sst->destroy().get();
 
     auto new_sstables = std::move(res.new_sstables);
@@ -118,7 +119,7 @@ void run_sstable_resharding_test(sstables::test_env& env) {
     std::unordered_set<shard_id> processed_shards;
 
     for (auto& sstable : new_sstables) {
-        auto new_sst = env.reusable_sst(s, sstable->generation(), version).get0();
+        auto new_sst = env.reusable_sst(s, sstable->generation(), version).get();
         bloom_filter_size_after += filter_size(new_sst);
         auto shards = new_sst->get_shards_for_this_sstable();
         BOOST_REQUIRE(shards.size() == 1); // check sstable is unshared.
@@ -128,7 +129,7 @@ void run_sstable_resharding_test(sstables::test_env& env) {
 
         auto rd = assert_that(new_sst->as_mutation_source().make_reader_v2(s, env.make_reader_permit()));
         BOOST_REQUIRE(muts[shard].size() == keys_per_shard);
-        for (auto k : boost::irange(0u, keys_per_shard)) {
+        for (auto k : std::views::iota(0u, keys_per_shard)) {
             rd.produces(muts[shard][k]);
         }
         rd.produces_end_of_stream();
@@ -188,7 +189,7 @@ SEASTAR_TEST_CASE(sstable_is_shared_correctness) {
             auto sst_gen = env.make_sst_factory(single_sharded_s, version);
 
             std::vector<mutation> muts;
-            for (shard_id shard : boost::irange(0u, smp::count)) {
+            for (shard_id shard : std::views::iota(0u, smp::count)) {
                 const auto keys = tests::generate_partition_keys(10, key_s, shard);
                 for (auto& k : keys) {
                     muts.push_back(get_mutation(single_sharded_s, k, shard));
@@ -199,7 +200,7 @@ SEASTAR_TEST_CASE(sstable_is_shared_correctness) {
             BOOST_REQUIRE(!sst->is_shared());
 
             auto all_shards_s = get_schema(smp::count, cfg->murmur3_partitioner_ignore_msb_bits());
-            sst = env.reusable_sst(all_shards_s, sst->generation(), version).get0();
+            sst = env.reusable_sst(all_shards_s, sst->generation(), version).get();
             BOOST_REQUIRE(smp::count == 1 || sst->is_shared());
             BOOST_REQUIRE(sst->get_shards_for_this_sstable().size() == smp::count);
             assert_sstable_computes_correct_owners(env, sst).get();

@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "messaging_service.hh"
@@ -11,8 +11,7 @@
 #include <seastar/rpc/rpc_types.hh>
 #include "api/api-doc/messaging_service.json.hh"
 #include "api/api-doc/error_injection.json.hh"
-#include <iostream>
-#include <sstream>
+#include "api/api.hh"
 
 using namespace seastar::httpd;
 using namespace httpd::messaging_service_json;
@@ -115,7 +114,7 @@ void set_messaging_service(http_context& ctx, routes& r, sharded<netw::messaging
     }));
 
     get_version.set(r, [&ms](const_req req) {
-        return ms.local().get_raw_version(req.get_query_param("addr"));
+        return ms.local().current_version;
     });
 
     get_dropped_messages_by_ver.set(r, [&ms](std::unique_ptr<request> req) {
@@ -147,7 +146,7 @@ void set_messaging_service(http_context& ctx, routes& r, sharded<netw::messaging
     });
 
     hf::inject_disconnect.set(r, [&ms] (std::unique_ptr<request> req) -> future<json::json_return_type> {
-        auto ip = msg_addr(req->param["ip"]);
+        auto ip = msg_addr(req->get_path_param("ip"));
         co_await ms.invoke_on_all([ip] (netw::messaging_service& ms) {
             ms.remove_rpc_client(ip);
         });

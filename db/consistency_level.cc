@@ -5,20 +5,18 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "db/consistency_level.hh"
 #include "db/consistency_level_validations.hh"
 
-#include <boost/range/algorithm/stable_partition.hpp>
-#include <boost/range/algorithm/find.hpp>
-#include <boost/range/algorithm/transform.hpp>
 #include "exceptions/exceptions.hh"
+#include <fmt/ranges.h>
 #include <seastar/core/sstring.hh>
+#include "locator/host_id.hh"
 #include "schema/schema.hh"
 #include "replica/database.hh"
-#include "unimplemented.hh"
 #include "db/read_repair_decision.hh"
 #include "locator/abstract_replication_strategy.hh"
 #include "locator/network_topology_strategy.hh"
@@ -36,7 +34,7 @@ size_t quorum_for(const locator::effective_replication_map& erm) {
 size_t local_quorum_for(const locator::effective_replication_map& erm, const sstring& dc) {
     using namespace locator;
 
-    auto& rs = erm.get_replication_strategy();
+    const auto& rs = erm.get_replication_strategy();
 
     if (rs.get_type() == replication_strategy_type::network_topology) {
         const network_topology_strategy* nrs =
@@ -65,7 +63,7 @@ size_t block_for_local_serial(const locator::effective_replication_map& erm) {
 size_t block_for_each_quorum(const locator::effective_replication_map& erm) {
     using namespace locator;
 
-    auto& rs = erm.get_replication_strategy();
+    const auto& rs = erm.get_replication_strategy();
 
     if (rs.get_type() == replication_strategy_type::network_topology) {
         const network_topology_strategy* nrs =
@@ -115,11 +113,10 @@ bool is_datacenter_local(consistency_level l) {
     return l == consistency_level::LOCAL_ONE || l == consistency_level::LOCAL_QUORUM;
 }
 
-template <typename Range, typename PendingRange = std::array<gms::inet_address, 0>>
 std::unordered_map<sstring, dc_node_count> count_per_dc_endpoints(
         const locator::effective_replication_map& erm,
-        const Range& live_endpoints,
-        const PendingRange& pending_endpoints = std::array<gms::inet_address, 0>()) {
+        const host_id_vector_replica_set& live_endpoints,
+        const host_id_vector_topology_change& pending_endpoints = host_id_vector_topology_change()) {
     using namespace locator;
 
     auto& rs = erm.get_replication_strategy();
@@ -150,12 +147,11 @@ std::unordered_map<sstring, dc_node_count> count_per_dc_endpoints(
     return dc_endpoints;
 }
 
-template<typename Range, typename PendingRange>
 bool assure_sufficient_live_nodes_each_quorum(
         consistency_level cl,
         const locator::effective_replication_map& erm,
-        const Range& live_endpoints,
-        const PendingRange& pending_endpoints) {
+        const host_id_vector_replica_set& live_endpoints,
+        const host_id_vector_topology_change& pending_endpoints) {
     using namespace locator;
 
     auto& rs = erm.get_replication_strategy();
@@ -177,12 +173,11 @@ bool assure_sufficient_live_nodes_each_quorum(
     return false;
 }
 
-template<typename Range, typename PendingRange>
 void assure_sufficient_live_nodes(
         consistency_level cl,
         const locator::effective_replication_map& erm,
-        const Range& live_endpoints,
-        const PendingRange& pending_endpoints) {
+        const host_id_vector_replica_set& live_endpoints,
+        const host_id_vector_topology_change& pending_endpoints) {
     size_t need = block_for(erm, cl);
 
     auto adjust_live_for_error = [] (size_t live, size_t pending) {
@@ -230,17 +225,14 @@ void assure_sufficient_live_nodes(
     }
 }
 
-template void assure_sufficient_live_nodes(consistency_level, const locator::effective_replication_map&, const inet_address_vector_replica_set&, const std::array<gms::inet_address, 0>&);
-template void assure_sufficient_live_nodes(db::consistency_level, const locator::effective_replication_map&, const inet_address_vector_replica_set&, const utils::small_vector<gms::inet_address, 1ul>&);
-
-inet_address_vector_replica_set
+host_id_vector_replica_set
 filter_for_query(consistency_level cl,
                  const locator::effective_replication_map& erm,
-                 inet_address_vector_replica_set live_endpoints,
-                 const inet_address_vector_replica_set& preferred_endpoints,
+                 host_id_vector_replica_set live_endpoints,
+                 const host_id_vector_replica_set& preferred_endpoints,
                  read_repair_decision read_repair,
                  const gms::gossiper& g,
-                 std::optional<gms::inet_address>* extra,
+                 std::optional<locator::host_id>* extra,
                  replica::column_family* cf) {
     size_t local_count;
 
@@ -250,49 +242,49 @@ filter_for_query(consistency_level cl,
 
     if (read_repair == read_repair_decision::DC_LOCAL || is_datacenter_local(cl)) {
         const auto& topo = erm.get_topology();
-        auto it = boost::range::stable_partition(live_endpoints, topo.get_local_dc_filter());
-        local_count = std::distance(live_endpoints.begin(), it);
+        auto non_local_endpoints = std::ranges::stable_partition(live_endpoints, topo.get_local_dc_filter());
+        local_count = std::distance(live_endpoints.begin(), non_local_endpoints.begin());
         if (is_datacenter_local(cl)) {
-            live_endpoints.erase(it, live_endpoints.end());
+            live_endpoints.erase(non_local_endpoints.begin(), non_local_endpoints.end());
         }
     }
 
     size_t bf = block_for(erm, cl);
 
     if (read_repair == read_repair_decision::DC_LOCAL) {
-        bf = std::max(block_for(erm, cl), local_count);
+        bf = std::max(bf, local_count);
     }
 
     if (bf >= live_endpoints.size()) { // RRD.DC_LOCAL + CL.LOCAL or CL.ALL
         return live_endpoints;
     }
 
-    inet_address_vector_replica_set selected_endpoints;
+    host_id_vector_replica_set selected_endpoints;
 
     // Pre-select endpoints based on client preference. If the endpoints
     // selected this way aren't enough to satisfy CL requirements select the
     // remaining ones according to the load-balancing strategy as before.
     if (!preferred_endpoints.empty()) {
-        const auto it = boost::stable_partition(live_endpoints, [&preferred_endpoints] (const gms::inet_address& a) {
+        const auto preferred = std::ranges::stable_partition(live_endpoints, [&preferred_endpoints] (const locator::host_id& a) {
             return std::find(preferred_endpoints.cbegin(), preferred_endpoints.cend(), a) == preferred_endpoints.end();
         });
-        const size_t selected = std::distance(it, live_endpoints.end());
+        const size_t selected = std::ranges::distance(preferred);
         if (selected >= bf) {
              if (extra) {
-                 *extra = selected == bf ? live_endpoints.front() : *(it + bf);
+                 *extra = selected == bf ? live_endpoints.front() : *(preferred.begin() + bf);
              }
-             return inet_address_vector_replica_set(it, it + bf);
+             return host_id_vector_replica_set(preferred.begin(), preferred.begin() + bf);
         } else if (selected) {
              selected_endpoints.reserve(bf);
-             std::move(it, live_endpoints.end(), std::back_inserter(selected_endpoints));
-             live_endpoints.erase(it, live_endpoints.end());
+             std::ranges::move(preferred, std::back_inserter(selected_endpoints));
+             live_endpoints.erase(preferred.begin(), preferred.end());
         }
     }
 
     const auto remaining_bf = bf - selected_endpoints.size();
 
     if (cf) {
-        auto get_hit_rate = [&g, cf] (gms::inet_address ep) -> float {
+        auto get_hit_rate = [&g, cf] (locator::host_id ep) -> float {
             // We limit each nodes' cache-hit ratio to max_hit_rate = 0.95
             // for two reasons:
             // 1. If two nodes have hit rate 0.99 and 0.98, the miss rates
@@ -306,6 +298,7 @@ filter_for_query(consistency_level cl,
             //    its miss rate is 0.05, 1/20th of the worst miss rate 1.0,
             //    so the cold node will get 1/20th the work of the hot.
             constexpr float max_hit_rate = 0.95;
+            // FIXME: all functions here should work on host ids
             auto ht = cf->get_hit_rate(g, ep);
             if (float(ht.rate) < 0) {
                 return float(ht.rate);
@@ -323,18 +316,24 @@ filter_for_query(consistency_level cl,
         float ht_min = 1;
         bool old_node = false;
 
-        auto epi = boost::copy_range<std::vector<std::pair<gms::inet_address, float>>>(live_endpoints | boost::adaptors::transformed([&] (gms::inet_address ep) {
+        auto epi = live_endpoints | std::views::transform([&] (locator::host_id ep) {
             auto ht = get_hit_rate(ep);
             old_node = old_node || ht < 0;
             ht_max = std::max(ht_max, ht);
             ht_min = std::min(ht_min, ht);
             return std::make_pair(ep, ht);
-        }));
+        }) | std::ranges::to<std::vector<std::pair<locator::host_id, float>>>();
 
         if (!old_node && ht_max - ht_min > 0.01) { // if there is old node or hit rates are close skip calculations
             // local node is always first if present (see storage_proxy::get_endpoints_for_reading)
             unsigned local_idx = erm.get_topology().is_me(epi[0].first) ? 0 : epi.size() + 1;
-            live_endpoints = boost::copy_range<inet_address_vector_replica_set>(miss_equalizing_combination(epi, local_idx, remaining_bf, bool(extra)));
+            auto weighted = miss_equalizing_combination(epi, local_idx, remaining_bf, bool(extra)) | std::ranges::to<host_id_vector_replica_set>();
+            // Workaround for https://github.com/scylladb/scylladb/issues/9285
+            auto last = std::adjacent_find(weighted.begin(), weighted.end());
+            if (last == weighted.end()) {
+                // No duplicates, so use the result based on hit rates
+                live_endpoints = std::move(weighted);
+            }
         }
     }
 
@@ -350,7 +349,7 @@ filter_for_query(consistency_level cl,
 bool
 is_sufficient_live_nodes(consistency_level cl,
                          const locator::effective_replication_map& erm,
-                         const inet_address_vector_replica_set& live_endpoints) {
+                         const host_id_vector_replica_set& live_endpoints) {
     using namespace locator;
     const auto& topo = erm.get_topology();
 

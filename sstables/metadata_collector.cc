@@ -3,10 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include "log.hh"
+#include "utils/log.hh"
 #include "metadata_collector.hh"
 #include "mutation/position_in_partition.hh"
 

@@ -3,11 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "db/view/view_update_backlog.hh"
+#include <seastar/core/timed_out_error.hh>
+#include "gms/inet_address.hh"
 #include <seastar/util/defer.hh>
-#include <boost/range/adaptor/map.hpp>
 #include "replica/database.hh"
 #include "view_update_generator.hh"
 #include "utils/error_injection.hh"
@@ -17,6 +19,9 @@
 #include "readers/evictable.hh"
 #include "dht/partition_filter.hh"
 #include "utils/pretty_printers.hh"
+#include "readers/from_mutations_v2.hh"
+#include "service/storage_proxy.hh"
+#include "db/config.hh"
 
 static logging::logger vug_logger("view_update_generator");
 
@@ -86,7 +91,7 @@ public:
 
     uint64_t sstables_pending_work() const noexcept {
         return _inactive_pending_work +
-            boost::accumulate(_monitors | boost::adaptors::map_values | boost::adaptors::transformed(std::mem_fn(&read_monitor::pending_work)), uint64_t(0));
+            std::ranges::fold_left(_monitors | std::views::values | std::views::transform(std::mem_fn(&read_monitor::pending_work)), uint64_t(0), std::plus());
     }
 };
 
@@ -104,9 +109,7 @@ view_update_generator::view_update_generator(replica::database& db, sharded<serv
 view_update_generator::~view_update_generator() {}
 
 future<> view_update_generator::start() {
-    thread_attributes attr;
-    attr.sched_group = _db.get_streaming_scheduling_group();
-    _started = seastar::async(std::move(attr), [this]() mutable {
+    _started = seastar::async([this]() mutable {
         auto drop_sstable_references = defer([&] () noexcept {
             // Clear sstable references so sstables_manager::stop() doesn't hang.
             vug_logger.info("leaving {} unstaged sstables unprocessed",
@@ -147,7 +150,7 @@ future<> view_update_generator::start() {
                     vug_logger.info("Processing {}.{}: {} in {} sstables",
                                     s->ks_name(), s->cf_name(), utils::pretty_printed_data_size(input_size), sstables.size());
 
-                    auto permit = _db.obtain_reader_permit(*t, "view_update_generator", db::no_timeout, {}).get0();
+                    auto permit = _db.obtain_reader_permit(*t, "view_update_generator", db::no_timeout, {}).get();
                     auto ms = mutation_source([this, ssts] (
                                 schema_ptr s,
                                 reader_permit permit,
@@ -169,8 +172,7 @@ future<> view_update_generator::start() {
                     auto close_sr = deferred_close(staging_sstable_reader);
 
                     inject_failure("view_update_generator_consume_staging_sstable");
-                    auto result = staging_sstable_reader.consume_in_thread(view_updating_consumer(*this, s, std::move(permit), *t, sstables, _as, staging_sstable_reader_handle),
-                        dht::incremental_owned_ranges_checker::make_partition_filter(_db.get_keyspace_local_ranges(s->ks_name())));
+                    auto result = staging_sstable_reader.consume_in_thread(view_updating_consumer(*this, s, std::move(permit), *t, sstables, _as, staging_sstable_reader_handle));
                     if (result == stop_iteration::yes) {
                         break;
                     }
@@ -179,6 +181,8 @@ future<> view_update_generator::start() {
                     // Need to add sstables back to the set so we can retry later. By now it may
                     // have had other updates.
                     std::move(sstables.begin(), sstables.end(), std::back_inserter(_sstables_with_tables[t]));
+                    // Sleep a bit, to avoid a tight loop repeatedly spamming the log with the same message.
+                    seastar::sleep(std::chrono::seconds(1)).get();
                     break;
                 }
                 try {
@@ -236,6 +240,10 @@ void view_update_generator::do_abort() noexcept {
     vug_logger.info("Terminating background fiber");
     _as.request_abort();
     _pending_sstables.signal();
+}
+
+future<> view_update_generator::drain() {
+    return _proxy.local().abort_view_writes();
 }
 
 future<> view_update_generator::stop() {
@@ -301,6 +309,177 @@ void view_update_generator::discover_staging_sstables() {
             }
         }
     });
+}
+
+static size_t memory_usage_of(const utils::chunked_vector<frozen_mutation_and_schema>& ms) {
+    return std::ranges::fold_left(ms | std::views::transform([] (const frozen_mutation_and_schema& m) {
+        return memory_usage_of(m);
+    }), 0, std::plus{});
+}
+
+/**
+ * Given some updates on the base table and assuming there are no pre-existing, overlapping updates,
+ * generates the mutations to be applied to the base table's views, and sends them to the paired
+ * view replicas. The future resolves when the updates have been acknowledged by the repicas, i.e.,
+ * propagating the view updates to the view replicas happens synchronously.
+ *
+ * @param views the affected views which need to be updated.
+ * @param base_token The token to use to match the base replica with the paired replicas.
+ * @param reader the base table updates being applied, which all correspond to the base token.
+ * @return a future that resolves when the updates have been acknowledged by the view replicas
+ */
+future<> view_update_generator::populate_views(const replica::table& table,
+        std::vector<view_and_base> views,
+        dht::token base_token,
+        mutation_reader&& reader,
+        gc_clock::time_point now) {
+    auto schema = reader.schema();
+    view_update_builder builder = make_view_update_builder(
+            get_db().as_data_dictionary(),
+            table,
+            schema,
+            std::move(views),
+            std::move(reader),
+            { },
+            now);
+
+    std::exception_ptr err;
+    while (true) {
+        try {
+            auto updates = co_await builder.build_some();
+            if (!updates) {
+                break;
+            }
+            size_t update_size = memory_usage_of(*updates);
+            size_t units_to_wait_for = std::min(table.get_config().view_update_concurrency_semaphore_limit, update_size);
+            auto units = co_await seastar::get_units(_db.view_update_sem(), units_to_wait_for);
+            units.adopt(seastar::consume_units(_db.view_update_sem(), update_size - units_to_wait_for));
+            if (utils::get_local_injector().enter("view_building_failure")) {
+                co_await seastar::sleep(std::chrono::seconds(1));
+                err = std::make_exception_ptr(std::runtime_error("Timeout a view building update"));
+                continue;
+            }
+            co_await mutate_MV(schema, base_token, std::move(*updates), table.view_stats(), *table.cf_stats(),
+                    tracing::trace_state_ptr(), std::move(units), service::allow_hints::no, wait_for_all_updates::yes);
+        } catch (...) {
+            if (!err) {
+                err = std::current_exception();
+            }
+        }
+    }
+    co_await builder.close();
+    if (err) {
+        std::rethrow_exception(err);
+    }
+}
+
+
+// Generating view updates for a single client request can take a long time and might not finish before the timeout is
+// reached. In such case this exception is thrown.
+// "Generating a view update" means creating a view update and scheduling it to be sent later.
+// This exception isn't thrown if the sending timeouts, it's only concrened with generating.
+struct view_update_generation_timeout_exception : public seastar::timed_out_error {
+    const char* what() const noexcept override {
+        return "Request timed out - couldn't prepare materialized view updates in time";
+    }
+};
+
+/**
+ * Given some updates on the base table and the existing values for the rows affected by that update, generates the
+ * mutations to be applied to the base table's views, and sends them to the paired view replicas.
+ *
+ * @param base the base schema at a particular version.
+ * @param views the affected views which need to be updated.
+ * @param updates the base table updates being applied.
+ * @param existings the existing values for the rows affected by updates. This is used to decide if a view is
+ * @param now the current time, used to calculate the deletion time for tombstones
+ * @param timeout client request timeout
+ * obsoleted by the update and should be removed, gather the values for columns that may not be part of the update if
+ * a new view entry needs to be created, and compute the minimal updates to be applied if the view entry isn't changed
+ * but has simply some updated values.
+ * @return a future resolving to the mutations to apply to the views, which can be empty.
+ */
+future<> view_update_generator::generate_and_propagate_view_updates(const replica::table& table,
+        const schema_ptr& base,
+        reader_permit permit,
+        std::vector<view_and_base>&& views,
+        mutation&& m,
+        mutation_reader_opt existings,
+        tracing::trace_state_ptr tr_state,
+        gc_clock::time_point now,
+        db::timeout_clock::time_point timeout) {
+    auto base_token = m.token();
+    auto m_schema = m.schema();
+    view_update_builder builder = make_view_update_builder(
+            get_db().as_data_dictionary(),
+            table,
+            base,
+            std::move(views),
+            make_mutation_reader_from_mutations_v2(std::move(m_schema), std::move(permit), std::move(m)),
+            std::move(existings),
+            now);
+
+    std::exception_ptr err = nullptr;
+    for (size_t batch_num = 0; ; batch_num++) {
+        std::optional<utils::chunked_vector<frozen_mutation_and_schema>> updates;
+        try {
+            updates = co_await builder.build_some();
+        } catch (...) {
+            err = std::current_exception();
+            break;
+        }
+        if (!updates) {
+            break;
+        }
+        tracing::trace(tr_state, "Generated {} view update mutations", updates->size());
+        auto units = seastar::consume_units(_db.view_update_sem(), memory_usage_of(*updates));
+        if (batch_num == 0 && _db.view_update_sem().current() == 0) {
+            // We don't have resources to propagate view updates for this write. If we reached this point, we failed to
+            // throttle the client. The memory queue is already full, waiting on the semaphore would block view updates
+            // that we've already started applying, and generating hints would ultimately result in the disk queue being
+            // full. Instead, we drop the base write, which will create inconsistencies between base replicas, but we
+            // will fix them using repair.
+            err = std::make_exception_ptr(exceptions::overloaded_exception("Too many view updates started concurrently"));
+            break;
+        }
+        // To prevent overload we sleep for a moment before sending another batch of view updates.
+        // The amount of time to sleep for is chosen based on how full the view update backlog is,
+        // the more full the queue of pending view updates is the more aggressively we should delay
+        // new ones.
+        // The first batch of updates doesn't have any delays because it's slowed down by the other throttling mechanism,
+        // the one which limits the number of incoming client requests by delaying the response to the client.
+        if (batch_num > 0) {
+            update_backlog local_backlog = _db.get_view_update_backlog();
+            std::chrono::microseconds throttle_delay =  calculate_view_update_throttling_delay(local_backlog, timeout, _db.get_config().view_flow_control_delay_limit_in_ms());
+
+            co_await seastar::sleep(throttle_delay);
+
+            if (utils::get_local_injector().enter("view_update_limit") && _db.view_update_sem().current() == 0) {
+                err = std::make_exception_ptr(std::runtime_error("View update backlog exceeded the limit"));
+                break;
+            }
+
+            if (db::timeout_clock::now() > timeout) {
+                err = std::make_exception_ptr(view_update_generation_timeout_exception());
+                break;
+            }
+        }
+
+        try {
+            co_await mutate_MV(base, base_token, std::move(*updates), table.view_stats(), *table.cf_stats(), tr_state,
+                std::move(units), service::allow_hints::yes, wait_for_all_updates::no);
+        } catch (...) {
+            // Ignore exceptions: any individual failure to propagate a view update will be reported
+            // by a separate mechanism in mutate_MV() function. Moreover, we should continue trying
+            // to generate updates even if some of them fail, in order to minimize the potential
+            // inconsistencies caused by not being able to propagate an update
+        }
+    }
+    co_await builder.close();
+    _proxy.local().update_view_update_backlog();
+    if (err) {
+        std::rethrow_exception(err);
+    }
 }
 
 }

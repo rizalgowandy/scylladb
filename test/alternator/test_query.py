@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for the Query operation
 # Some of the Query features are tested in separate files:
@@ -10,12 +10,17 @@
 #   * test_filter_expression.py: the FilterExpression parameter.
 #   * test_query_filter.py: the QueryFilter parameter.
 
+import operator
 import random
-import pytest
-from botocore.exceptions import ClientError
 from decimal import Decimal
-from util import random_string, random_bytes, full_query, multiset
-from boto3.dynamodb.conditions import Key, Attr
+
+import pytest
+from boto3.dynamodb.conditions import Attr
+from botocore.exceptions import ClientError
+
+from test.alternator.util import random_string, random_bytes, full_query, multiset
+
+python_compare_op_dict = {"LE": operator.le, "LT": operator.lt, "GE": operator.ge, "GT": operator.gt}
 
 def test_query_nonexistent_table(dynamodb):
     client = dynamodb.meta.client
@@ -376,7 +381,8 @@ def test_query_exclusivestartkey(test_table_sn):
 # return items sorted in reverse order. Combining this with Limit can
 # be used to return the last items instead of the first items of the
 # partition.
-def test_query_reverse(test_table_sn):
+@pytest.mark.parametrize("sort_key_op", [None, 'LT', 'LE', 'GT', 'GE'])
+def test_query_reverse(sort_key_op, test_table_sn):
     numbers = [Decimal(i) for i in range(20)]
     # Insert these numbers, in random order, into one partition:
     p = random_string()
@@ -388,29 +394,29 @@ def test_query_reverse(test_table_sn):
     # order, depending on the ScanIndexForward parameter being True or False.
     # First, no Limit so we should get all numbers (we have few of them, so
     # it all fits in the default 1MB limitation)
-    reversed_numbers = list(reversed(numbers))
-    got_items = test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, ScanIndexForward=True)['Items']
-    got_sort_keys = [x['c'] for x in got_items]
-    assert got_sort_keys == numbers
-    got_items = test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, ScanIndexForward=False)['Items']
-    got_sort_keys = [x['c'] for x in got_items]
-    assert got_sort_keys == reversed_numbers
-    # Now try a few different Limit values, and verify that the query
-    # returns exactly the first Limit sorted numbers - in regular or
-    # reverse order, depending on ScanIndexForward.
-    for limit in [1, 2, 3, 7, 10, 17, 100, 10000]:
-        got_items = test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Limit=limit, ScanIndexForward=True)['Items']
-        assert len(got_items) == min(limit, len(numbers))
+    key_condition = {'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}
+    if sort_key_op:
+        c_bound = random.randint(1, 19)
+        key_condition['c'] = {'AttributeValueList': [c_bound], 'ComparisonOperator': sort_key_op}
+        op = lambda x: python_compare_op_dict[sort_key_op](x, c_bound)
+    else:
+        op = lambda x: True
+
+    for scan_index_forward in [True, False]:
+        got_items = test_table_sn.query(ConsistentRead=True, KeyConditions=key_condition, ScanIndexForward=scan_index_forward)['Items']
         got_sort_keys = [x['c'] for x in got_items]
-        assert got_sort_keys == numbers[0:limit]
-        got_items = test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Limit=limit, ScanIndexForward=False)['Items']
-        assert len(got_items) == min(limit, len(numbers))
-        got_sort_keys = [x['c'] for x in got_items]
-        assert got_sort_keys == reversed_numbers[0:limit]
+        assert got_sort_keys == list(filter(op, numbers[:: 1 if scan_index_forward else -1]))
+
+        for limit in [1, 2, 3, 7, 10, 17, 100, 10000]:
+            got_items = test_table_sn.query(ConsistentRead=True, KeyConditions=key_condition, Limit=limit, ScanIndexForward=scan_index_forward)['Items']
+            got_sort_keys = [x['c'] for x in got_items]
+            assert got_sort_keys == list(filter(op, numbers[:: 1 if scan_index_forward else -1]))[:limit]
+
 
 # Test that paging also works properly with reverse order
 # (ScanIndexForward=false), i.e., reverse-order queries can be resumed
-def test_query_reverse_paging(test_table_sn):
+@pytest.mark.parametrize("sort_key_op", [None, 'LT', 'LE', 'GT', 'GE'])
+def test_query_reverse_paging(sort_key_op, test_table_sn):
     numbers = [Decimal(i) for i in range(20)]
     # Insert these numbers, in random order, into one partition:
     p = random_string()
@@ -422,10 +428,18 @@ def test_query_reverse_paging(test_table_sn):
     # Verify that with ScanIndexForward=False, full_query() returns all
     # these numbers in reversed sorted order - getting pages of Limit items
     # at a time and resuming the query.
+    key_condition = {'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}
+    if sort_key_op:
+        c_bound = random.randint(1, 19)
+        key_condition['c'] = {'AttributeValueList': [c_bound], 'ComparisonOperator': sort_key_op}
+        op = lambda x: python_compare_op_dict[sort_key_op](x, c_bound)
+    else:
+        op = lambda x: True
+
     for limit in [1, 2, 3, 7, 10, 17, 100, 10000]:
-        got_items = full_query(test_table_sn, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, ScanIndexForward=False, Limit=limit)
+        got_items = full_query(test_table_sn, KeyConditions=key_condition, ScanIndexForward=False, Limit=limit)
         got_sort_keys = [x['c'] for x in got_items]
-        assert got_sort_keys == reversed_numbers
+        assert got_sort_keys == list(filter(op, reversed_numbers))
 
 # Test that a reverse query also works for long partitions. This test
 # reproduces #7586, where reverse queries had to read the entire partition
@@ -592,3 +606,34 @@ def test_query_paging_string(test_table_ss):
     got_sort_keys = [x['c'] for x in got_items]
     expected_sort_keys = sorted(x['c'] for x in items)
     assert got_sort_keys == expected_sort_keys
+
+# The following test reproduces #17995: A Query returning a large page
+# composed of many small rows, which causes a lot of processing work for
+# outputting the result, and the risk (before #17995 is fixed) to stall.
+# To see the stall, an option like '--blocked-reactor-notify-ms', '5'
+# must be added to Scylla in test/alternator/run, as the default stall
+# threshold is higher than the one that this test produces.
+# Because this test is slow (takes several seconds to build the large
+# partition) and can't fail or even log a stall without different
+# configuration, we skip it by default, using the "veryslow" mark.
+# Remove this mark, and set the --block-reactor-notify-ms option, to run
+# this test.
+@pytest.mark.veryslow
+def test_query_large_page_small_rows(test_table_sn):
+    p = random_string()
+    # Experimentally, Scylla considers the rows we insert below (which each
+    # have a 10-byte string partition key with a one byte name, a numeric
+    # clustering key with a one byte name, and no other data) as being 32
+    # bytes in size, and returns 32772 of these rows in one (nominally) 1MB
+    # page of Query. So if the partition has just 30,000 rows, it will be
+    # returned entirely in one page.
+    N = 30_000
+    with test_table_sn.batch_writer() as batch:
+        for i in range(N):
+            batch.put_item({'p': p, 'c': i})
+
+    got_items = test_table_sn.query(KeyConditions={
+        'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}},
+        ConsistentRead=True)['Items']
+    n = len(got_items)
+    assert n == N

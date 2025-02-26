@@ -1,6 +1,6 @@
 # Copyright 2020-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for the FilterExpression parameter of the Query and Scan operations.
 # FilterExpression is a newer version of the older "QueryFilter" and
@@ -9,7 +9,7 @@
 import pytest
 from botocore.exceptions import ClientError
 import random
-from util import full_query, full_query_and_counts, full_scan, random_string, random_bytes, multiset
+from test.alternator.util import full_query, full_query_and_counts, full_scan, random_string, random_bytes, multiset
 
 # The test_table_sn_with_data fixture is the regular test_table_sn fixture
 # with a partition inserted with many items. The sort key 'c' of the items
@@ -40,7 +40,7 @@ def random_sets():
 def random_bool():
     return bool(random.randint(0,1))
 def random_item(p, i):
-    item = {'p': p, 'c': i, 's': random_s(), 'b': random_b(), 'i': random_i(),
+    item = {'p': p, 'c': i, 's': random_s(), 'b': random_b(), 'i': i,
             'l': random_l(), 'm': random_m(), 'ns': random_set(), 'ss': random_sets(), 'bool': random_bool() }
     # The "r" attribute doesn't appears on all items, and when it does it has a random type
     if i == 0:

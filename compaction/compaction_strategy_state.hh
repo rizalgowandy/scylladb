@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -11,7 +11,6 @@
 #include "time_window_compaction_strategy.hh"
 #include "leveled_compaction_strategy.hh"
 #include <utility>
-#include <type_traits>
 #include <variant>
 
 namespace compaction {

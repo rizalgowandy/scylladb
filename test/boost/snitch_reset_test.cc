@@ -3,17 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
-#include <boost/test/unit_test.hpp>
-#include "locator/gossiping_property_file_snitch.hh"
-#include "test/lib/scylla_test_case.hh"
-#include <seastar/util/std-compat.hh>
-#include <vector>
+#include <filesystem>
 #include <string>
-#include <tuple>
+#include <boost/test/unit_test.hpp>
+#include "locator/snitch_base.hh"
+#include "gms/inet_address.hh"
+#include "test/lib/scylla_test_case.hh"
+#include "seastarx.hh"
 
 namespace fs = std::filesystem;
 

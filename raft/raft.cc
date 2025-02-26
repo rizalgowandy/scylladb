@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #include "raft.hh"
 #include <fmt/ranges.h>
@@ -11,6 +11,27 @@
 namespace raft {
 
 seastar::logger logger("raft");
+
+size_t log_entry::get_size() const {
+    struct overloaded {
+        size_t operator()(const command& c) {
+            return c.size();
+        }
+        size_t operator()(const configuration& c) {
+            size_t size = 0;
+            for (auto& s : c.current) {
+                size += sizeof(s.addr.id);
+                size += s.addr.info.size();
+                size += sizeof(s.can_vote);
+            }
+            return size;
+        }
+        size_t operator()(const log_entry::dummy& d) {
+            return 0;
+        }
+    };
+    return std::visit(overloaded{}, this->data) + sizeof(*this);
+}
 
 } // end of namespace raft
 

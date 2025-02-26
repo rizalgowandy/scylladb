@@ -13,7 +13,7 @@ CQL is a typed language and supports a rich set of data types, including :ref:`n
 
 .. code-block::
    
-   cql_type: `native_type` | `collection_type` | `user_defined_type` | `tuple_type` 
+   cql_type: `native_type` | `collection_type` | `user_defined_type` | `tuple_type` | `vector_type`
 
 
 
@@ -146,7 +146,7 @@ valid ``timestamp`` values for  Mar 2, 2011, at 04:05:00 AM, GMT:
 
 The ``+0000`` above is an RFC 822 4-digit time zone specification; ``+0000`` refers to GMT. US Pacific Standard Time is
 ``-0800``. The time zone may be omitted if desired (``'2011-02-03 04:05:00'``), and if so, the date will be interpreted
-as being in the time zone under which the coordinating Scylla node is configured. However, there are difficulties
+as being in the time zone under which the coordinating ScyllaDB node is configured. However, there are difficulties
 inherent in relying on the time zone configuration as expected, so it is recommended that the time zone always be
 specified for timestamps when feasible.
 
@@ -252,7 +252,7 @@ and their values can be input using collection literals:
 
 .. code-block:: cql
 
-   collection_literal: `map_literal` | `set_literal` | `list_literal`
+   collection_literal: `map_literal` | `set_literal` | `list_or_vector_literal`
 
    map_literal: '{' [ `term` ':' `term` (',' `term` : `term`)* ] '}'
 
@@ -269,8 +269,12 @@ Collections are meant for storing/denormalizing a relatively small amount of dat
 phone numbers of a given user”, “labels applied to an email”, etc. But when items are expected to grow unbounded (“all
 messages sent by a user”, “events registered by a sensor”...), then collections are not appropriate, and a specific table
 (with clustering columns) should be used. A collection can be **frozen** or **non-frozen**.
-A non-frozen collection can be modified, i.e., have an element added or removed. A
-frozen collection can only be updated as a whole. By default, a collection is non-frozen.
+
+A non-frozen collection can be modified, i.e., have an element added or removed. 
+A frozen collection is *immutable*, and can only be updated as a whole.
+Only frozen collections can be used as primary keys or nested collections.
+
+By default, a collection is non-frozen. 
 To declare a frozen collection, use ``FROZEN`` keyword:
 
 .. code-block:: cql
@@ -279,7 +283,7 @@ To declare a frozen collection, use ``FROZEN`` keyword:
                           : | FROZEN '<' SET '<' `cql_type` '>' '>'
                           : | FROZEN '<' LIST '<' `cql_type` '>' '>'
 
-Non-frozen collections have the following noteworthy characteristics and limitations:
+Collections, frozen and non-frozen, have the following noteworthy characteristics and limitations:
 
 - Individual collections are not indexed internally. This means that even to access a single element of a collection,
   the whole collection has to be read (and reading one is not paged internally).
@@ -287,8 +291,6 @@ Non-frozen collections have the following noteworthy characteristics and limitat
   Further, some list operations are not idempotent by nature (see the section on :ref:`lists <lists>` below for
   details), making their retry in case of timeout problematic. It is thus advised to prefer sets over lists when
   possible.
-- Non-frozen collections impose a significant performance penalty. To ensure better performance, use frozen collections 
-  or frozen UDTs. See `this blog post <https://www.scylladb.com/2017/12/07/performance-udt/>`_ for more information about improving performance.
 
 Please note that while some of those limitations may or may not be removed/improved upon in the future, it is an
 anti-pattern to use a (single) collection to store large amounts of data.
@@ -315,7 +317,7 @@ old content, if any::
 
     UPDATE users SET favs = { 'fruit' : 'Banana' } WHERE id = 'jsmith';
 
-Note that Scylla does not distinguish an empty map from a missing value,
+Note that ScyllaDB does not distinguish an empty map from a missing value,
 thus assigning an empty map (``{}``) to a map is the same as deleting it.
 
 Further, maps support:
@@ -331,6 +333,10 @@ Further, maps support:
     UPDATE users SET favs = favs - { 'movie', 'band'} WHERE id = 'jsmith';
 
   Note that for removing multiple elements in a ``map``, you remove from it a ``set`` of keys.
+
+- Selecting one element::
+
+    SELECT favs['fruit'] FROM users WHERE id = 'jsmith';
 
 Lastly, TTLs are allowed for both ``INSERT`` and ``UPDATE``, but in both cases, the TTL set only applies to the newly
 inserted/updated elements. In other words::
@@ -361,7 +367,7 @@ old content, if any::
 
     UPDATE images SET tags = { 'kitten', 'cat', 'lol' } WHERE name = 'cat.jpg';
 
-Note that Scylla does not distinguish an empty set from a missing value,
+Note that ScyllaDB does not distinguish an empty set from a missing value,
 thus assigning an empty set (``{}``) to a set is the same as deleting it.
 
 Further, sets support:
@@ -373,6 +379,10 @@ Further, sets support:
 - Removing one or multiple elements (if an element doesn't exist, removing it is a no-op but no error is thrown)::
 
     UPDATE images SET tags = tags - { 'cat' } WHERE name = 'cat.jpg';
+
+- Selecting an element (if the element doesn't exist, returns null)::
+
+    SELECT tags['gray'] FROM images;
 
 Lastly, as for :ref:`maps <maps>`, TTLs, if used, only apply to the newly inserted values.
 
@@ -404,7 +414,7 @@ old content, if any::
 
     UPDATE plays SET scores = [ 3, 9, 4] WHERE id = '123-afde';
 
-Note that Scylla does not distinguish an empty list from a missing value,
+Note that ScyllaDB does not distinguish an empty list from a missing value,
 thus assigning an empty list (``[]``) to a list is the same as deleting it.
 
 Further, lists support:
@@ -429,6 +439,10 @@ Further, lists support:
   list, it is simply ignored, and no error is thrown)::
 
     UPDATE plays SET scores = scores - [ 12, 21 ] WHERE id = '123-afde';
+
+- Selecting an element by its position in the list::
+
+    SELECT scores[1] FROM plays;
 
 .. warning:: The append and prepend operations are not idempotent by nature. So, in particular, if one of these operation
    timeouts, then retrying the operation is not safe, and it may (or may not) lead to appending/prepending the value
@@ -467,7 +481,7 @@ Creating a new user-defined type is done using a ``CREATE TYPE`` statement defin
    field_definition: `identifier` `cql_type`
 
 A UDT has a name (``udt_name``), which is used to declare columns of that type and is a set of named and typed fields. The ``udt_name`` can be any
-type, including collections or other UDTs. UDTs and collections inside collections must always be frozen (no matter which version of Scylla you are using). 
+type, including collections or other UDTs. UDTs and collections inside collections must always be frozen (no matter which version of ScyllaDB you are using). 
 
 For example::
 
@@ -499,10 +513,10 @@ For example::
 
    - Attempting to create an already existing type will result in an error unless the ``IF NOT EXISTS`` option is used. If it is used, the statement will be a no-op if the type already exists.
    - A type is intrinsically bound to the keyspace in which it is created and can only be used in that keyspace. At creation, if the type name is prefixed by a keyspace name, it is created in that keyspace. Otherwise, it is created in the current keyspace.
-   - As of Scylla Open Source 3.2, UDTs not inside collections do not have to be frozen, but in all versions prior to Scylla Open Source 3.2, and in all Scylla Enterprise versions, UDTs **must** be frozen. 
+   - As of ScyllaDB Open Source 3.2, UDTs not inside collections do not have to be frozen, but in all versions prior to ScyllaDB Open Source 3.2, and in all ScyllaDB Enterprise versions, UDTs **must** be frozen. 
 
 
-A non-frozen UDT example with Scylla Open Source 3.2 and higher::
+A non-frozen UDT example with ScyllaDB Open Source 3.2 and higher::
 
    CREATE TYPE ut (a int, b int);
    CREATE TABLE cf (a int primary key, b ut);
@@ -626,6 +640,40 @@ Unlike other "composed" types (collections and UDT), a tuple is always ``frozen<
 `frozen` keyword), and it is not possible to update only some elements of a tuple (without updating the whole tuple).
 Also, a tuple literal should always provide values for all the components of the tuple type (some of
 those values can be null, but they need to be explicitly declared as so).
+
+.. _vectors:
+
+Vectors
+^^^^^^^
+
+A ``vector`` is an array of a given number of elements of a given type.
+For example, a ``vector<float, 3>`` holds vectors of 3 floats
+(in mathematical terms, these are 3-dimensional float vectors).
+None of the elements stored in a vector can be null.
+The vector type and it's respective literal are defined by:
+
+.. code-block::
+
+   vector_type: VECTOR '<' `cql_type` ',' `integer` '>'
+   list_literal: '[' [ `term` (',' `term`)* ] ']'
+
+Note that list_literal is used for both :ref:`lists` and :ref:`vectors` as their syntax is the same.
+In the case of vectors, the number of elements in the list_literal must match the number of elements in the vector type.
+
+Vectors can be used as in the example below::
+
+    CREATE TABLE vectors (
+        id int PRIMARY KEY,
+        gene_expr vector<float, 3>,
+    )
+
+    INSERT INTO vectors (id, gene_expr) VALUES (180503, [0.2228, 0.2112, 0.2024]);
+
+Similar to tuple type, a vector is always ``frozen<vector>`` (without the need of the `frozen` keyword), and
+it is not possible to update only some elements of a vector (without updating the whole vector).
+
+Types stored in a vector are not implicitly frozen, so if you want to store a frozen collection or
+frozen UDT in a vector, you need to explicitly wrap them using `frozen` keyword.
 
 .. .. _custom-types:
 

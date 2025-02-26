@@ -8,14 +8,11 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 #pragma once
 #include "i_filter.hh"
-#include "utils/murmur_hash.hh"
 #include "utils/large_bitset.hh"
-
-#include <vector>
 
 namespace utils {
 namespace filter {
@@ -89,6 +86,9 @@ struct always_present_filter: public i_filter {
         return 0;
     }
 };
+
+// Get the size of the bitset (in bits, not bytes) for the specific parameters.
+size_t get_bitset_size(int64_t num_elements, int buckets_per);
 
 filter_ptr create_filter(int hash, large_bitset&& bitset, filter_format format);
 filter_ptr create_filter(int hash, int64_t num_elements, int buckets_per, filter_format format);

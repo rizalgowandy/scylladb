@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -84,8 +84,6 @@ public:
 
 using decorated_key_opt = std::optional<decorated_key>;
 
-std::ostream& operator<<(std::ostream& out, const decorated_key& t);
-
 } // namespace dht
 
 namespace std {
@@ -99,3 +97,11 @@ struct hash<dht::decorated_key> {
 };
 
 } // namespace std
+
+template <> struct fmt::formatter<dht::decorated_key> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    template <typename FormatContext>
+    auto format(const dht::decorated_key& dk, FormatContext& ctx) const {
+        return fmt::format_to(ctx.out(), "{{key: {}, token: {}}}", dk._key, dk._token);
+    }
+};

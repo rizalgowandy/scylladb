@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #pragma once
 
@@ -12,7 +12,7 @@
 #include <seastar/util/bool_class.hh>
 
 // Scylla includes.
-#include "gms/inet_address.hh"
+#include "locator/host_id.hh"
 
 // STD.
 #include <cstdint>
@@ -21,7 +21,7 @@ namespace db::hints {
 namespace internal {
 
 /// Type identifying the host a specific subset of hints should be sent to.
-using endpoint_id = gms::inet_address;
+using endpoint_id = locator::host_id;
 
 /// Tag specifying if hint sending should enter the so-called "drain mode".
 /// If it should, that means that if a failure while sending a hint occurs,
@@ -38,7 +38,8 @@ struct hint_stats {
     uint64_t written                    = 0;
     uint64_t errors                     = 0;
     uint64_t dropped                    = 0;
-    uint64_t sent                       = 0;
+    uint64_t sent_total                 = 0;
+    uint64_t sent_hints_bytes_total     = 0;
     uint64_t discarded                  = 0;
     uint64_t send_errors                = 0;
     uint64_t corrupted_files            = 0;

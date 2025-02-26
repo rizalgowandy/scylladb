@@ -3,9 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include <seastar/core/simple-stream.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/maybe_yield.hh>
@@ -13,8 +14,6 @@
 #include "mutation_partition_view.hh"
 #include "schema/schema.hh"
 #include "atomic_cell.hh"
-#include "utils/data_input.hh"
-#include "mutation_partition_serializer.hh"
 #include "mutation_partition.hh"
 #include "counters.hh"
 #include "frozen_mutation.hh"
@@ -105,7 +104,7 @@ collection_mutation read_collection_cell(const abstract_type& type, ser::collect
             for (auto&& e : elements) {
                 bytes key = e.key();
                 auto idx = deserialize_field_index(key);
-                assert(idx < utype.size());
+                SCYLLA_ASSERT(idx < utype.size());
 
                 mut.cells.emplace_back(key, read_atomic_cell(*utype.type(idx), e.value(), atomic_cell::collection_member::yes));
             }
@@ -189,7 +188,7 @@ template<typename Visitor>
 requires MutationViewVisitor<Visitor>
 void mutation_partition_view::do_accept(const column_mapping& cm, Visitor& visitor) const {
     auto in = _in;
-    auto mpv = ser::deserialize(in, boost::type<ser::mutation_partition_view>());
+    auto mpv = ser::deserialize(in, std::type_identity<ser::mutation_partition_view>());
 
     visitor.accept_partition_tombstone(mpv.tomb());
 
@@ -231,7 +230,7 @@ template<typename Visitor>
 requires MutationViewVisitor<Visitor>
 future<> mutation_partition_view::do_accept_gently(const column_mapping& cm, Visitor& visitor) const {
     auto in = _in;
-    auto mpv = ser::deserialize(in, boost::type<ser::mutation_partition_view>());
+    auto mpv = ser::deserialize(in, std::type_identity<ser::mutation_partition_view>());
 
     visitor.accept_partition_tombstone(mpv.tomb());
 
@@ -276,7 +275,7 @@ future<> mutation_partition_view::do_accept_gently(const column_mapping& cm, Vis
 template <bool is_preemptible>
 mutation_partition_view::accept_ordered_result mutation_partition_view::do_accept_ordered(const schema& s, mutation_partition_view_virtual_visitor& visitor, accept_ordered_cookie cookie) const {
     auto in = _in;
-    auto mpv = ser::deserialize(in, boost::type<ser::mutation_partition_view>());
+    auto mpv = ser::deserialize(in, std::type_identity<ser::mutation_partition_view>());
     const column_mapping& cm = s.get_column_mapping();
 
     if (!cookie.accepted_partition_tombstone) {
@@ -420,7 +419,7 @@ future<> mutation_partition_view::accept_gently_ordered(const schema& s, mutatio
 std::optional<clustering_key> mutation_partition_view::first_row_key() const
 {
     auto in = _in;
-    auto mpv = ser::deserialize(in, boost::type<ser::mutation_partition_view>());
+    auto mpv = ser::deserialize(in, std::type_identity<ser::mutation_partition_view>());
     auto rows = mpv.rows();
     if (rows.empty()) {
         return { };
@@ -431,7 +430,7 @@ std::optional<clustering_key> mutation_partition_view::first_row_key() const
 std::optional<clustering_key> mutation_partition_view::last_row_key() const
 {
     auto in = _in;
-    auto mpv = ser::deserialize(in, boost::type<ser::mutation_partition_view>());
+    auto mpv = ser::deserialize(in, std::type_identity<ser::mutation_partition_view>());
     auto rows = mpv.rows();
     if (rows.empty()) {
         return { };
@@ -452,7 +451,7 @@ mutation_partition_view mutation_partition_view::from_view(ser::mutation_partiti
 mutation_fragment frozen_mutation_fragment::unfreeze(const schema& s, reader_permit permit)
 {
     auto in = ser::as_input_stream(_bytes);
-    auto view = ser::deserialize(in, boost::type<ser::mutation_fragment_view>());
+    auto view = ser::deserialize(in, std::type_identity<ser::mutation_fragment_view>());
     return seastar::visit(view.fragment(),
         [&] (ser::clustering_row_view crv) {
             class clustering_row_builder {

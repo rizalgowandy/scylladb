@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2023-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
 from test.pylib.manager_client import ManagerClient
@@ -27,31 +27,14 @@ async def test_different_group0_ids(manager: ManagerClient):
     "zero replica after the removal" thrown by the repair service.
     """
 
-    # Consistent cluster management is disabled to use repair based node operations.
-    scylla_a = await manager.server_add(config={
-        'experimental_features': ["udf"] # disable consistent cluster management
-    })
-    scylla_b = await manager.server_add(start=False, config={
-        'experimental_features': ["udf"], # disable consistent cluster management
-    })
-    await manager.server_update_config(scylla_b.server_id, key='seed_provider', value=[{
-            'class_name': 'org.apache.cassandra.locator.SimpleSeedProvider',
-            'parameters': [{
-                    'seeds': f'{scylla_b.ip_addr}'
-                }]
-            }]
-        )
-    await manager.server_start(scylla_b.server_id)
+    # Consistent topology changes are disabled to use repair based node operations.
+    cfg = {'force_gossip_topology_changes': True, 'enable_tablets': False}
+    scylla_a = await manager.server_add(config = cfg)
+    scylla_b = await manager.server_add(start=False, config = cfg)
+    await manager.server_start(scylla_b.server_id, seeds=[scylla_b.ip_addr])
 
     await manager.server_stop(scylla_b.server_id)
-    await manager.server_update_config(scylla_b.server_id, key='seed_provider', value=[{
-            'class_name': 'org.apache.cassandra.locator.SimpleSeedProvider',
-            'parameters': [{
-                    'seeds': f'{scylla_a.ip_addr},{scylla_b.ip_addr}'
-                }]
-            }]
-        )
-    await manager.server_start(scylla_b.server_id)
+    await manager.server_start(scylla_b.server_id, seeds=[scylla_a.ip_addr, scylla_b.ip_addr])
 
     log_file_a = await manager.server_open_log(scylla_a.server_id)
     log_file_b = await manager.server_open_log(scylla_b.server_id)

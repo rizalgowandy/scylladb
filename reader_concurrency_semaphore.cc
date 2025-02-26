@@ -3,21 +3,23 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/seastar.hh>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <seastar/core/file.hh>
 #include <seastar/util/lazy.hh>
 #include <seastar/util/log.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/maybe_yield.hh>
+#include <seastar/core/metrics.hh>
 #include <utility>
 
 #include "reader_concurrency_semaphore.hh"
 #include "query-result.hh"
-#include "readers/flat_mutation_reader_v2.hh"
+#include "readers/mutation_reader.hh"
+#include "utils/assert.hh"
 #include "utils/exceptions.hh"
 #include "schema/schema.hh"
 #include "utils/human_readable.hh"
@@ -26,18 +28,19 @@
 logger rcslog("reader_concurrency_semaphore");
 
 struct reader_concurrency_semaphore::inactive_read {
-    flat_mutation_reader_v2 reader;
+    mutation_reader reader;
+    const dht::partition_range* range = nullptr;
     eviction_notify_handler notify_handler;
-    timer<lowres_clock> ttl_timer;
     inactive_read_handle* handle = nullptr;
 
-    explicit inactive_read(flat_mutation_reader_v2 reader_) noexcept
+    explicit inactive_read(mutation_reader reader_, const dht::partition_range* range_) noexcept
         : reader(std::move(reader_))
+        , range(range_)
     { }
     inactive_read(inactive_read&& o)
         : reader(std::move(o.reader))
+        , range(o.range)
         , notify_handler(std::move(o.notify_handler))
-        , ttl_timer(std::move(o.ttl_timer))
         , handle(o.handle)
     {
         o.handle = nullptr;
@@ -54,7 +57,7 @@ struct reader_concurrency_semaphore::inactive_read {
 };
 
 template <>
-struct fmt::formatter<reader_concurrency_semaphore::evict_reason> : fmt::formatter<std::string_view> {
+struct fmt::formatter<reader_concurrency_semaphore::evict_reason> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const reader_concurrency_semaphore::evict_reason& reason, FormatContext& ctx) const {
         static const char* value_table[] = {"permit", "time", "manual"};
@@ -64,13 +67,13 @@ struct fmt::formatter<reader_concurrency_semaphore::evict_reason> : fmt::formatt
 
 namespace {
 
-void maybe_dump_reader_permit_diagnostics(const reader_concurrency_semaphore& semaphore, std::string_view problem) noexcept;
+void maybe_dump_reader_permit_diagnostics(const reader_concurrency_semaphore& semaphore, std::string_view problem, reader_permit::impl* permit) noexcept;
 
 }
 
-std::ostream& operator<<(std::ostream& os , const reader_resources& r) {
-    os << "{" << r.count << ", " << r.memory << "}";
-    return os;
+auto fmt::formatter<reader_resources>::format(const reader_resources& r, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    return fmt::format_to(ctx.out(), "{{{}, {}}}", r.count, r.memory);
 }
 
 reader_permit::resource_units::resource_units(reader_permit permit, reader_resources res, already_consumed_tag)
@@ -103,7 +106,7 @@ reader_permit::resource_units& reader_permit::resource_units::operator=(resource
 }
 
 void reader_permit::resource_units::add(resource_units&& o) {
-    assert(_permit == o._permit);
+    SCYLLA_ASSERT(_permit == o._permit);
     _resources += std::exchange(o._resources, {});
 }
 
@@ -141,15 +144,13 @@ public:
         promise<> pr;
         std::optional<shared_future<>> fut;
         reader_concurrency_semaphore::read_func func;
-        // Self reference to keep the permit alive while queued for execution.
-        // Must be cleared on all code-paths, otherwise it will keep the permit alive in perpetuity.
-        reader_permit_opt permit_keepalive;
         std::optional<reader_concurrency_semaphore::inactive_read> ir;
     };
 
 private:
     reader_concurrency_semaphore& _semaphore;
-    const schema* _schema;
+    schema_ptr _schema;
+
     sstring _op_name;
     std::string_view _op_name_view;
     reader_resources _base_resources;
@@ -218,27 +219,36 @@ private:
     }
 
     void on_timeout() {
-        auto keepalive = std::exchange(_aux_data.permit_keepalive, std::nullopt);
+        auto ex = named_semaphore_timed_out(_semaphore._name);
+        _ex = std::make_exception_ptr(ex);
 
-        _ex = std::make_exception_ptr(timed_out_error{});
-
-        if (_state == state::waiting_for_admission || _state == state::waiting_for_memory || _state == state::waiting_for_execution) {
-            _aux_data.pr.set_exception(named_semaphore_timed_out(_semaphore._name));
-
-            maybe_dump_reader_permit_diagnostics(_semaphore, "timed out");
-
-            _semaphore.dequeue_permit(*this);
-        } else if (_state == state::inactive) {
-            _semaphore.evict(*this, reader_concurrency_semaphore::evict_reason::time);
+        switch (_state) {
+            case state::waiting_for_admission:
+            case state::waiting_for_memory:
+            case state::waiting_for_execution:
+                _aux_data.pr.set_exception(ex);
+                maybe_dump_reader_permit_diagnostics(_semaphore, "timed out", this);
+                _semaphore.dequeue_permit(*this);
+                break;
+            case state::active:
+            case state::active_need_cpu:
+            case state::active_await:
+                maybe_dump_reader_permit_diagnostics(_semaphore, "timed out", this);
+                break;
+            case state::inactive:
+                _semaphore.evict(*this, reader_concurrency_semaphore::evict_reason::time);
+                break;
+            case state::evicted:
+                break;
         }
     }
 
 public:
     struct value_tag {};
 
-    impl(reader_concurrency_semaphore& semaphore, const schema* const schema, const std::string_view& op_name, reader_resources base_resources, db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr)
+    impl(reader_concurrency_semaphore& semaphore, schema_ptr schema, const std::string_view& op_name, reader_resources base_resources, db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr)
         : _semaphore(semaphore)
-        , _schema(schema)
+        , _schema(std::move(schema))
         , _op_name_view(op_name)
         , _base_resources(base_resources)
         , _ttl_timer([this] { on_timeout(); })
@@ -247,9 +257,9 @@ public:
         set_timeout(timeout);
         _semaphore.on_permit_created(*this);
     }
-    impl(reader_concurrency_semaphore& semaphore, const schema* const schema, sstring&& op_name, reader_resources base_resources, db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr)
+    impl(reader_concurrency_semaphore& semaphore, schema_ptr schema, sstring&& op_name, reader_resources base_resources, db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr)
         : _semaphore(semaphore)
-        , _schema(schema)
+        , _schema(std::move(schema))
         , _op_name(std::move(op_name))
         , _op_name_view(_op_name)
         , _base_resources(base_resources)
@@ -273,7 +283,7 @@ public:
         }
 
         if (_need_cpu_branches) {
-            on_internal_error_noexcept(rcslog, format("reader_permit::impl::~impl(): permit {}.{}:{} destroyed with {} need_cpu branches",
+            on_internal_error_noexcept(rcslog, seastar::format("reader_permit::impl::~impl(): permit {}.{}:{} destroyed with {} need_cpu branches",
                         _schema ? _schema->ks_name() : "*",
                         _schema ? _schema->cf_name() : "*",
                         _op_name_view,
@@ -282,7 +292,7 @@ public:
         }
 
         if (_awaits_branches) {
-            on_internal_error_noexcept(rcslog, format("reader_permit::impl::~impl(): permit {}.{}:{} destroyed with {} awaits branches",
+            on_internal_error_noexcept(rcslog, seastar::format("reader_permit::impl::~impl(): permit {}.{}:{} destroyed with {} awaits branches",
                         _schema ? _schema->ks_name() : "*",
                         _schema ? _schema->cf_name() : "*",
                         _op_name_view,
@@ -301,7 +311,7 @@ public:
         return _semaphore;
     }
 
-    const ::schema* get_schema() const {
+    const schema_ptr& get_schema() const {
         return _schema;
     }
 
@@ -330,7 +340,7 @@ public:
     }
 
     void on_admission() {
-        assert(_state != reader_permit::state::active_await);
+        SCYLLA_ASSERT(_state != reader_permit::state::active_await);
         on_permit_active();
         consume(_base_resources);
         _base_resources_consumed = true;
@@ -348,17 +358,17 @@ public:
     }
 
     void on_register_as_inactive() {
-        assert(_state == reader_permit::state::active || _state == reader_permit::state::active_need_cpu || _state == reader_permit::state::waiting_for_memory);
+        SCYLLA_ASSERT(_state == reader_permit::state::active || _state == reader_permit::state::active_need_cpu || _state == reader_permit::state::waiting_for_memory);
         on_permit_inactive(reader_permit::state::inactive);
     }
 
     void on_unregister_as_inactive() {
-        assert(_state == reader_permit::state::inactive);
+        SCYLLA_ASSERT(_state == reader_permit::state::inactive);
         on_permit_active();
     }
 
     void on_evicted() {
-        assert(_state == reader_permit::state::inactive);
+        SCYLLA_ASSERT(_state == reader_permit::state::inactive);
         _state = reader_permit::state::evicted;
         if (_base_resources_consumed) {
             signal(_base_resources);
@@ -400,7 +410,7 @@ public:
     }
 
     sstring description() const {
-        return format("{}.{}:{}",
+        return seastar::format("{}.{}:{}",
                 _schema ? _schema->ks_name() : "*",
                 _schema ? _schema->cf_name() : "*",
                 _op_name_view);
@@ -419,7 +429,7 @@ public:
     }
 
     void mark_not_need_cpu() noexcept {
-        assert(_need_cpu_branches);
+        SCYLLA_ASSERT(_need_cpu_branches);
         --_need_cpu_branches;
         if (_marked_as_need_cpu && !_need_cpu_branches) {
             // When an exception is thrown, need_cpu and awaits guards might be
@@ -442,7 +452,7 @@ public:
     }
 
     void mark_not_awaits() noexcept {
-        assert(_awaits_branches);
+        SCYLLA_ASSERT(_awaits_branches);
         --_awaits_branches;
         if (_marked_as_awaits && !_awaits_branches) {
             _state = reader_permit::state::active_need_cpu;
@@ -481,7 +491,7 @@ public:
         _trace_ptr = std::move(trace_ptr);
     }
 
-    void check_abort() {
+    void check_abort() const {
         if (_ex) {
             std::rethrow_exception(_ex);
         }
@@ -523,15 +533,15 @@ reader_permit::reader_permit(shared_ptr<impl> impl) : _impl(std::move(impl))
 {
 }
 
-reader_permit::reader_permit(reader_concurrency_semaphore& semaphore, const schema* const schema, std::string_view op_name,
+reader_permit::reader_permit(reader_concurrency_semaphore& semaphore, schema_ptr schema, std::string_view op_name,
         reader_resources base_resources, db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr)
-    : _impl(::seastar::make_shared<reader_permit::impl>(semaphore, schema, op_name, base_resources, timeout, std::move(trace_ptr)))
+    : _impl(::seastar::make_shared<reader_permit::impl>(semaphore, std::move(schema), op_name, base_resources, timeout, std::move(trace_ptr)))
 {
 }
 
-reader_permit::reader_permit(reader_concurrency_semaphore& semaphore, const schema* const schema, sstring&& op_name,
+reader_permit::reader_permit(reader_concurrency_semaphore& semaphore, schema_ptr schema, sstring&& op_name,
         reader_resources base_resources, db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr)
-    : _impl(::seastar::make_shared<reader_permit::impl>(semaphore, schema, std::move(op_name), base_resources, timeout, std::move(trace_ptr)))
+    : _impl(::seastar::make_shared<reader_permit::impl>(semaphore, std::move(schema), std::move(op_name), base_resources, timeout, std::move(trace_ptr)))
 {
 }
 
@@ -542,7 +552,7 @@ reader_concurrency_semaphore& reader_permit::semaphore() {
     return _impl->semaphore();
 }
 
-const ::schema* reader_permit::get_schema() const {
+const schema_ptr& reader_permit::get_schema() const {
     return _impl->get_schema();
 }
 
@@ -630,7 +640,7 @@ void reader_permit::set_trace_state(tracing::trace_state_ptr trace_ptr) noexcept
     _impl->set_trace_state(std::move(trace_ptr));
 }
 
-void reader_permit::check_abort() {
+void reader_permit::check_abort() const {
     return _impl->check_abort();
 }
 
@@ -650,34 +660,36 @@ void reader_permit::on_finish_sstable_read() noexcept {
     _impl->on_finish_sstable_read();
 }
 
-std::ostream& operator<<(std::ostream& os, reader_permit::state s) {
+auto fmt::formatter<reader_permit::state>::format(reader_permit::state s, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    std::string_view name;
     switch (s) {
         case reader_permit::state::waiting_for_admission:
-            os << "waiting_for_admission";
+            name = "waiting_for_admission";
             break;
         case reader_permit::state::waiting_for_memory:
-            os << "waiting_for_memory";
+            name = "waiting_for_memory";
             break;
         case reader_permit::state::waiting_for_execution:
-            os << "waiting_for_execution";
+            name = "waiting_for_execution";
             break;
         case reader_permit::state::active:
-            os << "active";
+            name = "active";
             break;
         case reader_permit::state::active_need_cpu:
-            os << "active/need_cpu";
+            name = "active/need_cpu";
             break;
         case reader_permit::state::active_await:
-            os << "active/await";
+            name = "active/await";
             break;
         case reader_permit::state::inactive:
-            os << "inactive";
+            name= "inactive";
             break;
         case reader_permit::state::evicted:
-            os << "evicted";
+            name = "evicted";
             break;
     }
-    return os;
+    return formatter<string_view>::format(name, ctx);
 }
 
 namespace {
@@ -761,11 +773,12 @@ static permit_stats do_dump_reader_permit_diagnostics(std::ostream& os, const pe
     return total;
 }
 
-static void do_dump_reader_permit_diagnostics(std::ostream& os, const reader_concurrency_semaphore& semaphore, std::string_view problem, unsigned max_lines = 20) {
+static void do_dump_reader_permit_diagnostics(std::ostream& os, const reader_concurrency_semaphore& semaphore, std::string_view problem,
+        reader_permit::impl* permit, unsigned max_lines = 20) {
     permit_groups permits;
 
     semaphore.foreach_permit([&] (const reader_permit::impl& permit) {
-        permits[permit_group_key(permit.get_schema(), permit.get_op_name(), permit.get_state())].add(permit);
+        permits[permit_group_key(permit.get_schema().get(), permit.get_op_name(), permit.get_state())].add(permit);
     });
 
     permit_stats total;
@@ -777,6 +790,34 @@ static void do_dump_reader_permit_diagnostics(std::ostream& os, const reader_con
             semaphore.initial_resources().memory - semaphore.available_resources().memory,
             semaphore.initial_resources().memory,
             problem);
+
+    if (permit) {
+        const auto& schema = permit->get_schema();
+        fmt::print(os, "Trigger permit: count={}, memory={}, table={}.{}, operation={}, state={}\n",
+            permit->resources().count,
+            permit->resources().memory,
+            schema ? permit->get_schema()->ks_name() : "*",
+            schema ? permit->get_schema()->cf_name() : "*",
+            permit->get_op_name(),
+            permit->get_state());
+    }
+
+    std::vector<sstring> bottlenecks;
+    if (semaphore.get_stats().need_cpu_permits > 0) {
+        bottlenecks.push_back("CPU");
+    }
+    if (semaphore.available_resources().memory <= 0) {
+        bottlenecks.push_back("memory");
+    }
+    if (semaphore.available_resources().count <= 0) {
+        bottlenecks.push_back("disk");
+    }
+
+    if (!bottlenecks.empty()) {
+        fmt::print(os, "Identified bottleneck(s): {}\n", fmt::join(bottlenecks, ", "));
+    }
+
+    fmt::print(os, "\n");
     total += do_dump_reader_permit_diagnostics(os, permits, max_lines);
     fmt::print(os, "\n");
     const auto& stats = semaphore.get_stats();
@@ -827,13 +868,13 @@ static void do_dump_reader_permit_diagnostics(std::ostream& os, const reader_con
             stats.sstables_read);
 }
 
-void maybe_dump_reader_permit_diagnostics(const reader_concurrency_semaphore& semaphore, std::string_view problem) noexcept {
+void maybe_dump_reader_permit_diagnostics(const reader_concurrency_semaphore& semaphore, std::string_view problem, reader_permit::impl* permit) noexcept {
     static thread_local logger::rate_limit rate_limit(std::chrono::seconds(30));
 
     rcslog.log(log_level::info, rate_limit, "{}", value_of([&] {
         std::ostringstream os;
-        do_dump_reader_permit_diagnostics(os, semaphore, problem);
-        return os.str();
+        do_dump_reader_permit_diagnostics(os, semaphore, problem, permit);
+        return std::move(os).str();
     }));
 }
 
@@ -845,6 +886,12 @@ void reader_concurrency_semaphore::inactive_read_handle::abandon() noexcept {
         auto& sem = permit.semaphore();
         sem.close_reader(std::move(permit.aux_data().ir->reader));
         sem.dequeue_permit(permit);
+        // Break the handle <-> inactive read connection, to prevent the inactive
+        // read attempting to detach(). Not only is that unnecessary (the handle
+        // is abandoning the inactive read), but detach() will reset _permit,
+        // which might be the last permit instance alive. Destroying it could
+        // yank out *this from under our feet.
+        permit.aux_data().ir->handle = nullptr;
         permit.aux_data().ir.reset();
     }
 }
@@ -911,13 +958,15 @@ future<> reader_concurrency_semaphore::execution_loop() noexcept {
             co_return;
         }
 
+        maybe_admit_waiters();
+
         while (!_ready_list.empty()) {
             auto& permit = _ready_list.front();
             dequeue_permit(permit);
             permit.on_executing();
             auto e = std::move(permit.aux_data());
 
-            tracing::trace(permit.trace_state(), "[reader concurrency semaphore] executing read");
+            tracing::trace(permit.trace_state(), "[reader concurrency semaphore {}] executing read", _name);
 
             try {
                 e.func(reader_permit(permit.shared_from_this())).forward_to(std::move(e.pr));
@@ -925,12 +974,15 @@ future<> reader_concurrency_semaphore::execution_loop() noexcept {
                 e.pr.set_exception(std::current_exception());
             }
 
+            // We now possibly have >= CPU concurrency, so even if the above read
+            // didn't release any resources, just dequeueing it from the
+            // _ready_list could allow us to admit new reads.
+            maybe_admit_waiters();
+
             if (need_preempt()) {
                 co_await coroutine::maybe_yield();
             }
         }
-
-        maybe_admit_waiters();
     }
 }
 
@@ -956,7 +1008,7 @@ void reader_concurrency_semaphore::consume(reader_permit::impl& permit, resource
         if (permit.on_oom_kill()) {
             ++_stats.total_reads_killed_due_to_kill_limit;
         }
-        maybe_dump_reader_permit_diagnostics(*this, "kill limit triggered");
+        maybe_dump_reader_permit_diagnostics(*this, "kill limit triggered", &permit);
         throw utils::memory_limit_reached(format("kill limit triggered on semaphore {} by permit {}", _name, permit.description()));
     }
     _resources -= r;
@@ -964,30 +1016,98 @@ void reader_concurrency_semaphore::consume(reader_permit::impl& permit, resource
 
 void reader_concurrency_semaphore::signal(const resources& r) noexcept {
     _resources += r;
-    maybe_admit_waiters();
+    maybe_wake_execution_loop();
 }
 
-reader_concurrency_semaphore::reader_concurrency_semaphore(int count, ssize_t memory, sstring name, size_t max_queue_length,
-            utils::updateable_value<uint32_t> serialize_limit_multiplier, utils::updateable_value<uint32_t> kill_limit_multiplier)
+namespace sm = seastar::metrics;
+static const sm::label class_label("class");
+
+reader_concurrency_semaphore::reader_concurrency_semaphore(
+        utils::updateable_value<int> count,
+        ssize_t memory,
+        sstring name,
+        size_t max_queue_length,
+        utils::updateable_value<uint32_t> serialize_limit_multiplier,
+        utils::updateable_value<uint32_t> kill_limit_multiplier,
+        utils::updateable_value<uint32_t> cpu_concurrency,
+        register_metrics metrics)
     : _initial_resources(count, memory)
     , _resources(count, memory)
+    , _count_observer(count.observe([this] (const int& new_count) { set_resources({new_count, _initial_resources.memory}); }))
     , _name(std::move(name))
     , _max_queue_length(max_queue_length)
     , _serialize_limit_multiplier(std::move(serialize_limit_multiplier))
     , _kill_limit_multiplier(std::move(kill_limit_multiplier))
-{ }
+    , _cpu_concurrency(cpu_concurrency)
+{
+    if (metrics == register_metrics::yes) {
+        _metrics.emplace();
+        _metrics->add_group("database", {
+                sm::make_counter("sstable_read_queue_overloads", _stats.total_reads_shed_due_to_overload,
+                               sm::description("Counts the number of times the sstable read queue was overloaded. "
+                                               "A non-zero value indicates that we have to drop read requests because they arrive faster than we can serve them."),
+                               {class_label(_name)}),
 
-reader_concurrency_semaphore::reader_concurrency_semaphore(no_limits, sstring name)
+                sm::make_gauge("active_reads", [this] { return active_reads(); },
+                               sm::description("Holds the number of currently active read operations. "),
+                               {class_label(_name)}),
+
+                sm::make_gauge("reads_memory_consumption", [this] { return consumed_resources().memory; },
+                               sm::description("Holds the amount of memory consumed by current read operations. "),
+                               {class_label(_name)}),
+
+                sm::make_gauge("queued_reads", _stats.waiters,
+                               sm::description("Holds the number of currently queued read operations."),
+                               {class_label(_name)}),
+
+                sm::make_gauge("paused_reads", _stats.inactive_reads,
+                               sm::description("The number of currently active reads that are temporarily paused."),
+                               {class_label(_name)}),
+
+                sm::make_counter("paused_reads_permit_based_evictions", _stats.permit_based_evictions,
+                               sm::description("The number of paused reads evicted to free up permits."
+                                               " Permits are required for new reads to start, and the database will evict paused reads (if any)"
+                                               " to be able to admit new ones, if there is a shortage of permits."),
+                               {class_label(_name)}),
+
+                sm::make_counter("reads_shed_due_to_overload", _stats.total_reads_shed_due_to_overload,
+                               sm::description("The number of reads shed because the admission queue reached its max capacity."
+                                               " When the queue is full, excessive reads are shed to avoid overload."),
+                               {class_label(_name)}),
+
+                sm::make_gauge("disk_reads", _stats.disk_reads,
+                               sm::description("Holds the number of currently active disk read operations. "),
+                               {class_label(_name)}),
+
+                sm::make_gauge("sstables_read", _stats.sstables_read,
+                               sm::description("Holds the number of currently read sstables. "),
+                               {class_label(_name)}),
+
+                sm::make_counter("total_reads", _stats.total_successful_reads,
+                               sm::description("Counts the total number of successful user reads on this shard."),
+                               {class_label(_name)}),
+
+                sm::make_counter("total_reads_failed", _stats.total_failed_reads,
+                               sm::description("Counts the total number of failed user read operations. "
+                                               "Add the total_reads to this value to get the total amount of reads issued on this shard."),
+                               {class_label(_name)}),
+                });
+    }
+}
+
+reader_concurrency_semaphore::reader_concurrency_semaphore(no_limits, sstring name, register_metrics metrics)
     : reader_concurrency_semaphore(
-            std::numeric_limits<int>::max(),
+            utils::updateable_value(std::numeric_limits<int>::max()),
             std::numeric_limits<ssize_t>::max(),
             std::move(name),
             std::numeric_limits<size_t>::max(),
             utils::updateable_value(std::numeric_limits<uint32_t>::max()),
-            utils::updateable_value(std::numeric_limits<uint32_t>::max())) {}
+            utils::updateable_value(std::numeric_limits<uint32_t>::max()),
+            utils::updateable_value(uint32_t(1)),
+            metrics) {}
 
 reader_concurrency_semaphore::~reader_concurrency_semaphore() {
-    assert(!_stats.waiters);
+    SCYLLA_ASSERT(!_stats.waiters);
     if (!_stats.total_permits) {
         // We allow destroy without stop() when the semaphore wasn't used at all yet.
         return;
@@ -996,12 +1116,13 @@ reader_concurrency_semaphore::~reader_concurrency_semaphore() {
         on_internal_error_noexcept(rcslog, format("~reader_concurrency_semaphore(): semaphore {} not stopped before destruction", _name));
         // With the below conditions, we can get away with the semaphore being
         // unstopped. In this case don't force an abort.
-        assert(_inactive_reads.empty() && !_close_readers_gate.get_count() && !_permit_gate.get_count() && !_execution_loop_future);
+        SCYLLA_ASSERT(_inactive_reads.empty() && !_close_readers_gate.get_count() && !_permit_gate.get_count() && !_execution_loop_future);
         broken();
     }
 }
 
-reader_concurrency_semaphore::inactive_read_handle reader_concurrency_semaphore::register_inactive_read(flat_mutation_reader_v2 reader) noexcept {
+reader_concurrency_semaphore::inactive_read_handle reader_concurrency_semaphore::register_inactive_read(mutation_reader reader,
+        const dht::partition_range* range) noexcept {
     auto& permit = reader.permit();
     if (permit->get_state() == reader_permit::state::waiting_for_memory) {
         // Kill all outstanding memory requests, the read is going to be evicted.
@@ -1011,11 +1132,11 @@ reader_concurrency_semaphore::inactive_read_handle reader_concurrency_semaphore:
     permit->on_register_as_inactive();
     if (_blessed_permit == &*permit) {
         _blessed_permit = nullptr;
-        maybe_admit_waiters();
+        maybe_wake_execution_loop();
     }
     if (!should_evict_inactive_read()) {
       try {
-        permit->aux_data().ir.emplace(std::move(reader));
+        permit->aux_data().ir.emplace(std::move(reader), range);
         permit->unlink();
         _inactive_reads.push_back(*permit);
         ++_stats.inactive_reads;
@@ -1040,14 +1161,11 @@ void reader_concurrency_semaphore::set_notify_handler(inactive_read_handle& irh,
     auto& ir = *(*irh._permit)->aux_data().ir;
     ir.notify_handler = std::move(notify_handler);
     if (ttl_opt) {
-        ir.ttl_timer.set_callback([this, permit = *irh._permit] () mutable {
-            evict(*permit, evict_reason::time);
-        });
-        ir.ttl_timer.arm(lowres_clock::now() + *ttl_opt);
+        irh._permit->set_timeout(lowres_clock::now() + *ttl_opt);
     }
 }
 
-flat_mutation_reader_v2_opt reader_concurrency_semaphore::unregister_inactive_read(inactive_read_handle irh) {
+mutation_reader_opt reader_concurrency_semaphore::unregister_inactive_read(inactive_read_handle irh) {
     if (!irh) {
         return {};
     }
@@ -1089,14 +1207,21 @@ void reader_concurrency_semaphore::clear_inactive_reads() {
     }
 }
 
-future<> reader_concurrency_semaphore::evict_inactive_reads_for_table(table_id id) noexcept {
+future<> reader_concurrency_semaphore::evict_inactive_reads_for_table(table_id id, const dht::partition_range* range) noexcept {
+    auto overlaps_with_range = [range] (const reader_concurrency_semaphore::inactive_read& ir) {
+        if (!range || !ir.range) {
+            return true;
+        }
+        return ir.range->overlaps(*range, dht::ring_position_comparator(*ir.reader.schema()));
+    };
+
     permit_list_type evicted_readers;
     auto it = _inactive_reads.begin();
     while (it != _inactive_reads.end()) {
         auto& permit = *it;
         auto& ir = *permit.aux_data().ir;
         ++it;
-        if (ir.reader.schema()->id() == id) {
+        if (ir.reader.schema()->id() == id && overlaps_with_range(ir)) {
             do_detach_inactive_reader(permit, evict_reason::manual);
             permit.unlink();
             evicted_readers.push_back(permit);
@@ -1118,7 +1243,7 @@ std::runtime_error reader_concurrency_semaphore::stopped_exception() {
 }
 
 future<> reader_concurrency_semaphore::stop() noexcept {
-    assert(!_stopped);
+    SCYLLA_ASSERT(!_stopped);
     _stopped = true;
     co_await stop_ext_pre();
     clear_inactive_reads();
@@ -1138,10 +1263,9 @@ future<> reader_concurrency_semaphore::stop() noexcept {
 void reader_concurrency_semaphore::do_detach_inactive_reader(reader_permit::impl& permit, evict_reason reason) noexcept {
     dequeue_permit(permit);
     auto& ir = *permit.aux_data().ir;
-    ir.ttl_timer.cancel();
     ir.detach();
     ir.reader.permit()->on_evicted();
-    tracing::trace(permit.trace_state(), "[reader_concurrency_semaphore] evicted, reason: {}", reason);
+    tracing::trace(permit.trace_state(), "[reader_concurrency_semaphore {}] evicted, reason: {}", _name, reason);
     try {
         if (ir.notify_handler) {
             ir.notify_handler(reason);
@@ -1161,7 +1285,7 @@ void reader_concurrency_semaphore::do_detach_inactive_reader(reader_permit::impl
     }
 }
 
-flat_mutation_reader_v2 reader_concurrency_semaphore::detach_inactive_reader(reader_permit::impl& permit, evict_reason reason) noexcept {
+mutation_reader reader_concurrency_semaphore::detach_inactive_reader(reader_permit::impl& permit, evict_reason reason) noexcept {
     do_detach_inactive_reader(permit, reason);
     auto irp = std::move(permit.aux_data().ir);
     return std::move(irp->reader);
@@ -1171,7 +1295,7 @@ void reader_concurrency_semaphore::evict(reader_permit::impl& permit, evict_reas
     close_reader(detach_inactive_reader(permit, reason));
 }
 
-void reader_concurrency_semaphore::close_reader(flat_mutation_reader_v2 reader) {
+void reader_concurrency_semaphore::close_reader(mutation_reader reader) {
     // It is safe to discard the future since it is waited on indirectly
     // by closing the _close_readers_gate in stop().
     (void)with_gate(_close_readers_gate, [reader = std::move(reader)] () mutable {
@@ -1185,15 +1309,15 @@ bool reader_concurrency_semaphore::has_available_units(const resources& r) const
     return (_resources.non_zero() && _resources.count >= r.count && _resources.memory >= r.memory) || _resources.count == _initial_resources.count;
 }
 
-bool reader_concurrency_semaphore::all_need_cpu_permits_are_awaiting() const {
-    return _stats.need_cpu_permits == _stats.awaits_permits;
+bool reader_concurrency_semaphore::cpu_concurrency_limit_reached() const {
+    return (_stats.need_cpu_permits - _stats.awaits_permits) >= _cpu_concurrency();
 }
 
 std::exception_ptr reader_concurrency_semaphore::check_queue_size(std::string_view queue_name) {
     if (_stats.waiters >= _max_queue_length) {
         _stats.total_reads_shed_due_to_overload++;
-        maybe_dump_reader_permit_diagnostics(*this, fmt::format("{} queue overload", queue_name));
-        return std::make_exception_ptr(std::runtime_error(format("{}: {} queue overload", _name, queue_name)));
+        maybe_dump_reader_permit_diagnostics(*this, fmt::format("{} queue overload", queue_name), nullptr);
+        return std::make_exception_ptr(std::runtime_error(fmt::format("{}: {} queue overload", _name, queue_name)));
     }
     return {};
 }
@@ -1269,12 +1393,12 @@ reader_concurrency_semaphore::can_admit_read(const reader_permit::impl& permit) 
         return {can_admit::no, reason::ready_list};
     }
 
-    if (!all_need_cpu_permits_are_awaiting()) {
+    if (cpu_concurrency_limit_reached()) {
         return {can_admit::no, reason::need_cpu_permits};
     }
 
     if (!has_available_units(permit.base_resources())) {
-        auto reason = _resources.memory >= permit.base_resources().memory ? reason::memory_resources : reason::count_resources;
+        auto reason = _resources.memory >= permit.base_resources().memory ? reason::count_resources : reason::memory_resources;
         if (_inactive_reads.empty()) {
             return {can_admit::no, reason};
         } else {
@@ -1319,18 +1443,17 @@ future<> reader_concurrency_semaphore::do_wait_admission(reader_permit::impl& pe
 
     const auto [admit, why] = can_admit_read(permit);
     ++(_stats.*stats_table[static_cast<int>(why)]);
-    tracing::trace(permit.trace_state(), "[reader concurrency semaphore] {}", result_as_string[static_cast<int>(why)]);
+    tracing::trace(permit.trace_state(), "[reader concurrency semaphore {}] {}", _name, result_as_string[static_cast<int>(why)]);
     if (admit != can_admit::yes || !_wait_list.empty()) {
         auto fut = enqueue_waiter(permit, wait_on::admission);
         if (admit == can_admit::yes && !_wait_list.empty()) {
-            // This is a contradiction: the semaphore could admit waiters yet it has waiters.
-            // Normally, the semaphore should admit waiters as soon as it can.
-            // So at any point in time, there should either be no waiters, or it
-            // shouldn't be able to admit new reads. Otherwise something went wrong.
-            maybe_dump_reader_permit_diagnostics(*this, "semaphore could admit new reads yet there are waiters");
-            maybe_admit_waiters();
+            // Enters the case where the semaphore can admit waiters yet it has waiters.
+            // Hence, wake the execution loop to process the waiters. Since readers are
+            // no longer admitted as soon as they can, the resource release could be delayed
+            // as well.
+            maybe_wake_execution_loop();
         } else if (admit == can_admit::maybe) {
-            tracing::trace(permit.trace_state(), "[reader concurrency semaphore] evicting inactive reads in the background to free up resources");
+            tracing::trace(permit.trace_state(), "[reader concurrency semaphore {}] evicting inactive reads in the background to free up resources", _name);
             ++_stats.reads_queued_with_eviction;
             evict_readers_in_background();
         }
@@ -1374,6 +1497,12 @@ void reader_concurrency_semaphore::maybe_admit_waiters() noexcept {
     if (admit == can_admit::maybe) {
         // Evicting readers will trigger another call to `maybe_admit_waiters()` from `signal()`.
         evict_readers_in_background();
+    }
+}
+
+void reader_concurrency_semaphore::maybe_wake_execution_loop() noexcept {
+    if (!_wait_list.empty()) {
+        _ready_list_cv.signal();
     }
 }
 
@@ -1433,7 +1562,7 @@ void reader_concurrency_semaphore::on_permit_destroyed(reader_permit::impl& perm
     --_stats.current_permits;
     if (_blessed_permit == &permit) {
         _blessed_permit = nullptr;
-        maybe_admit_waiters();
+        maybe_wake_execution_loop();
     }
 }
 
@@ -1442,54 +1571,54 @@ void reader_concurrency_semaphore::on_permit_need_cpu() noexcept {
 }
 
 void reader_concurrency_semaphore::on_permit_not_need_cpu() noexcept {
-    assert(_stats.need_cpu_permits);
+    SCYLLA_ASSERT(_stats.need_cpu_permits);
     --_stats.need_cpu_permits;
-    assert(_stats.need_cpu_permits >= _stats.awaits_permits);
-    maybe_admit_waiters();
+    SCYLLA_ASSERT(_stats.need_cpu_permits >= _stats.awaits_permits);
+    maybe_wake_execution_loop();
 }
 
 void reader_concurrency_semaphore::on_permit_awaits() noexcept {
     ++_stats.awaits_permits;
-    assert(_stats.need_cpu_permits >= _stats.awaits_permits);
-    maybe_admit_waiters();
+    SCYLLA_ASSERT(_stats.need_cpu_permits >= _stats.awaits_permits);
+    maybe_wake_execution_loop();
 }
 
 void reader_concurrency_semaphore::on_permit_not_awaits() noexcept {
-    assert(_stats.awaits_permits);
+    SCYLLA_ASSERT(_stats.awaits_permits);
     --_stats.awaits_permits;
 }
 
-future<reader_permit> reader_concurrency_semaphore::obtain_permit(const schema* const schema, const char* const op_name, size_t memory,
+future<reader_permit> reader_concurrency_semaphore::obtain_permit(schema_ptr schema, const char* const op_name, size_t memory,
         db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr) {
-    auto permit = reader_permit(*this, schema, std::string_view(op_name), {1, static_cast<ssize_t>(memory)}, timeout, std::move(trace_ptr));
+    auto permit = reader_permit(*this, std::move(schema), std::string_view(op_name), {1, static_cast<ssize_t>(memory)}, timeout, std::move(trace_ptr));
     return do_wait_admission(*permit).then([permit] () mutable {
         return std::move(permit);
     });
 }
 
-future<reader_permit> reader_concurrency_semaphore::obtain_permit(const schema* const schema, sstring&& op_name, size_t memory,
+future<reader_permit> reader_concurrency_semaphore::obtain_permit(schema_ptr schema, sstring&& op_name, size_t memory,
         db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr) {
-    auto permit = reader_permit(*this, schema, std::move(op_name), {1, static_cast<ssize_t>(memory)}, timeout, std::move(trace_ptr));
+    auto permit = reader_permit(*this, std::move(schema), std::move(op_name), {1, static_cast<ssize_t>(memory)}, timeout, std::move(trace_ptr));
     return do_wait_admission(*permit).then([permit] () mutable {
         return std::move(permit);
     });
 }
 
-reader_permit reader_concurrency_semaphore::make_tracking_only_permit(const schema* const schema, const char* const op_name,
+reader_permit reader_concurrency_semaphore::make_tracking_only_permit(schema_ptr schema, const char* const op_name,
         db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr) {
-    return reader_permit(*this, schema, std::string_view(op_name), {}, timeout, std::move(trace_ptr));
+    return reader_permit(*this, std::move(schema), std::string_view(op_name), {}, timeout, std::move(trace_ptr));
 }
 
-reader_permit reader_concurrency_semaphore::make_tracking_only_permit(const schema* const schema, sstring&& op_name,
+reader_permit reader_concurrency_semaphore::make_tracking_only_permit(schema_ptr schema, sstring&& op_name,
         db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr) {
-    return reader_permit(*this, schema, std::move(op_name), {}, timeout, std::move(trace_ptr));
+    return reader_permit(*this, std::move(schema), std::move(op_name), {}, timeout, std::move(trace_ptr));
 }
 
-future<> reader_concurrency_semaphore::with_permit(const schema* const schema, const char* const op_name, size_t memory,
-        db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr, read_func func) {
-    auto permit = reader_permit(*this, schema, std::string_view(op_name), {1, static_cast<ssize_t>(memory)}, timeout, std::move(trace_ptr));
+future<> reader_concurrency_semaphore::with_permit(schema_ptr schema, const char* const op_name, size_t memory,
+        db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr, reader_permit_opt& permit_holder, read_func func) {
+    permit_holder = reader_permit(*this, std::move(schema), std::string_view(op_name), {1, static_cast<ssize_t>(memory)}, timeout, std::move(trace_ptr));
+    auto permit = *permit_holder;
     permit->aux_data().func = std::move(func);
-    permit->aux_data().permit_keepalive = permit;
     return do_wait_admission(*permit);
 }
 
@@ -1517,7 +1646,7 @@ void reader_concurrency_semaphore::set_resources(resources r) {
     auto delta = r - _initial_resources;
     _initial_resources = r;
     _resources += delta;
-    maybe_admit_waiters();
+    maybe_wake_execution_loop();
 }
 
 void reader_concurrency_semaphore::broken(std::exception_ptr ex) {
@@ -1533,15 +1662,16 @@ void reader_concurrency_semaphore::broken(std::exception_ptr ex) {
 
 std::string reader_concurrency_semaphore::dump_diagnostics(unsigned max_lines) const {
     std::ostringstream os;
-    do_dump_reader_permit_diagnostics(os, *this, "user request", max_lines);
-    return os.str();
+    do_dump_reader_permit_diagnostics(os, *this, "user request", nullptr, max_lines);
+    return std::move(os).str();
 }
 
 void reader_concurrency_semaphore::foreach_permit(noncopyable_function<void(const reader_permit::impl&)> func) const {
-    boost::for_each(_permit_list, std::ref(func));
-    boost::for_each(_wait_list._admission_queue, std::ref(func));
-    boost::for_each(_wait_list._memory_queue, std::ref(func));
-    boost::for_each(_ready_list, std::ref(func));
+    std::ranges::for_each(_permit_list, std::ref(func));
+    std::ranges::for_each(_wait_list._admission_queue, std::ref(func));
+    std::ranges::for_each(_wait_list._memory_queue, std::ref(func));
+    std::ranges::for_each(_ready_list, std::ref(func));
+    std::ranges::for_each(_inactive_reads, std::ref(func));
 }
 
 void reader_concurrency_semaphore::foreach_permit(noncopyable_function<void(const reader_permit&)> func) const {

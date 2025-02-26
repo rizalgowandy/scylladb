@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # Copyright 2020-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for the KeyConditions parameter of the Query operation.
 # KeyConditions is the older version of the newer "KeyConditionExpression"
@@ -9,7 +9,9 @@
 
 import pytest
 from botocore.exceptions import ClientError
-from util import random_string, random_bytes, full_query, multiset
+
+from test.alternator.util import random_string, random_bytes, full_query, multiset
+
 
 # The test_table_{sn,ss,sb}_with_sorted_partition fixtures are the regular
 # test_table_{sn,ss,sb} fixture with a partition inserted with many items.

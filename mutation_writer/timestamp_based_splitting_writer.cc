@@ -3,15 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "mutation_writer/timestamp_based_splitting_writer.hh"
 
-#include <cinttypes>
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/range/algorithm/min_element.hpp>
+#include <optional>
 #include <seastar/core/shared_mutex.hh>
+#include <seastar/core/when_all.hh>
+
+#include "mutation_writer/feed_writers.hh"
 
 namespace mutation_writer {
 
@@ -179,13 +180,13 @@ future<> timestamp_based_splitting_mutation_writer::write_to_bucket(bucket_id bu
     // We can explicitly write a partition-start fragment when the partition has
     // a partition tombstone.
     if (mf.is_partition_start()) {
-        return writer.consume(std::move(mf)).then([this, bucket = it->first, &writer] {
+        return writer.consume(std::move(mf)).then([this, bucket, &writer] {
             writer.set_has_current_partition();
             _buckets_used_for_current_partition.push_back(bucket);
         });
     }
 
-    return writer.consume(mutation_fragment_v2(*_schema, _permit, partition_start(_current_partition_start))).then([this, bucket = it->first, &writer, mf = std::move(mf)] () mutable {
+    return writer.consume(mutation_fragment_v2(*_schema, _permit, partition_start(_current_partition_start))).then([this, bucket, &writer, mf = std::move(mf)] () mutable {
         writer.set_has_current_partition();
         _buckets_used_for_current_partition.push_back(bucket);
         return writer.consume(std::move(mf));
@@ -198,25 +199,20 @@ std::optional<timestamp_based_splitting_mutation_writer::bucket_id> timestamp_ba
         return _classifier(cell.as_atomic_cell(cdef).timestamp());
     }
     if (cdef.type->is_collection() || cdef.type->is_user_type()) {
-        std::optional<bucket_id> bucket;
-        bool mismatch = false;
-        cell.as_collection_mutation().with_deserialized(*cdef.type, [&, this] (collection_mutation_view_description mv) {
+        return cell.as_collection_mutation().with_deserialized(*cdef.type, [this] (collection_mutation_view_description mv) {
+            std::optional<bucket_id> bucket;
             if (mv.tomb) {
                 bucket = _classifier(mv.tomb.timestamp);
             }
             for (auto&& c : mv.cells) {
-                if (mismatch) {
-                    break;
-                }
                 const auto this_bucket = _classifier(c.second.timestamp());
-                mismatch |= bucket.value_or(this_bucket) != this_bucket;
+                if (bucket && *bucket != this_bucket) {
+                    return std::optional<bucket_id>{};
+                }
                 bucket = this_bucket;
             }
+            return bucket;
         });
-        if (mismatch) {
-            bucket.reset();
-        }
-        return bucket;
     }
     throw std::runtime_error(fmt::format("Cannot classify timestamp of cell (column {} of unknown type {})", cdef.name_as_text(), cdef.type->name()));
 }
@@ -445,7 +441,7 @@ future<> timestamp_based_splitting_mutation_writer::consume(partition_end&& pe) 
     });
 }
 
-future<> segregate_by_timestamp(flat_mutation_reader_v2 producer, classify_by_timestamp classifier, reader_consumer_v2 consumer) {
+future<> segregate_by_timestamp(mutation_reader producer, classify_by_timestamp classifier, reader_consumer_v2 consumer) {
     //FIXME: make this into a consume() variant?
     auto schema = producer.schema();
     auto permit = producer.permit();

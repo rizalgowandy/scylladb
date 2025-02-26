@@ -3,23 +3,21 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <seastar/core/distributed.hh>
-#include <seastar/core/future.hh>
-#include <seastar/core/distributed.hh>
+#include <seastar/core/future.hh>  // IWYU pragma: keep
 #include <seastar/core/weak_ptr.hh>
 
 #include "utils/hash.hh"
 #include "schema/schema_fwd.hh"
-#include "readers/flat_mutation_reader_v2.hh"
+#include "readers/mutation_reader.hh"
 #include "utils/top_k.hh"
 #include "schema/schema_registry.hh"
 
-#include <vector>
 #include <set>
 
 class frozen_mutation;
@@ -36,13 +34,13 @@ public:
     // Invoked for each query (both data query and mutation query) when a mutation reader is created.
     // Paging queries may invoke this once for a page, or less often, depending on whether they hit in the querier cache or not.
     //
-    // The flat_mutation_reader passed to this method is the reader from which the query results are built (uncompacted).
+    // The mutation_reader passed to this method is the reader from which the query results are built (uncompacted).
     // This method replaces that reader with the one returned from this method.
     // This allows the listener to install on-the-fly processing for the mutation stream.
     //
     // The schema_ptr passed is the one which corresponds to the reader, not the current schema of the table.
-    virtual flat_mutation_reader_v2 on_read(const schema_ptr& s, const dht::partition_range& range,
-            const query::partition_slice& slice, flat_mutation_reader_v2&& rd) {
+    virtual mutation_reader on_read(const schema_ptr& s, const dht::partition_range& range,
+            const query::partition_slice& slice, mutation_reader&& rd) {
         return std::move(rd);
     }
 };
@@ -54,8 +52,8 @@ public:
     void install(data_listener* listener);
     void uninstall(data_listener* listener);
 
-    flat_mutation_reader_v2 on_read(const schema_ptr& s, const dht::partition_range& range,
-            const query::partition_slice& slice, flat_mutation_reader_v2&& rd);
+    mutation_reader on_read(const schema_ptr& s, const dht::partition_range& range,
+            const query::partition_slice& slice, mutation_reader&& rd);
     void on_write(const schema_ptr& s, const frozen_mutation& m);
 
     bool exists(data_listener* listener) const;
@@ -131,8 +129,8 @@ public:
     toppartitions_data_listener(replica::database& db, std::unordered_set<std::tuple<sstring, sstring>, utils::tuple_hash> table_filters, std::unordered_set<sstring> keyspace_filters);
     ~toppartitions_data_listener();
 
-    virtual flat_mutation_reader_v2 on_read(const schema_ptr& s, const dht::partition_range& range,
-            const query::partition_slice& slice, flat_mutation_reader_v2&& rd) override;
+    virtual mutation_reader on_read(const schema_ptr& s, const dht::partition_range& range,
+            const query::partition_slice& slice, mutation_reader&& rd) override;
 
     virtual void on_write(const schema_ptr& s, const frozen_mutation& m) override;
 

@@ -5,40 +5,40 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include <seastar/core/coroutine.hh>
+#include <tuple>
 #include "cql3/statements/schema_altering_statement.hh"
 #include "locator/abstract_replication_strategy.hh"
 #include "data_dictionary/data_dictionary.hh"
-#include "mutation/mutation.hh"
 #include "cql3/query_processor.hh"
-#include "transport/messages/result_message.hh"
-#include "service/raft/raft_group_registry.hh"
-#include "service/migration_manager.hh"
+#include "service/raft/raft_group0_client.hh"
 
 namespace cql3 {
 
 namespace statements {
 
+static logging::logger logger("schema_altering_statement");
+
 schema_altering_statement::schema_altering_statement(timeout_config_selector timeout_selector)
     : cf_statement(cf_name())
     , cql_statement_no_metadata(timeout_selector)
-    , _is_column_family_level{false}
-{
-  needs_guard = true;
+    , _is_column_family_level{false} {
 }
 
 schema_altering_statement::schema_altering_statement(cf_name name, timeout_config_selector timeout_selector)
     : cf_statement{std::move(name)}
     , cql_statement_no_metadata(timeout_selector)
-    , _is_column_family_level{true}
-{
-  needs_guard = true;
+    , _is_column_family_level{true} {
 }
 
-future<> schema_altering_statement::grant_permissions_to_creator(const service::client_state&) const {
+bool schema_altering_statement::needs_guard(query_processor&, service::query_state&) const {
+    return true;
+}
+
+future<> schema_altering_statement::grant_permissions_to_creator(const service::client_state&, service::group0_batch&) const {
     return make_ready_future<>();
 }
 
@@ -74,18 +74,26 @@ schema_altering_statement::execute(query_processor& qp, service::query_state& st
             throw std::logic_error(format("Attempted to modify {} via internal query: such schema changes are not propagated and thus illegal", info));
         }
     }
+    service::group0_batch mc{std::move(guard)};
+    auto result = co_await qp.execute_schema_statement(*this, state, options, mc);
+    co_await qp.announce_schema_statement(*this, mc);
+    co_return std::move(result);
+}
 
-    return qp.execute_schema_statement(*this, state, options, std::move(guard)).then([this, &state, internal](::shared_ptr<messages::result_message> result) {
-        // We don't want to grant the permissions to the supposed creator even if the statement succeeded if it's an internal query
-        // or if the query did not actually create the item, i.e. the query is bounced to another shard or it's a IF NOT EXISTS
-        // query where the item already exists.
-        auto permissions_granted_fut = internal || !result->is_schema_change()
-                ? make_ready_future<>()
-                : grant_permissions_to_creator(state.get_client_state());
-        return permissions_granted_fut.then([result = std::move(result)] {
-           return result;
-        });
-    });
+future<std::tuple<::shared_ptr<schema_altering_statement::event_t>, std::vector<mutation>, cql3::cql_warnings_vec>> schema_altering_statement::prepare_schema_mutations(query_processor& qp, const query_options& options, api::timestamp_type) const {
+    // derived class must implement one of prepare_schema_mutations overloads
+    on_internal_error(logger, "not implemented");
+    co_return std::make_tuple(::shared_ptr<event_t>(nullptr), std::vector<mutation>{}, cql3::cql_warnings_vec{});
+}
+
+future<std::tuple<::shared_ptr<schema_altering_statement::event_t>, cql3::cql_warnings_vec>> schema_altering_statement::prepare_schema_mutations(query_processor& qp, service::query_state& state, const query_options& options, service::group0_batch& mc) const {
+    auto [ret, muts, cql_warnings] = co_await prepare_schema_mutations(qp, options, mc.write_timestamp());
+    mc.add_mutations(std::move(muts));
+    co_return std::make_tuple(ret, cql_warnings);
+}
+
+audit::statement_category schema_altering_statement::category() const {
+    return audit::statement_category::DDL;
 }
 
 }

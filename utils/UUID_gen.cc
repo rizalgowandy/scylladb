@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "UUID_gen.hh"
@@ -15,6 +15,7 @@
 #include <net/if_arp.h>
 #endif // __linux__
 
+#include <atomic>
 #include <stdlib.h>
 #include "utils/hashers.hh"
 
@@ -121,8 +122,8 @@ UUID UUID_gen::get_name_UUID(bytes_view b) {
     return get_name_UUID(reinterpret_cast<const unsigned char*>(b.begin()), b.size());
 }
 
-UUID UUID_gen::get_name_UUID(sstring_view s) {
-    static_assert(sizeof(char) == sizeof(sstring_view::value_type), "Assumed that str.size() counts in chars");
+UUID UUID_gen::get_name_UUID(std::string_view s) {
+    static_assert(sizeof(char) == sizeof(std::string_view::value_type), "Assumed that str.size() counts in chars");
     return get_name_UUID(reinterpret_cast<const unsigned char*>(s.begin()), s.size());
 }
 

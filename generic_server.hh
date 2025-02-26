@@ -3,19 +3,21 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include "log.hh"
+#include "utils/log.hh"
 
 #include "seastarx.hh"
 
 #include <list>
 
+#include <seastar/core/file-types.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/util/noncopyable_function.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/tls.hh>
 
@@ -34,6 +36,11 @@ class server;
 // member function to perform request processing. This base class provides a
 // `_read_buf` and a `_write_buf` for reading requests and writing responses.
 class connection : public boost::intrusive::list_base_hook<> {
+public:
+    using connection_process_loop = noncopyable_function<future<> ()>;
+    using execute_under_tenant_type = noncopyable_function<future<> (connection_process_loop)>;
+    bool _tenant_switch = false;
+    execute_under_tenant_type _execute_under_current_tenant = no_tenant();
 protected:
     server& _server;
     connected_socket _fd;
@@ -41,7 +48,10 @@ protected:
     output_stream<char> _write_buf;
     future<> _ready_to_respond = make_ready_future<>();
     seastar::gate _pending_requests_gate;
+    seastar::gate::holder _hold_server;
 
+private:
+    future<> process_until_tenant_switch();
 public:
     connection(server& server, connected_socket&& fd);
     virtual ~connection();
@@ -55,6 +65,10 @@ public:
     virtual void on_connection_close();
 
     virtual future<> shutdown();
+
+    void switch_tenant(execute_under_tenant_type execute);
+
+    static execute_under_tenant_type no_tenant();
 };
 
 // A generic TCP socket server.
@@ -76,10 +90,8 @@ class server {
 protected:
     sstring _server_name;
     logging::logger& _logger;
-    bool _stopping = false;
-    promise<> _all_connections_stopped;
-    uint64_t _current_connections = 0;
-    uint64_t _connections_being_accepted = 0;
+    seastar::gate _gate;
+    future<> _all_connections_stopped = make_ready_future<>();
     uint64_t _total_connections = 0;
     future<> _listeners_stopped = make_ready_future<>();
     using connections_list_t = boost::intrusive::list<connection>;
@@ -92,6 +104,7 @@ protected:
     };
     std::list<gentle_iterator> _gentle_iterators;
     std::vector<server_socket> _listeners;
+    shared_ptr<seastar::tls::server_credentials> _credentials;
 
 public:
     server(const sstring& server_name, logging::logger& logger);
@@ -107,7 +120,12 @@ public:
     future<> shutdown();
     future<> stop();
 
-    future<> listen(socket_address addr, std::shared_ptr<seastar::tls::credentials_builder> creds, bool is_shard_aware, bool keepalive);
+    future<> listen(socket_address addr, 
+        std::shared_ptr<seastar::tls::credentials_builder> creds, 
+        bool is_shard_aware, bool keepalive, 
+        std::optional<file_permissions> unix_domain_socket_permissions,
+        std::function<server&()> get_shard_instance = {}
+        );
 
     future<> do_accepts(int which, bool keepalive, socket_address server_addr);
 
@@ -119,8 +137,6 @@ protected:
     virtual future<> unadvertise_connection(shared_ptr<connection> conn);
 
     future<> for_each_gently(noncopyable_function<void(connection&)>);
-
-    void maybe_stop();
 };
 
 }

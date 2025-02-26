@@ -3,8 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
+
+#include <random>
 
 #include "test/lib/scylla_test_case.hh"
 #include "utils/stall_free.hh"
@@ -123,7 +125,7 @@ SEASTAR_THREAD_TEST_CASE(test_clear_gently_foreign_ptr) {
             cleared_gently++;
         });
         return make_foreign<lw_shared_ptr<clear_gently_tracker<int>>>(std::move(p));
-    }).get0();
+    }).get();
 
     utils::clear_gently(p0).get();
     BOOST_CHECK(p0);
@@ -529,4 +531,16 @@ SEASTAR_THREAD_TEST_CASE(test_clear_gently_vector_of_optimized_optionals) {
 
     utils::clear_gently(v).get();
     BOOST_REQUIRE_EQUAL(cleared_gently, 1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_reserve_gently_with_chunked_vector) {
+    auto rand = std::default_random_engine();
+    auto size_dist = std::uniform_int_distribution<unsigned>(1, 1 << 12);
+
+    for (int i = 0; i < 100; ++i) {
+        utils::chunked_vector<uint8_t, 512> v;
+        const auto size = size_dist(rand);
+        utils::reserve_gently(v, size).get();
+        BOOST_REQUIRE_EQUAL(v.capacity(), size);
+    }
 }

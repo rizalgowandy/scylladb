@@ -4,17 +4,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "test/lib/scylla_test_case.hh"
 #include <seastar/testing/thread_test_case.hh>
 
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <fmt/core.h>
 #include <string>
 
 #include "utils/double-decker.hh"
+#include "utils/logalloc.hh"
 #include "test/lib/random_utils.hh"
 
 class compound_key {

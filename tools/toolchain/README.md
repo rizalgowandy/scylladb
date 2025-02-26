@@ -35,7 +35,7 @@ The above command works as follows:
    container, so the same directory can be reused.
 3. The ":z" flag is necessary on systems with SELinux enabled, and causes a
    special selinux label to be applied to $HOME/.ccache so docker can write
-   it it. While this (rightfully) sounds fishy, note that dbuild already does
+   it. While this (rightfully) sounds fishy, note that dbuild already does
    the same thing to your current directory, where the build output is
    written - the current directory is also mounted with the ":z" flag.
 
@@ -94,8 +94,10 @@ another using native systems, which requires access to aarch64 and s390x machine
    commit it. The commit updating install-dependencies.sh should
    include the toolchain change, for atomicity. Do not push the commit
    to `next` yet.
-2. Run `tools/toolchain/prepare` and wait. It requires `buildah` and
-   `qemu-user-static` to be installed (and will complain if they are not).
+2. Run `tools/toolchain/prepare --clang-build-mode INSTALL_FROM --clang-archive <filename to the archive>` and wait.
+   The clang archive need to be download prior to build.
+   It requires `buildah` and `qemu-user-static` to be installed
+   (and will complain if they are not).
 3. Publish the image using the instructions printed by the previous step.
 4. Push the `next` branch that refers to the new toolchain.
 
@@ -110,14 +112,11 @@ another using native systems, which requires access to aarch64 and s390x machine
     1. check out the branch containing the new toolchain name
     2. Run `git submodule update --init --recursive` to make sure
        all the submodules are synchronized
-    3. Run `podman build --no-cache --pull --tag mytag-arch -f tools/toolchain/Dockerfile .`, where mytag-arch is a new, unique tag that is different for x86 and ARM.
-    4. Push the resulting images to a personal docker repository.
+    3. Run `tools/toolchain/prepare --clang-build-mode INSTALL_FROM --clang-archive <archive-path> --disable-multiarch`. This should complete relatively quickly.
 4. Now, create a multiarch image with the following:
-    1. Pull the two images with `podman pull`. Let's call the two tags
-       `mytag-x86` and `mytag-arm`.
-    2. Create the new toolchain manifest with `podman manifest create $(<tools/toolchain/image)`
-    3. Add each image with `podman manifest add --all $(<tools/toolchain/image) mytag-x86` and `podman manifest add --all $(<tools/toolchain/image) mytag-arm`
-    4. Push the image with `podman manifest push --all $(<tools/toolchain/image) docker://$(<tools/toolchain/image)`
+    1. Push one of the images using the `podman manifest push` command suggested by `tools/toolchain/prepare`.
+    2. For the other image, first merge the other image into it. This is done by using the command from step 1, but replacing `push` with `add`. For example, if in step 1 you pushed the x86_64 image, in step 2 you add the x86_64 image to the local aarch64 image. This creates a local image supporting the two architectures.
+    3. Push the combined image using the `podman manifest push` command suggested by `tools/toolchain/prepare`. This replaces the single-architecture image with a two-architecture image.
 5. Now push the commit that updated the toolchain with `git push`.
 
 ## Troubleshooting

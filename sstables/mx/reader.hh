@@ -3,24 +3,23 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include "readers/flat_mutation_reader_fwd.hh"
-#include "readers/flat_mutation_reader_v2.hh"
+#include "readers/mutation_reader_fwd.hh"
+#include "readers/mutation_reader.hh"
 #include "sstables/progress_monitor.hh"
+#include "sstables/types_fwd.hh"
 
 namespace sstables {
 namespace mx {
 
 // Precondition: if the slice is reversed, the schema must be reversed as well
 // and the range must be singular (`range.is_singular()`).
-// Reversed slices must be provided in the 'half-reversed' format (the order of ranges
-// being reversed, but the ranges themselves are not).
 // Fast-forwarding is not supported in reversed queries (FIXME).
-flat_mutation_reader_v2 make_reader(
+mutation_reader make_reader(
         shared_sstable sstable,
         schema_ptr schema,
         reader_permit permit,
@@ -29,10 +28,11 @@ flat_mutation_reader_v2 make_reader(
         tracing::trace_state_ptr trace_state,
         streamed_mutation::forwarding fwd,
         mutation_reader::forwarding fwd_mr,
-        read_monitor& monitor);
+        read_monitor& monitor,
+        integrity_check integrity);
 
 // Same as above but the slice is moved and stored inside the reader.
-flat_mutation_reader_v2 make_reader(
+mutation_reader make_reader(
         shared_sstable sstable,
         schema_ptr schema,
         reader_permit permit,
@@ -41,16 +41,18 @@ flat_mutation_reader_v2 make_reader(
         tracing::trace_state_ptr trace_state,
         streamed_mutation::forwarding fwd,
         mutation_reader::forwarding fwd_mr,
-        read_monitor& monitor);
+        read_monitor& monitor,
+        integrity_check integrity);
 
 // A reader which doesn't use the index at all. It reads everything from the
 // sstable and it doesn't support skipping.
-flat_mutation_reader_v2 make_crawling_reader(
+mutation_reader make_full_scan_reader(
         shared_sstable sstable,
         schema_ptr schema,
         reader_permit permit,
         tracing::trace_state_ptr trace_state,
-        read_monitor& monitor);
+        read_monitor& monitor,
+        integrity_check integrity);
 
 // Validate the content of the sstable with the mutation_fragment_stream_valdiator,
 // additionally cross checking that the content is laid out as expected by the

@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include <seastar/core/coroutine.hh>
@@ -27,8 +27,6 @@
 #include "index/secondary_index_manager.hh"
 #include "mutation/mutation.hh"
 
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/algorithm/string/join.hpp>
 #include <stdexcept>
 
 namespace cql3 {
@@ -73,8 +71,7 @@ create_index_statement::validate(query_processor& qp, const service::client_stat
     _properties->validate();
 }
 
-std::vector<::shared_ptr<index_target>> create_index_statement::validate_while_executing(query_processor& qp) const {
-    auto db = qp.db();
+std::vector<::shared_ptr<index_target>> create_index_statement::validate_while_executing(data_dictionary::database db) const {
     auto schema = validation::validate_column_family(db, keyspace(), column_family());
 
     if (schema->is_counter()) {
@@ -90,6 +87,13 @@ std::vector<::shared_ptr<index_target>> create_index_statement::validate_while_e
                 "Secondary indexes are not supported on COMPACT STORAGE tables that have clustering columns");
     }
 
+    if (_index_name.size() > size_t(schema::NAME_LENGTH)) {
+        throw exceptions::invalid_request_exception(format("index names shouldn't be more than {:d} characters long (got \"{}\")", schema::NAME_LENGTH, _index_name.c_str()));
+    }
+
+    if (!db.features().views_with_tablets && db.find_keyspace(keyspace()).get_replication_strategy().uses_tablets()) {
+        throw exceptions::invalid_request_exception(format("Secondary indexes are not supported on base tables with tablets (keyspace '{}')", keyspace()));
+    }
     validate_for_local_index(*schema);
 
     std::vector<::shared_ptr<index_target>> targets;
@@ -132,7 +136,7 @@ std::vector<::shared_ptr<index_target>> create_index_statement::validate_while_e
         }
 
         // Origin TODO: we could lift that limitation
-        if ((schema->is_dense() || !schema->thrift().has_compound_comparator()) && cd->is_primary_key()) {
+        if ((schema->is_dense() || !schema->is_compound()) && cd->is_primary_key()) {
             throw exceptions::invalid_request_exception(
                     "Secondary indexes are not supported on PRIMARY KEY columns in COMPACT STORAGE tables");
         }
@@ -180,7 +184,7 @@ std::vector<::shared_ptr<index_target>> create_index_statement::validate_while_e
 void create_index_statement::validate_for_local_index(const schema& schema) const {
     if (!_raw_targets.empty()) {
             if (const auto* index_pk = std::get_if<std::vector<::shared_ptr<column_identifier::raw>>>(&_raw_targets.front()->value)) {
-                auto base_pk_identifiers = *index_pk | boost::adaptors::transformed([&schema] (const ::shared_ptr<column_identifier::raw>& raw_ident) {
+                auto base_pk_identifiers = *index_pk | std::views::transform([&schema] (const ::shared_ptr<column_identifier::raw>& raw_ident) {
                     return raw_ident->prepare_column_identifier(schema);
                 });
                 auto remaining_base_pk_columns = schema.partition_key_columns();
@@ -249,8 +253,8 @@ void create_index_statement::validate_for_collection(const index_target& target,
             [[fallthrough]];
         case index_target::target_type::keys_and_values:
             if (!cd.type->is_map()) {
-                const char* msg_format = "Cannot create secondary index on {} of column {} with non-map type";
-                throw exceptions::invalid_request_exception(format(msg_format, to_sstring(target.type), cd.name_as_text()));
+                constexpr const char* msg_format = "Cannot create secondary index on {} of column {} with non-map type";
+                throw exceptions::invalid_request_exception(seastar::format(msg_format, to_sstring(target.type), cd.name_as_text()));
             }
             break;
     }
@@ -327,10 +331,9 @@ void create_index_statement::validate_targets_for_multi_column_index(std::vector
     }
 }
 
-schema_ptr create_index_statement::build_index_schema(query_processor& qp) const {
-    auto targets = validate_while_executing(qp);
+std::optional<create_index_statement::base_schema_with_new_index> create_index_statement::build_index_schema(data_dictionary::database db) const {
+    auto targets = validate_while_executing(db);
 
-    data_dictionary::database db = qp.db();
     auto schema = db.find_schema(keyspace(), column_family());
 
     sstring accepted_name = _index_name;
@@ -355,7 +358,7 @@ schema_ptr create_index_statement::build_index_schema(query_processor& qp) const
     auto existing_index = schema->find_index_noname(index);
     if (existing_index) {
         if (_if_not_exists) {
-            return schema_ptr();
+            return {};
         } else {
             throw exceptions::invalid_request_exception(
                     format("Index {} is a duplicate of existing index {}", index.name(), existing_index.value().name()));
@@ -372,19 +375,19 @@ schema_ptr create_index_statement::build_index_schema(query_processor& qp) const
     schema_builder builder{schema};
     builder.with_index(index);
 
-    return builder.build();
+    return base_schema_with_new_index{builder.build(), index};
 }
 
 future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>>
-create_index_statement::prepare_schema_mutations(query_processor& qp, api::timestamp_type ts) const {
+create_index_statement::prepare_schema_mutations(query_processor& qp, const query_options&, api::timestamp_type ts) const {
     using namespace cql_transport;
-    auto schema = build_index_schema(qp);
+    auto res = build_index_schema(qp.db());
 
     ::shared_ptr<event::schema_change> ret;
     std::vector<mutation> m;
 
-    if (schema) {
-        m = co_await service::prepare_column_family_update_announcement(qp.proxy(), std::move(schema), false, {}, ts);
+    if (res) {
+        m = co_await service::prepare_column_family_update_announcement(qp.proxy(), std::move(res->schema), {}, ts);
 
         ret = ::make_shared<event::schema_change>(
                 event::schema_change::change_type::UPDATED,
@@ -399,7 +402,7 @@ create_index_statement::prepare_schema_mutations(query_processor& qp, api::times
 std::unique_ptr<cql3::statements::prepared_statement>
 create_index_statement::prepare(data_dictionary::database db, cql_stats& stats) {
     _cql_stats = &stats;
-    return std::make_unique<prepared_statement>(make_shared<create_index_statement>(*this));
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<create_index_statement>(*this));
 }
 
 index_metadata create_index_statement::make_index_metadata(const std::vector<::shared_ptr<index_target>>& targets,

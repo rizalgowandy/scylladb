@@ -3,13 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #define BOOST_TEST_MODULE core
 
 #include <boost/test/unit_test.hpp>
-#include <boost/range/algorithm/copy.hpp>
 #include "keys.hh"
 #include "schema/schema.hh"
 #include "schema/schema_builder.hh"
@@ -144,7 +143,7 @@ inline
 T reserialize(const T& v) {
     auto buf = ser::serialize_to_buffer<bytes>(v);
     auto in = ser::as_input_stream(buf);
-    return ser::deserialize(in, boost::type<T>());
+    return ser::deserialize(in, std::type_identity<T>());
 }
 
 BOOST_AUTO_TEST_CASE(test_serialization) {

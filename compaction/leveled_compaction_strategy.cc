@@ -3,15 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "leveled_compaction_strategy.hh"
 #include "leveled_manifest.hh"
 #include "compaction_strategy_state.hh"
 #include <algorithm>
-
-#include <boost/range/algorithm/remove_if.hpp>
 
 namespace sstables {
 
@@ -50,17 +48,16 @@ compaction_descriptor leveled_compaction_strategy::get_sstables_for_compaction(t
     for (auto level = int(manifest.get_level_count()); level >= 0; level--) {
         auto& sstables = manifest.get_level(level);
         // filter out sstables which droppable tombstone ratio isn't greater than the defined threshold.
-        auto e = boost::range::remove_if(sstables, [this, compaction_time, &table_s] (const sstables::shared_sstable& sst) -> bool {
+        std::erase_if(sstables, [this, compaction_time, &table_s] (const sstables::shared_sstable& sst) -> bool {
             return !worth_dropping_tombstones(sst, compaction_time, table_s);
         });
-        sstables.erase(e, sstables.end());
         if (sstables.empty()) {
             continue;
         }
         auto& sst = *std::max_element(sstables.begin(), sstables.end(), [&] (auto& i, auto& j) {
-            auto gc_before1 = i->get_gc_before_for_drop_estimation(compaction_time, table_s.get_tombstone_gc_state(), table_s.schema());
-            auto gc_before2 = j->get_gc_before_for_drop_estimation(compaction_time, table_s.get_tombstone_gc_state(), table_s.schema());
-            return i->estimate_droppable_tombstone_ratio(gc_before1) < j->estimate_droppable_tombstone_ratio(gc_before2);
+            auto ratio_i = i->estimate_droppable_tombstone_ratio(compaction_time, table_s.get_tombstone_gc_state(), table_s.schema());
+            auto ratio_j = j->estimate_droppable_tombstone_ratio(compaction_time, table_s.get_tombstone_gc_state(), table_s.schema());
+            return ratio_i < ratio_j;
         });
         return sstables::compaction_descriptor({ sst }, sst->get_sstable_level());
     }
@@ -146,7 +143,8 @@ int64_t leveled_compaction_strategy::estimated_pending_compactions(table_state& 
 }
 
 compaction_descriptor
-leveled_compaction_strategy::get_reshaping_job(std::vector<shared_sstable> input, schema_ptr schema, reshape_mode mode) const {
+leveled_compaction_strategy::get_reshaping_job(std::vector<shared_sstable> input, schema_ptr schema, reshape_config cfg) const {
+    auto mode = cfg.mode;
     std::array<std::vector<shared_sstable>, leveled_manifest::MAX_LEVELS> level_info;
 
     auto is_disjoint = [schema] (const std::vector<shared_sstable>& sstables, unsigned tolerance) -> std::tuple<bool, unsigned> {
@@ -203,7 +201,7 @@ leveled_compaction_strategy::get_reshaping_job(std::vector<shared_sstable> input
 
     if (level_info[0].size() > offstrategy_threshold) {
         size_tiered_compaction_strategy stcs(_stcs_options);
-        return stcs.get_reshaping_job(std::move(level_info[0]), schema, mode);
+        return stcs.get_reshaping_job(std::move(level_info[0]), schema, cfg);
     }
 
     for (unsigned level = leveled_manifest::MAX_LEVELS - 1; level > 0; --level) {

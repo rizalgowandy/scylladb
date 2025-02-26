@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -136,8 +136,6 @@ public:
 
     // "less" comparator corresponding to tri_compare()
     bool less_compare(const schema&, const ring_position&) const;
-
-    friend std::ostream& operator<<(std::ostream&, const ring_position&);
 };
 
 // Non-owning version of ring_position and ring_position_ext.
@@ -177,11 +175,13 @@ public:
     using after_key = bool_class<after_key_tag>;
 
     static ring_position_view min() noexcept {
-        return { minimum_token(), nullptr, -1 };
+        static auto min_token = minimum_token();
+        return { min_token, nullptr, -1 };
     }
 
     static ring_position_view max() noexcept {
-        return { maximum_token(), nullptr, 1 };
+        static auto max_token = maximum_token();
+        return { max_token, nullptr, 1 };
     }
 
     bool is_min() const noexcept {
@@ -257,7 +257,7 @@ public:
     // Only when key() != nullptr
     after_key is_after_key() const { return after_key(_weight == 1); }
 
-    friend std::ostream& operator<<(std::ostream&, ring_position_view);
+    friend fmt::formatter<ring_position_view>;
     friend class optimized_optional<ring_position_view>;
 };
 
@@ -390,8 +390,6 @@ public:
     after_key is_after_key() const { return after_key(_weight == 1); }
 
     operator ring_position_view() const { return { _token, _key ? &*_key : nullptr, _weight }; }
-
-    friend std::ostream& operator<<(std::ostream&, const ring_position_ext&);
 };
 
 std::strong_ordering ring_position_tri_compare(const schema& s, ring_position_view lh, ring_position_view rh);
@@ -490,6 +488,29 @@ public:
     const dht::partition_range* end() const { return _data + _size; }
 };
 
-std::ostream& operator<<(std::ostream& out, partition_ranges_view v);
-
 } // namespace dht
+
+template<>
+struct fmt::formatter<dht::ring_position_view> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const dht::ring_position_view&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template<>
+struct fmt::formatter<dht::ring_position_ext> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const dht::ring_position_ext& pos, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", (dht::ring_position_view)pos);
+    }
+};
+
+template<>
+struct fmt::formatter<dht::ring_position> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const dht::ring_position& pos, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <> struct fmt::formatter<dht::partition_ranges_view> : fmt::formatter<string_view> {
+    auto format(const dht::partition_ranges_view&, fmt::format_context& ctx) const
+      -> decltype(ctx.out());
+};

@@ -3,16 +3,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <algorithm>
 #include <seastar/core/file.hh>
 #include <seastar/core/seastar.hh>
-#include "bytes.hh"
-#include "log.hh"
+#include "utils/log.hh"
+#include "seastarx.hh"
 
 namespace sstables {
 

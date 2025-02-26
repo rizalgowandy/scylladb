@@ -3,7 +3,7 @@ Choose a Compaction Strategy
 ============================
 
 
-Scylla implements the following compaction strategies in order to reduce :term:`read amplification<Read Amplification>`, :term:`write amplification<Write Amplification>`, and :term:`space amplification<Space Amplification>`, which causes bottlenecks and poor performance. These strategies include:
+ScyllaDB implements the following compaction strategies in order to reduce :term:`read amplification<Read Amplification>`, :term:`write amplification<Write Amplification>`, and :term:`space amplification<Space Amplification>`, which causes bottlenecks and poor performance. These strategies include:
 
 * `Size-tiered compaction strategy (STCS)`_ - triggered when the system has enough (four by default) similarly sized SSTables.
 * `Leveled compaction strategy (LCS)`_ - the system uses small, fixed-size (by default 160 MB) SSTables distributed across different levels.
@@ -12,7 +12,7 @@ Scylla implements the following compaction strategies in order to reduce :term:`
 
 This document covers how to choose a compaction strategy and presents the benefits and disadvantages of each one. If you want more information on compaction in general or on any of these strategies, refer to the :doc:`Compaction Overview </kb/compaction>`. If you want an explanation of the CQL commands used to create a compaction strategy, refer to :doc:`Compaction CQL Reference </cql/compaction>` .
 
-Learn more in the `Compaction Strategies lesson <https://university.scylladb.com/courses/scylla-operations/lessons/compaction-strategies/>`_ on Scylla University
+Learn more in the `Compaction Strategies lesson <https://university.scylladb.com/courses/scylla-operations/lessons/compaction-strategies/>`_ on ScyllaDB University
 
 .. _STCS1:
 
@@ -70,7 +70,34 @@ Set the parameters for :ref:`Leveled Compaction <leveled-compaction-strategy-lcs
 Incremental Compaction Strategy (ICS)
 =====================================
 
-ICS is only available in ScyllaDB Enterprise. See the `ScyllaDB Enetrpise documentation <https://enterprise.docs.scylladb.com/stable/architecture/compaction/compaction-strategies.html>`_ for details.
+ICS principles of operation are similar to those of STCS, merely replacing the increasingly larger SSTables in each tier, by increasingly longer SSTable runs, modeled after LCS runs, but using larger fragment size of 1 GB, by default.
+
+Compaction is triggered when there are two or more runs of roughly the same size. These runs are incrementally compacted with each other, producing a new SSTable run, while incrementally releasing space as soon as each SSTable in the input run is processed and compacted. This method eliminates the high temporary space amplification problem of STCS by limiting the overhead to twice the (constant) fragment size, per shard.
+
+Incremental Compaction Strategy benefits
+----------------------------------------
+* Greatly reduces the temporary space amplification which is typical of STCS,  resulting in more disk space being available for storing user data.
+* The space requirement for a major compaction with ICS is almost non-existent given that the operation can release fragments at roughly same rate it produces new ones.
+
+If you look at the following screenshot the green line shows how disk usage behaves under ICS when major compaction is issued.
+
+.. image:: /architecture/compaction/screenshot.png
+
+Incremental Compaction Strategy disadvantages
+----------------------------------------------
+
+* Since ICS principles of operation are the same as STCS, its disadvantages are similar to STCS's, except for the temporary space amplification issue.
+
+Namely:
+
+* Continuously modifying existing rows results in each row being split across several SSTables, making reads slow, which doesn’t happen in Leveled compaction.
+* Obsolete data (overwritten or deleted columns) may accumulate across tiers, wasting space, for a long time, until it is finally merged. This can be mitigated by running major compaction from time to time.
+
+**To implement this strategy**
+
+Set the parameters for :ref:`Incremental Compaction <incremental-compaction-strategy-ics>`.
+
+For more information, see the :ref:`Compaction KB Article <incremental-compaction-strategy-ics>`.
 
 .. _TWCS1:
 
@@ -197,6 +224,6 @@ References
 ----------
 * :doc:`Compaction Overview </kb/compaction>` - contains in depth information on all of the strategies
 * :doc:`Compaction CQL Reference </cql/compaction>` - covers the CQL parameters used for implementing compaction
-* Scylla Summit Tech Talk: `How to Ruin Performance by Choosing the Wrong Compaction Strategy <https://www.scylladb.com/tech-talk/ruin-performance-choosing-wrong-compaction-strategy-scylla-summit-2017/>`_
+* ScyllaDB Summit Tech Talk: `How to Ruin Performance by Choosing the Wrong Compaction Strategy <https://www.scylladb.com/tech-talk/ruin-performance-choosing-wrong-compaction-strategy-scylla-summit-2017/>`_
 
 

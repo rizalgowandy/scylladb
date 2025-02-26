@@ -1,11 +1,12 @@
 # Copyright 2021-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 ##############################################################################
 # Tests for Scylla's metrics (see docs/dev/metrics.md) for Alternator
-# queries. Reproduces issue #9406, where although metrics was implemented for
-# Alternator requests, they were missing for some operations (BatchGetItem).
+# queries. Reproduces issues #9406 and #17615, where although metrics were
+# implemented for Alternator requests, they were missing for some operations
+# (BatchGetItem).
 # In the tests here we attempt to ensure that the metrics continue to work
 # for the relevant operations as the code evolves.
 #
@@ -22,14 +23,17 @@
 # counter increases.
 ##############################################################################
 
-import pytest
-import requests
 import re
 import time
 from contextlib import contextmanager
+
+import pytest
+import requests
 from botocore.exceptions import ClientError
 
-from util import random_string, new_test_table, is_aws
+from test.alternator.test_manual_requests import get_signed_request
+from test.alternator.util import random_string, new_test_table, is_aws
+
 
 # Fixture for checking if we are able to test Scylla metrics. Scylla metrics
 # are not available on AWS (of course), but may also not be available for
@@ -53,7 +57,7 @@ def metrics(dynamodb):
 
 # Utility function for fetching all metrics from Scylla, using an HTTP request
 # to port 9180. The response format is defined by the Prometheus protocol.
-# Only use get_metrics() in a test using the metrics_available fixture.
+# get_metrics() needs the test to use the "metrics" fixture.
 def get_metrics(metrics):
     response = requests.get(metrics)
     assert response.status_code == 200
@@ -91,22 +95,33 @@ def get_metric(metrics, name, requested_labels=None, the_metrics=None):
 # of the specified metrics. Helps reduce the amount of code duplication
 # below.
 @contextmanager
-def check_increases_metric(metrics, metric_names):
+def check_increases_metric(metrics, metric_names, requested_labels=None):
     the_metrics = get_metrics(metrics)
-    saved_metrics = { x: get_metric(metrics, x, None, the_metrics) for x in metric_names }
+    saved_metrics = { x: get_metric(metrics, x, requested_labels, the_metrics) for x in metric_names }
     yield
     the_metrics = get_metrics(metrics)
     for n in metric_names:
-        assert saved_metrics[n] < get_metric(metrics, n, None, the_metrics), f'metric {n} did not increase'
+        assert saved_metrics[n] < get_metric(metrics, n, requested_labels, the_metrics), f'metric {n} did not increase'
 
 @contextmanager
-def check_increases_operation(metrics, operation_names):
+def check_increases_metric_exact(metrics, metric_name, increase_value):
     the_metrics = get_metrics(metrics)
-    saved_metrics = { x: get_metric(metrics, 'scylla_alternator_operation', {'op': x}, the_metrics) for x in operation_names }
+    saved_metric = get_metric(metrics, metric_name, None, the_metrics)
+    yield
+    the_metrics = get_metrics(metrics)
+    assert get_metric(metrics, metric_name, None, the_metrics) - saved_metric == increase_value, f'metric {metric_name} did not increase at expected value {increase_value}'
+
+@contextmanager
+def check_increases_operation(metrics, operation_names, metric_name = 'scylla_alternator_operation', expected_value=None):
+    the_metrics = get_metrics(metrics)
+    saved_metrics = { x: get_metric(metrics, metric_name, {'op': x}, the_metrics) for x in operation_names }
     yield
     the_metrics = get_metrics(metrics)
     for op in operation_names:
-        assert saved_metrics[op] < get_metric(metrics, 'scylla_alternator_operation', {'op': op}, the_metrics)
+        if expected_value:
+            assert expected_value == get_metric(metrics, metric_name, {'op': op}, the_metrics) - saved_metrics[op]
+        else:
+            assert saved_metrics[op] < get_metric(metrics, metric_name, {'op': op}, the_metrics)
 
 ###### Test for metrics that count DynamoDB API operations:
 
@@ -121,6 +136,35 @@ def test_batch_get_item(test_table_s, metrics):
         test_table_s.meta.client.batch_get_item(RequestItems = {
             test_table_s.name: {'Keys': [{'p': random_string()}], 'ConsistentRead': True}})
 
+def test_batch_write_item_count(test_table_s, metrics):
+    with check_increases_operation(metrics, ['BatchWriteItem'], metric_name='scylla_alternator_batch_item_count', expected_value=2):
+        test_table_s.meta.client.batch_write_item(RequestItems = {
+            test_table_s.name: [{'PutRequest': {'Item': {'p': random_string(), 'a': 'hi'}}}, {'PutRequest': {'Item': {'p': random_string(), 'a': 'hi'}}}]})
+
+def test_batch_get_item_count(test_table_s, metrics):
+    with check_increases_operation(metrics, ['BatchGetItem'], metric_name='scylla_alternator_batch_item_count', expected_value=2):
+        test_table_s.meta.client.batch_get_item(RequestItems = {
+            test_table_s.name: {'Keys': [{'p': random_string()}, {'p': random_string()}], 'ConsistentRead': True}})
+
+KB = 1024
+def test_rcu(test_table_s, metrics):
+    with check_increases_metric_exact(metrics, 'scylla_alternator_rcu_total', 4):
+        p = random_string()
+        val = random_string()
+        total_length = len(p) + len(val) + len("pattanother")
+        val2 = 'a' * (4 * KB - total_length + 1) # message length 4KB +1
+
+        test_table_s.put_item(Item={'p': p, 'att': val, 'another': val2})
+        test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
+
+def test_wcu(test_table_s, metrics):
+    with check_increases_operation(metrics, ['PutItem'], 'scylla_alternator_wcu_total', 6):
+        p = random_string()
+        val = random_string()
+        total_length = len(p) + len(val) + len("pattanother")
+        val2 = 'a' * (2 * KB - total_length + 1) # message length 2K + 1
+        test_table_s.put_item(Item={'p': p, 'att': val, 'another': val2})
+
 # Test counters for CreateTable, DescribeTable, UpdateTable and DeleteTable
 def test_table_operations(dynamodb, metrics):
     with check_increases_operation(metrics, ['CreateTable', 'DescribeTable', 'UpdateTable', 'DeleteTable']):
@@ -132,7 +176,7 @@ def test_table_operations(dynamodb, metrics):
             # here because new_test_table already does it (to make sure the
             # table exists before returning), but let's not assume it.
             dynamodb.meta.client.describe_table(TableName=table.name)
-            dynamodb.meta.client.update_table(TableName=table.name)
+            dynamodb.meta.client.update_table(TableName=table.name, BillingMode='PAY_PER_REQUEST')
 
 # Test counters for DeleteItem, GetItem, PutItem and UpdateItem:
 def test_item_operations(test_table_s, metrics):
@@ -144,7 +188,7 @@ def test_item_operations(test_table_s, metrics):
         test_table_s.update_item(Key={'p': p})
 
 # Test counters for Query and Scan:
-def test_item_operations(test_table_s, metrics):
+def test_scan_operations(test_table_s, metrics):
     with check_increases_operation(metrics, ['Query', 'Scan']):
         # We don't care whether test_table_s contains any content when we scan
         # it. We just want the scan to be counted
@@ -152,11 +196,13 @@ def test_item_operations(test_table_s, metrics):
         test_table_s.query(Limit=1, KeyConditionExpression='p=:p',
             ExpressionAttributeValues={':p': 'dog'})
 
-def test_describe_endpoints(dynamodb, metrics):
+# Test counters for DescribeEndpoints:
+def test_describe_endpoints_operations(dynamodb, metrics):
     with check_increases_operation(metrics, ['DescribeEndpoints']):
         dynamodb.meta.client.describe_endpoints()
 
-def test_list_tables(dynamodb, metrics):
+# Test counters for ListTables:
+def test_list_tables_operations(dynamodb, metrics):
     with check_increases_operation(metrics, ['ListTables']):
         dynamodb.meta.client.list_tables(Limit=1)
 
@@ -208,6 +254,85 @@ def test_streams_operations(test_table_s, dynamodbstreams, metrics):
 # ListGlobalTables, UpdateGlobalTable, UpdateGlobalTableSettings,
 # DescribeLimits.
 
+###### Test metrics that are latency histograms of DynamoDB API operations:
+
+# Check that an operation sets the desired latency histograms to non-zero.
+# We don't know what this latency should be, but we can still check that
+# the desired latency metric gets updated.
+#
+# A latency histogram metric "scylla_alternator_op_latency" is actually three
+# separate metrics: scylla_alternator_op_latency_count, ..._sum and ..._bucket.
+# As discussed in issue #18847, we cannot assume that the _sum must increase
+# on every request (it is possible for it to stay unchanged if the request is
+# very short and to sum until now was high). But we can rely on the _count
+# to change when the latency is updated, so that's what we'll check here.
+# Remember that the goal of this test isn't to verify that the histogram
+# metrics code is correct, but to verify that Alternator didn't forget
+# to update latencies for one kind of operation (#17616, and compare #9406),
+# and to do that checking that ..._count increases for that op is enough.
+@contextmanager
+def check_sets_latency(metrics, operation_names):
+    the_metrics = get_metrics(metrics)
+    saved_latency_count = { x: get_metric(metrics, 'scylla_alternator_op_latency_count', {'op': x}, the_metrics) for x in operation_names }
+    yield
+    the_metrics = get_metrics(metrics)
+    for op in operation_names:
+        # The total "count" on all shards should strictly increase
+        assert saved_latency_count[op] < get_metric(metrics, 'scylla_alternator_op_latency_count', {'op': op}, the_metrics)
+
+# Test latency metrics for PutItem, GetItem, DeleteItem, UpdateItem.
+# We can't check what exactly the latency is - just that it gets updated.
+def test_item_latency(test_table_s, metrics):
+    with check_sets_latency(metrics, ['DeleteItem', 'GetItem', 'PutItem', 'UpdateItem', 'BatchWriteItem', 'BatchGetItem']):
+        p = random_string()
+        test_table_s.put_item(Item={'p': p})
+        test_table_s.get_item(Key={'p': p})
+        test_table_s.delete_item(Key={'p': p})
+        test_table_s.update_item(Key={'p': p})
+        test_table_s.meta.client.batch_write_item(RequestItems = {
+            test_table_s.name: [{'PutRequest': {'Item': {'p': random_string(), 'a': 'hi'}}}]})
+        test_table_s.meta.client.batch_get_item(RequestItems = {
+            test_table_s.name: {'Keys': [{'p': random_string()}], 'ConsistentRead': True}})
+
+# Test latency metrics for GetRecords. Other Streams-related operations -
+# ListStreams, DescribeStream, and GetShardIterator, have an operation
+# count (tested above) but do NOT currently have a latency histogram.
+def test_streams_latency(dynamodb, dynamodbstreams, metrics):
+    # Whereas the *count* metric for various operations also counts failed
+    # operations so we could write this test without a real stream, the
+    # latency metrics are only updated for *successful* operations so we
+    # need to use a real Alternator Stream in this test.
+    with new_test_table(dynamodb,
+        # Alternator Streams is expected to fail with tablets due to #16317.
+        # To ensure that this test still runs, instead of xfailing it, we
+        # temporarily coerce Altenator to avoid using default tablets
+        # setting, even if it's available. We do this by using the following
+        # tags when creating the table:
+        Tags=[{'Key': 'experimental:initial_tablets', 'Value': 'none'}],
+        KeySchema=[{ 'AttributeName': 'p', 'KeyType': 'HASH' }],
+        AttributeDefinitions=[{ 'AttributeName': 'p', 'AttributeType': 'S' }],
+        StreamSpecification={ 'StreamEnabled': True, 'StreamViewType': 'NEW_AND_OLD_IMAGES'}
+        ) as table:
+        # Wait for the stream to become active. This should be instantenous
+        # in Alternator, so the following loop won't wait
+        stream_enabled = False
+        start_time = time.time()
+        while time.time() < start_time + 60:
+            desc = table.meta.client.describe_table(TableName=table.name)['Table']
+            if 'LatestStreamArn' in desc:
+                arn = desc['LatestStreamArn']
+                desc = dynamodbstreams.describe_stream(StreamArn=arn)
+                if desc['StreamDescription']['StreamStatus'] == 'ENABLED':
+                    stream_enabled = True
+                    break
+            time.sleep(1)
+        assert stream_enabled
+        desc = dynamodbstreams.describe_stream(StreamArn=arn)
+        shard_id = desc['StreamDescription']['Shards'][0]['ShardId'];
+        it = dynamodbstreams.get_shard_iterator(StreamArn=arn, ShardId=shard_id, ShardIteratorType='LATEST')['ShardIterator']
+        with check_sets_latency(metrics, ['GetRecords']):
+            dynamodbstreams.get_records(ShardIterator=it)
+
 ###### Test for other metrics, not counting specific DynamoDB API operations:
 
 # Test that unsupported operations operations increment a counter. Instead
@@ -217,7 +342,6 @@ def test_streams_operations(test_table_s, dynamodbstreams, metrics):
 # An unsupported operation also increments the total_operations counter.
 def test_unsupported_operation(dynamodb, metrics):
     with check_increases_metric(metrics, ['scylla_alternator_unsupported_operations', 'scylla_alternator_total_operations']):
-        from test_manual_requests import get_signed_request
         req = get_signed_request(dynamodb, 'BoguousOperationName', '{}')
         requests.post(req.url, headers=req.headers, data=req.body, verify=False)
 
@@ -262,10 +386,15 @@ def alternator_ttl_period_in_seconds(dynamodb, request):
 # up to the setting of alternator_ttl_period_in_seconds. test/alternator/run
 # sets this to 1 second, which becomes the maximum delay of this test, but
 # if it is set higher we skip this test unless --runveryslow is enabled.
+# This test fails with tablets due to #16567, so to temporarily ensure that
+# Alternator TTL is still being tested, we use the following TAGS to
+# coerce Alternator to create the test table without tablets.
+TAGS = [{'Key': 'experimental:initial_tablets', 'Value': 'none'}]
 def test_ttl_stats(dynamodb, metrics, alternator_ttl_period_in_seconds):
     print(alternator_ttl_period_in_seconds)
     with check_increases_metric(metrics, ['scylla_expiration_scan_passes', 'scylla_expiration_scan_table', 'scylla_expiration_items_deleted']):
         with new_test_table(dynamodb,
+            Tags = TAGS,
             KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, ],
             AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' } ]) as table:
             # Insert one already-expired item, and then enable TTL:
@@ -286,7 +415,6 @@ def test_ttl_stats(dynamodb, metrics, alternator_ttl_period_in_seconds):
             assert not 'Item' in table.get_item(Key={'p': p0})
 
 # TODO: there are additional metrics which we don't yet test here. At the
-# time of this writing they are: latency histograms
-# ({put,get,delete,update}_item_latency, get_records_latency),
+# time of this writing they are:
 # reads_before_write, write_using_lwt, shard_bounce_for_lwt,
 # requests_blocked_memory, requests_shed

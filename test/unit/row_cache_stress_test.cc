@@ -3,21 +3,24 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <boost/range/irange.hpp>
 #include "seastarx.hh"
 #include "test/lib/simple_schema.hh"
 #include "test/lib/log.hh"
 #include <seastar/core/app-template.hh>
 #include "replica/memtable.hh"
-#include "row_cache.hh"
+#include "db/row_cache.hh"
 #include "partition_slice_builder.hh"
+#include "utils/assert.hh"
 #include "utils/int_range.hh"
 #include "utils/div_ceil.hh"
+#include "utils/to_string.hh"
 #include "test/lib/memtable_snapshot_source.hh"
 #include <seastar/core/reactor.hh>
+#include <fmt/core.h>
+#include <fmt/std.h>
 
 static thread_local bool cancelled = false;
 
@@ -43,7 +46,7 @@ struct table {
     row_cache cache;
 
     table(unsigned partitions, unsigned rows)
-        : semaphore(reader_concurrency_semaphore::no_limits{}, __FILE__)
+        : semaphore(reader_concurrency_semaphore::no_limits{}, __FILE__, reader_concurrency_semaphore::register_metrics::no)
         , mt(make_lw_shared<replica::memtable>(s.schema()))
         , underlying(s.schema())
         , cache(s.schema(), snapshot_source([this] { return underlying(); }), tracker)
@@ -54,7 +57,7 @@ struct table {
     }
 
     reader_permit make_permit() {
-        return semaphore.make_tracking_only_permit(s.schema().get(), "test", db::no_timeout, {});
+        return semaphore.make_tracking_only_permit(s.schema(), "test", db::no_timeout, {});
     }
     future<> stop() noexcept {
         return semaphore.stop();
@@ -71,7 +74,7 @@ struct table {
     }
 
     size_t index_of_key(const dht::decorated_key& dk) {
-        for (auto i : boost::irange<size_t>(0, p_keys.size())) {
+        for (auto i : std::views::iota(0u, p_keys.size())) {
             if (p_keys[i].equal(*s.schema(), dk)) {
                 return i;
             }
@@ -108,7 +111,7 @@ struct table {
 
     void mutate_next_phase() {
         testlog.trace("mutating, phase={}", mutation_phase);
-        for (auto i : boost::irange<int>(0, p_keys.size())) {
+        for (auto i : std::views::iota(0u, p_keys.size())) {
             auto t = s.new_timestamp();
             auto tag = value_tag(i, mutation_phase);
             auto m = get_mutation(i, t, tag);
@@ -150,7 +153,7 @@ struct table {
     std::unique_ptr<reader> make_reader(dht::partition_range pr, query::partition_slice slice) {
         testlog.trace("making reader, pk={} ck={}", pr, slice);
         auto r = std::make_unique<reader>(std::move(pr), std::move(slice));
-        std::vector<flat_mutation_reader_v2> rd;
+        std::vector<mutation_reader> rd;
         auto permit = make_permit();
         if (prev_mt) {
             rd.push_back(prev_mt->make_flat_reader(s.schema(), permit, r->pr, r->slice, nullptr,
@@ -181,11 +184,18 @@ struct table {
 
 struct reader_id {
     sstring name;
+};
 
-    friend std::ostream& operator<<(std::ostream& out, reader_id id) {
-        return out << id.name;
+} // namespace row_cache_stress_test
+
+// TODO: use format_as() after {fmt} v10
+template <> struct fmt::formatter<row_cache_stress_test::reader_id> : fmt::formatter<string_view> {
+    auto format(const row_cache_stress_test::reader_id& id, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", id.name);
     }
 };
+
+namespace row_cache_stress_test {
 
 class validating_consumer {
     table& _t;
@@ -221,11 +231,11 @@ public:
         std::tie(value, t) = _t.s.get_value(*_s, row);
         testlog.trace("reader {}: {} @{}, {}", _id, value, t, clustering_row::printer(*_s, row));
         if (_value && value != _value) {
-            throw std::runtime_error(format("Saw values from two different writes in partition {:d}: {} and {}", _key, _value, value));
+            throw std::runtime_error(fmt::format("Saw values from two different writes in partition {:d}: {} and {}", _key, _value, value));
         }
         auto lowest_timestamp = _writetimes[_key];
         if (t < lowest_timestamp) {
-            throw std::runtime_error(format("Expected to see the write @{:d}, but saw @{:d} ({}), c_key={}", lowest_timestamp, t, value, row.key()));
+            throw std::runtime_error(fmt::format("Expected to see the write @{:d}, but saw @{:d} ({}), c_key={}", lowest_timestamp, t, value, row.key()));
         }
         _value = std::move(value);
         return stop_iteration::no;
@@ -334,7 +344,7 @@ int main(int argc, char** argv) {
                 while (!cancelled) {
                     testlog.trace("{}: starting read", id);
                     auto rd = t.make_single_key_reader(pk, ck_range);
-                    auto row_count = rd->rd->consume(validating_consumer(t, id, t.s.schema())).get0();
+                    auto row_count = rd->rd->consume(validating_consumer(t, id, t.s.schema())).get();
                     if (row_count != len) {
                         throw std::runtime_error(format("Expected {:d} fragments, got {:d}", len, row_count));
                     }
@@ -346,7 +356,7 @@ int main(int argc, char** argv) {
                 while (!cancelled) {
                     testlog.trace("{}: starting read", id);
                     auto rd = t.make_scanning_reader();
-                    auto row_count = rd->rd->consume(validating_consumer(t, id, t.s.schema())).get0();
+                    auto row_count = rd->rd->consume(validating_consumer(t, id, t.s.schema())).get();
                     if (row_count != expected_row_count) {
                         throw std::runtime_error(format("Expected {:d} fragments, got {:d}", expected_row_count, row_count));
                     }
@@ -356,7 +366,7 @@ int main(int argc, char** argv) {
             // populate the initial phase, readers expect constant fragment count.
             t.mutate_next_phase();
 
-            auto readers = parallel_for_each(boost::irange(0u, concurrency), [&] (auto i) {
+            auto readers = parallel_for_each(std::views::iota(0u, concurrency), [&] (auto i) {
                 reader_id id{format("single-{:d}", i)};
                 return seastar::async([&, i, id] {
                     single_partition_reader(i, id);
@@ -365,7 +375,7 @@ int main(int argc, char** argv) {
                 });
             });
 
-            auto scanning_readers = parallel_for_each(boost::irange(0u, scan_concurrency), [&] (auto i) {
+            auto scanning_readers = parallel_for_each(std::views::iota(0u, scan_concurrency), [&] (auto i) {
                 reader_id id{format("scan-{:d}", i)};
                 return seastar::async([&, id] {
                     scanning_reader(id);
@@ -402,8 +412,8 @@ int main(int argc, char** argv) {
             t.tracker.cleaner().drain().get();
             t.tracker.memtable_cleaner().drain().get();
 
-            assert(t.tracker.get_stats().partitions == 0);
-            assert(t.tracker.get_stats().rows == 0);
+            SCYLLA_ASSERT(t.tracker.get_stats().partitions == 0);
+            SCYLLA_ASSERT(t.tracker.get_stats().rows == 0);
         });
     });
 }

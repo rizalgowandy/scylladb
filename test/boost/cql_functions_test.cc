@@ -3,31 +3,34 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include <algorithm>
 
-#include <boost/range/irange.hpp>
-#include <boost/range/adaptors.hpp>
-#include <boost/range/algorithm.hpp>
 #include <boost/test/unit_test.hpp>
 #include <boost/multiprecision/cpp_int.hpp>
 
 #include <seastar/net/inet_address.hh>
 
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
 
 #include <seastar/core/future-util.hh>
 #include "transport/messages/result_message.hh"
+#include "types/vector.hh"
+#include "utils/assert.hh"
 #include "utils/big_decimal.hh"
-#include "types/user.hh"
+#include "utils/unique_view.hh"
 #include "types/map.hh"
 #include "types/list.hh"
 #include "types/set.hh"
 #include "schema/schema_builder.hh"
+
+BOOST_AUTO_TEST_SUITE(cql_functions_test)
 
 using namespace std::literals::chrono_literals;
 
@@ -55,7 +58,6 @@ SEASTAR_TEST_CASE(test_functions) {
                 virtual void visit(const result_message::void_message&) override { throw "bad"; }
                 virtual void visit(const result_message::set_keyspace&) override { throw "bad"; }
                 virtual void visit(const result_message::prepared::cql&) override { throw "bad"; }
-                virtual void visit(const result_message::prepared::thrift&) override { throw "bad"; }
                 virtual void visit(const result_message::schema_change&) override { throw "bad"; }
                 virtual void visit(const result_message::rows& rows) override {
                     const auto& rs = rows.rs().result_set();
@@ -71,8 +73,8 @@ SEASTAR_TEST_CASE(test_functions) {
             validator v;
             msg->accept(v);
             // No boost::adaptors::sorted
-            boost::sort(v.res);
-            BOOST_REQUIRE_EQUAL(boost::distance(v.res | boost::adaptors::uniqued), 3);
+            std::ranges::sort(v.res);
+            BOOST_REQUIRE_EQUAL(std::ranges::distance(v.res | utils::views::unique), 3);
         }).then([&] {
             return e.execute_cql("select sum(c1), count(c1) from cf where p1 = 'key1';");
         }).then([] (shared_ptr<cql_transport::messages::result_message> msg) {
@@ -128,7 +130,7 @@ struct aggregate_function_test {
         return tbl_name;
     }
     void call_function_and_expect(const char* fname, data_type type, data_value expected) {
-        auto msg = _e.execute_cql(format("select {}(value) from {}", fname, table_name())).get0();
+        auto msg = _e.execute_cql(format("select {}(value) from {}", fname, table_name())).get();
         assert_that(msg).is_rows()
             .with_size(1)
             .with_column_types({type})
@@ -150,7 +152,7 @@ public:
                     .build();
         }).get();
 
-        auto prepared = _e.prepare(format("insert into {} (pk, ck, value) values ('key1', ?, ?)", cf_name)).get0();
+        auto prepared = _e.prepare(format("insert into {} (pk, ck, value) values ('key1', ?, ?)", cf_name)).get();
         for (int i = 0; i < (int)_sorted_values.size(); i++) {
             const auto& value = _sorted_values[i];
             BOOST_ASSERT(&*value.type() == &*_column_type);
@@ -318,7 +320,7 @@ SEASTAR_TEST_CASE(test_aggregate_functions_timeuuid_type) {
             timeuuid_native_type{utils::UUID("00000000-0000-1000-0000-000000000000")},
             timeuuid_native_type{utils::UUID("00000000-0000-1000-0000-000000000001")},
             timeuuid_native_type{utils::UUID("00000000-0000-1000-0000-000000000002")}
-        ).test_count(); // min and max will fail, because we assert using UUID order, not timestamp order.
+        ).test_count(); // min and max will fail, because we SCYLLA_ASSERT using UUID order, not timestamp order.
     });
 }
 
@@ -408,3 +410,16 @@ SEASTAR_TEST_CASE(test_aggregate_functions_map_type) {
         ).test_min_max_count();
     });
 }
+
+SEASTAR_TEST_CASE(test_aggregate_functions_vector_type) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        auto vector_type_int = vector_type_impl::get_instance(int32_type, 3);
+        aggregate_function_test(e, vector_type_int,
+            make_list_value(vector_type_int, {1, 2, 3}),
+            make_list_value(vector_type_int, {1, 2, 4}),
+            make_list_value(vector_type_int, {2, 2, 3})
+        ).test_min_max_count();
+    });
+}
+
+BOOST_AUTO_TEST_SUITE_END()

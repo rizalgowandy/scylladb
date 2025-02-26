@@ -2,6 +2,58 @@
 #old path: new path
 
 
+# Remove an oudated article
+
+/stable/troubleshooting/nodetool-memory-read-timeout.html: /stable/troubleshooting/index.html
+
+# Move up the Features section
+
+/stable/using-scylla/features.html: /stable/features/index.html
+/stable/using-scylla/lwt.html: /stable/features/lwt.html
+/stable/using-scylla/secondary-indexes.html: /stable/features/secondary-indexes.html
+/stable/using-scylla/local-secondary-indexes.html: /stable/features/local-secondary-indexes.html
+/stable/using-scylla/materialized-views.html: /stable/features/materialized-views.html
+/stable/using-scylla/counters.html: /stable/features/counters.html
+/stable/using-scylla/workload-attributes.html: /stable/features/workload-attributes.html
+/stable/using-scylla/cdc/index.html: /stable/features/cdc/index.html
+/stable/using-scylla/cdc/cdc-intro.html: /stable/features/cdc/cdc-intro.html
+/stable/using-scylla/cdc/cdc-log-table.html: /stable/features/cdc/cdc-log-table.html
+/stable/using-scylla/cdc/cdc-basic-operations.html: /stable/features/cdc/cdc-basic-operations.html
+/stable/using-scylla/cdc/cdc-streams.html: /stable/features/cdc/cdc-streams.html
+/stable/using-scylla/cdc/cdc-stream-generations.html: /stable/features/cdc/cdc-stream-generations.html
+/stable/using-scylla/cdc/cdc-querying-streams.html: /stable/features/cdc/cdc-querying-streams.html
+/stable/using-scylla/cdc/cdc-advanced-types.html: /stable/features/cdc/cdc-advanced-types.html
+/stable/using-scylla/cdc/cdc-preimages.html: /stable/features/cdc/cdc-preimages.html
+/stable/using-scylla/cdc/cdc-consistency.html: /stable/features/cdc/cdc-consistency.html
+
+# Remove the Cluster membership changes and LWT consistency page
+
+/stable/operating-scylla/procedures/cluster-management/membership-changes.html: /stable/operating-scylla/index.html
+
+# Moving pages from the install-scylla folder
+
+/stable/getting-started/install-scylla/scylla-web-installer.html: /stable/getting-started/installation-common/scylla-web-installer.html
+/stable/getting-started/install-scylla/unified-installer.html: /stable/getting-started/installation-common/unified-installer.html
+/stable/getting-started/install-scylla/air-gapped-install.html: /stable/getting-started/installation-common/air-gapped-install.html
+/stable/getting-started/install-scylla/disable-housekeeping.html: /stable/getting-started/installation-common/disable-housekeeping.html
+/stable/getting-started/install-scylla/dev-mod.html: /stable/getting-started/installation-common/dev-mod.html
+/stable/getting-started/install-scylla/config-commands.html: /stable/getting-started/config-commands.html
+
+# Remove the doc for the SSTable2json tool
+
+/stable/operating-scylla/admin-tools/sstable2json.html: /stable/operating-scylla/admin-tools/index.html
+
+# remove the Open Source vs. Enterprise Matrix from the Open Source docs
+
+/stable/reference/versions-matrix-enterprise-oss.html: https://enterprise.docs.scylladb.com/stable/reference/versions-matrix-enterprise-oss.html
+# Remove the outdated Troubleshooting article
+
+/stable/troubleshooting/error-messages/create-mv.html: /stable/troubleshooting/index.html
+
+# Remove the Learn page (replaced with a link to a page in a different repo)
+
+/stable/using-scylla/learn: https://docs.scylladb.com/stable/get-started/learn-resources/index.html
+
 # Removed the outdated upgrade guides
 
 /stable/upgrade/upgrade-opensource/upgrade-guide-from-ubuntu-14-to-16.html: /stable/upgrade/index.html

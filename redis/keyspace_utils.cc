@@ -3,19 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include "redis/keyspace_utils.hh"
 #include "schema/schema_builder.hh"
 #include "types/types.hh"
-#include "exceptions/exceptions.hh"
 #include "cql3/statements/ks_prop_defs.hh"
 #include <seastar/core/future.hh>
-#include <memory>
-#include "log.hh"
+#include "utils/log.hh"
 #include "auth/service.hh"
 #include "service/migration_manager.hh"
 #include "service/storage_proxy.hh"
@@ -24,10 +23,10 @@
 #include "db/system_keyspace.hh"
 #include "schema/schema.hh"
 #include "gms/gossiper.hh"
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include "db/config.hh"
 #include "data_dictionary/keyspace_metadata.hh"
-#include <boost/algorithm/cxx11/all_of.hpp>
+#include "replica/database.hh"
 
 using namespace seastar;
 
@@ -51,7 +50,7 @@ schema_ptr strings_schema(sstring ks_name) {
     );
     builder.set_gc_grace_seconds(0);
     builder.with(schema_builder::compact_storage::yes);
-    builder.with_version(db::system_keyspace::generate_schema_version(builder.uuid()));
+    builder.with_hash_version();
     return builder.build(schema_builder::compact_storage::yes);
 }
 
@@ -72,7 +71,7 @@ schema_ptr lists_schema(sstring ks_name) {
     );
     builder.set_gc_grace_seconds(0);
     builder.with(schema_builder::compact_storage::yes);
-    builder.with_version(db::system_keyspace::generate_schema_version(builder.uuid()));
+    builder.with_hash_version();
     return builder.build(schema_builder::compact_storage::yes);
 }
 
@@ -93,7 +92,7 @@ schema_ptr hashes_schema(sstring ks_name) {
     );
     builder.set_gc_grace_seconds(0);
     builder.with(schema_builder::compact_storage::yes);
-    builder.with_version(db::system_keyspace::generate_schema_version(builder.uuid()));
+    builder.with_hash_version();
     return builder.build(schema_builder::compact_storage::yes);
 }
 
@@ -114,7 +113,7 @@ schema_ptr sets_schema(sstring ks_name) {
     );
     builder.set_gc_grace_seconds(0);
     builder.with(schema_builder::compact_storage::yes);
-    builder.with_version(db::system_keyspace::generate_schema_version(builder.uuid()));
+    builder.with_hash_version();
     return builder.build(schema_builder::compact_storage::yes);
 }
 
@@ -135,12 +134,12 @@ schema_ptr zsets_schema(sstring ks_name) {
     );
     builder.set_gc_grace_seconds(0);
     builder.with(schema_builder::compact_storage::yes);
-    builder.with_version(db::system_keyspace::generate_schema_version(builder.uuid()));
+    builder.with_hash_version();
     return builder.build(schema_builder::compact_storage::yes);
 }
 
 future<> create_keyspace_if_not_exists_impl(seastar::sharded<service::storage_proxy>& proxy, data_dictionary::database db, seastar::sharded<service::migration_manager>& mm, db::config& config, int default_replication_factor) {
-    assert(this_shard_id() == 0);
+    SCYLLA_ASSERT(this_shard_id() == 0);
     auto keyspace_replication_strategy_options = config.redis_keyspace_replication_strategy_options();
     if (!keyspace_replication_strategy_options.contains("class")) {
         keyspace_replication_strategy_options["class"] = "SimpleStrategy";
@@ -158,16 +157,17 @@ future<> create_keyspace_if_not_exists_impl(seastar::sharded<service::storage_pr
                              table{redis::HASHes, hashes_schema},
                              table{redis::ZSETs, zsets_schema}};
 
-    auto ks_names = boost::copy_range<std::vector<sstring>>(
-            boost::irange<unsigned>(0, config.redis_database_count()) |
-            boost::adaptors::transformed([] (unsigned i) { return fmt::format("REDIS_{}", i); }));
+    auto ks_names =
+            std::views::iota(0u, config.redis_database_count()) |
+            std::views::transform([] (unsigned i) { return fmt::format("REDIS_{}", i); }) |
+            std::ranges::to<std::vector<sstring>>();
 
     while (true) {
-        bool schema_ok = boost::algorithm::all_of(ks_names, [&] (auto& ks_name) {
+        bool schema_ok = std::ranges::all_of(ks_names, [&] (auto& ks_name) {
             auto check = [&] (table t) {
                 return db.has_schema(ks_name, t.name);
             };
-            return db.has_keyspace(ks_name) && boost::algorithm::all_of(tables, check);
+            return db.has_keyspace(ks_name) && std::ranges::all_of(tables, check);
         });
 
         if (schema_ok) {
@@ -189,7 +189,7 @@ future<> create_keyspace_if_not_exists_impl(seastar::sharded<service::storage_pr
             attrs.add_property(cql3::statements::ks_prop_defs::KW_REPLICATION, replication_properties);
             attrs.validate();
 
-            ksms.push_back(attrs.as_ks_metadata(ks_name, *tm));
+            ksms.push_back(attrs.as_ks_metadata(ks_name, *tm, proxy.local().features(), proxy.local().local_db().get_config()));
         }
 
         auto group0_guard = co_await mml.start_group0_operation();

@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -46,13 +46,13 @@ public:
 protected:
     std::optional<sstring> get_simple(const sstring& name) const;
 
-    std::optional<std::map<sstring, sstring>> get_map(const sstring& name) const;
-
     void remove_from_map_if_exists(const sstring& name, const sstring& key) const;
 public:
     bool has_property(const sstring& name) const;
 
     std::optional<value_type> get(const sstring& name) const;
+
+    std::optional<std::map<sstring, sstring>> get_map(const sstring& name) const;
 
     sstring get_string(sstring key, sstring default_value) const;
 
@@ -70,6 +70,10 @@ public:
     static int32_t to_int(sstring key, std::optional<sstring> value, int32_t default_value);
 
     static long to_long(sstring key, std::optional<sstring> value, long default_value);
+
+    size_t count() const {
+        return _properties.size();
+    }
 };
 
 }

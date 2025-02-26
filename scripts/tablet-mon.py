@@ -2,7 +2,7 @@
 #
 # Copyright (C) 2023-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 # This is a tool for live-monitoring the state of tablets and load balancing dynamics in a Scylla cluster.
 #
@@ -17,6 +17,11 @@
 # To connect to a different host, you can set up a tunnel:
 #
 #   ssh -L *:9042:127.0.0.1:9042 -N <remote-host>
+#
+# Key bindings:
+#
+#  t - toggle display of table tags. Each table has a unique color which is displayed in the bottom part of the tablet.
+#  i - toggle display of tablet ids. Only visible when table tags are visible.
 #
 
 import math
@@ -39,6 +44,8 @@ tablet_w = tablet_size
 tablet_h = tablet_w // 2
 tablet_radius = tablet_size // 7
 tablet_frame_size = max(2, min(6, tablet_size // 14))
+show_table_tag = False
+show_tablet_id = False
 
 # Animation settings
 streaming_trace_duration_ms = 300
@@ -84,6 +91,12 @@ class Tablet(object):
         self.state = state
         self.insert_time = pygame.time.get_ticks()
         self.streaming = False
+        self.seq = 0 # Tablet index within table
+
+        table_id = id[0]
+        if table_id not in table_tag_colors:
+            table_tag_colors[table_id] = table_tag_palette[len(table_tag_colors) % len(table_tag_palette)]
+        self.table_tag_color = table_tag_colors[table_id]
 
         # Updated by animate()
         self.h = 0 # Height including tablet_frame_size
@@ -359,6 +372,28 @@ tablet_colors = {
     (Tablet.STATE_LEAVING, 'end_migration'): light_gray,
 }
 
+table_tag_palette = [
+    (238, 187, 187),  # Light Red
+    (238, 221, 187),  # Orange
+    (187, 238, 187),  # Lime Green
+    (187, 238, 238),  # Aqua
+    (187, 221, 238),  # Light Blue
+    (221, 187, 238),  # Lavender
+    (238, 187, 238),  # Pink
+    (238, 238, 187),  # Yellow
+    (238, 153, 153),  # Lighter Red
+    (238, 187, 153),  # Lighter Orange
+    (238, 238, 153),  # Lighter Yellow
+    (153, 238, 153),  # Lighter Green
+    (153, 221, 238),  # Lighter Blue
+    (187, 153, 238),  # Lighter Purple
+    (238, 153, 238),  # Lighter Pink
+    (204, 204, 204)   # Gray
+]
+
+# Map between table id and color
+table_tag_colors = {}
+
 # Avoid redrawing if nothing changed
 changed = False
 
@@ -403,7 +438,17 @@ def update_from_cql(initial=False):
             changed = True
 
     tablets_by_shard = set()
+    tablet_id_by_table = {}
+
+    def tablet_id_for_table(table_id):
+        if table_id not in tablet_id_by_table:
+            tablet_id_by_table[table_id] = 0
+        ret = tablet_id_by_table[table_id]
+        tablet_id_by_table[table_id] += 1
+        return ret
+
     for tablet in session.execute(tablets_query):
+        tablet_seq = tablet_id_for_table(tablet.table_id)
         id = (tablet.table_id, tablet.last_token)
         replicas = set(tablet.replicas)
         new_replicas = set(tablet.new_replicas) if tablet.new_replicas else replicas
@@ -436,6 +481,7 @@ def update_from_cql(initial=False):
                 inserted = True
                 changed = True
             t = s.tablets[id]
+            t.seq = tablet_seq
             if t.state != state:
                 t.state = state
                 stage_change = True
@@ -508,6 +554,7 @@ window_width = min(window_width, 3000)
 window_height = min(window_height, 2000)
 window = pygame.display.set_mode((window_width, window_height), pygame.RESIZABLE)
 pygame.display.set_caption('Tablets')
+number_font = pygame.font.SysFont(None, 20)
 
 def draw_tablet(tablet, x, y):
     tablet.x = x
@@ -516,10 +563,30 @@ def draw_tablet(tablet, x, y):
     h = tablet.size_frac * (tablet_h + 2 * tablet_frame_size)
     if h > 2 * tablet_frame_size:
         color = tablet_colors[tablet.state]
-        pygame.draw.rect(window, color, (x + tablet_frame_size + (tablet_w - w) / 2,
+        if show_table_tag:
+            table_tag_color = tablet.table_tag_color
+        else:
+            table_tag_color = color
+
+        pygame.draw.rect(window, table_tag_color, (x + tablet_frame_size + (tablet_w - w) / 2,
                                          y + tablet_frame_size,
                                          w,
                                          h - 2 * tablet_frame_size), border_radius=tablet_radius)
+
+        if show_table_tag:
+            table_tag_h = tablet_radius
+            pygame.draw.rect(window, color, (x + tablet_frame_size + (tablet_w - w) / 2,
+                                             y + tablet_frame_size,
+                                             w,
+                                             table_tag_h),
+                             border_top_left_radius=tablet_radius,
+                             border_top_right_radius=tablet_radius)
+
+            if show_tablet_id:
+                number_text = str(tablet.seq)
+                number_image = number_font.render(number_text, True, BLACK)
+                window.blit(number_image, (x + tablet_frame_size + (w - number_image.get_width()) / 2,
+                                           y + tablet_frame_size + (h-1 - number_image.get_height()) / 2))
 
 def draw_node_frame(x, y, x2, y2, color):
     pygame.draw.rect(window, color, (x, y, x2 - x, y2 - y), node_frame_thickness,
@@ -614,6 +681,13 @@ while running:
         elif event.type == pygame.VIDEORESIZE:
             window_width, window_height = event.w, event.h
             changed = True
+        elif event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_t:
+                show_table_tag = not show_table_tag
+                changed = True
+            elif event.key == pygame.K_i:
+                show_tablet_id = not show_tablet_id
+                changed = True
 
     now = float(pygame.time.get_ticks())
 

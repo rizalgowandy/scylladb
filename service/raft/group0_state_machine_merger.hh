@@ -3,15 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #pragma once
 
 #include "data_dictionary/data_dictionary.hh"
 #include "service/raft/group0_state_machine.hh"
 #include "service/storage_proxy.hh"
-
-#include <boost/range/algorithm/transform.hpp>
 
 namespace service {
 

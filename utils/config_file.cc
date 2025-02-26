@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <unordered_map>
@@ -12,8 +12,6 @@
 #include <yaml-cpp/yaml.h>
 
 #include <boost/program_options.hpp>
-#include <boost/any.hpp>
-#include <boost/range/adaptor/filtered.hpp>
 
 #include <seastar/core/file.hh>
 #include <seastar/core/seastar.hh>
@@ -21,11 +19,13 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/do_with.hh>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/util/defer.hh>
 
 #include <seastar/json/json_elements.hh>
+
+#include <ranges>
 
 #include "config_file.hh"
 #include "config_file_impl.hh"
@@ -225,7 +225,7 @@ sstring utils::hyphenate(const std::string_view& v) {
 }
 
 utils::config_file::config_file(std::initializer_list<cfg_ref> cfgs)
-    : _cfgs(cfgs)
+    : _cfgs(cfgs), _initialization_completed(false)
 {}
 
 void utils::config_file::add(cfg_ref cfg, std::unique_ptr<any_value> value) {
@@ -270,7 +270,7 @@ utils::config_file::add_options(bpo::options_description_easy_init& init) {
 
 
 bpo::options_description_easy_init&
-utils::config_file::add_deprecated_options(bpo::options_description_easy_init&& init) {
+utils::config_file::add_deprecated_options(bpo::options_description_easy_init& init) {
     for (config_src& src : _cfgs) {
         if (src.status() == value_status::Deprecated) {
             src.add_command_line_option(init);
@@ -330,7 +330,7 @@ void utils::config_file::read_from_yaml(const char* yaml, error_handler h) {
         }
         // Still, a syntax error is an error warning, not a fail
         try {
-            cfg.set_value(node.second);
+            cfg.set_value(node.second, this->_initialization_completed ? config_source::SettingsFile : config_source::None);
         } catch (std::exception& e) {
             h(label, e.what(), cfg.status());
         } catch (...) {
@@ -340,9 +340,9 @@ void utils::config_file::read_from_yaml(const char* yaml, error_handler h) {
 }
 
 utils::config_file::configs utils::config_file::set_values() const {
-    return boost::copy_range<configs>(_cfgs | boost::adaptors::filtered([] (const config_src& cfg) {
+    return _cfgs | std::views::filter([] (const config_src& cfg) {
         return cfg.status() > value_status::Used || cfg.source() > config_source::None;
-    }));
+    }) | std::ranges::to<configs>();
 }
 
 utils::config_file::configs utils::config_file::unset_values() const {
@@ -364,6 +364,11 @@ future<> utils::config_file::read_from_file(file f, error_handler h) {
         return do_with(make_file_input_stream(f), [this, s, h](input_stream<char>& in) {
             return in.read_exactly(s).then([this, h](temporary_buffer<char> buf) {
                read_from_yaml(sstring(buf.begin(), buf.end()), h);
+                if (!_initialization_completed) {
+                    // Boolean value set on only one shard, but broadcast_to_all_shards().get() called later
+                    // in main.cc will apply the required memory barriers anyway.
+                    _initialization_completed = true;
+                }
             });
         });
     });

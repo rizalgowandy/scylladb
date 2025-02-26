@@ -4,10 +4,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "db/hints/internal/hint_storage.hh"
+
+#include <fmt/std.h>
 
 // Seastar features.
 #include <seastar/core/coroutine.hh>
@@ -17,12 +19,9 @@
 #include <seastar/core/smp.hh>
 #include <seastar/core/sstring.hh>
 
-// Boost features.
-#include <boost/range/adaptors.hpp>
-
 // Scylla includes.
 #include "db/hints/internal/hint_logger.hh"
-#include "seastar/core/future.hh"
+#include <seastar/core/future.hh>
 #include "utils/disk-error-handler.hh"
 #include "utils/lister.hh"
 
@@ -88,7 +87,7 @@ future<hints_segments_map> get_current_hints_segments(const fs::path& hint_direc
         return lister::scan_dir(dir / de.name, lister::dir_entry_types::of<directory_entry_type::directory>(),
                 [&current_hint_segments, shard_id] (fs::path dir, directory_entry de) {
             manager_logger.trace("\tIP: {}", de.name);
-            
+
             // Hint files.
             return lister::scan_dir(dir / de.name, lister::dir_entry_types::of<directory_entry_type::regular>(),
                     [&current_hint_segments, shard_id, ep = de.name] (fs::path dir, directory_entry de) {
@@ -175,10 +174,10 @@ future<> rebalance_segments(const fs::path& hint_directory, hints_segments_map& 
     std::unordered_map<sstring, size_t> per_ep_hints;
 
     for (const auto& [ep, ep_hint_segments] : segments_map) {
-        per_ep_hints[ep] = boost::accumulate(ep_hint_segments
-                | boost::adaptors::map_values
-                | boost::adaptors::transformed(std::mem_fn(&segment_list::size)),
-                size_t(0));
+        per_ep_hints[ep] = std::ranges::fold_left(ep_hint_segments
+                | std::views::values
+                | std::views::transform(std::mem_fn(&segment_list::size)),
+                size_t(0), std::plus());
         manager_logger.trace("{}: total files: {}", ep, per_ep_hints[ep]);
     }
 
@@ -253,7 +252,7 @@ future<> remove_irrelevant_shards_directories(const fs::path& hint_directory) {
                     lister::show_hidden::yes, [] (fs::path dir, directory_entry de) {
                 return io_check(remove_file, (dir / de.name).native());
             });
-            
+
             co_await io_check(remove_file, (dir / de.name).native());
         }
     });
@@ -271,6 +270,77 @@ future<> rebalance_hints(fs::path hint_directory) {
     // Remove the directories of shards that are not present anymore.
     // They should not have any segments by now.
     co_await remove_irrelevant_shards_directories(hint_directory);
+}
+
+std::pair<locator::host_id, gms::inet_address> hint_directory_manager::insert_mapping(const locator::host_id& host_id,
+        const gms::inet_address& ip)
+{
+    const auto maybe_mapping = get_mapping(host_id, ip);
+    if (maybe_mapping) {
+        return *maybe_mapping;
+    }
+
+
+    _mappings.emplace(host_id, ip);
+    return std::make_pair(host_id, ip);
+}
+
+std::optional<gms::inet_address> hint_directory_manager::get_mapping(const locator::host_id& host_id) const noexcept {
+    auto it = _mappings.find(host_id);
+    if (it != _mappings.end()) {
+        return it->second;
+    }
+    return {};
+}
+
+std::optional<locator::host_id> hint_directory_manager::get_mapping(const gms::inet_address& ip) const noexcept {
+    for (const auto& [host_id, ep] : _mappings) {
+        if (ep == ip) {
+            return host_id;
+        }
+    }
+    return {};
+}
+
+std::optional<std::pair<locator::host_id, gms::inet_address>> hint_directory_manager::get_mapping(
+        const locator::host_id& host_id, const gms::inet_address& ip) const noexcept
+{
+    for (const auto& [hid, ep] : _mappings) {
+        if (hid == host_id || ep == ip) {
+            return std::make_pair(hid, ep);
+        }
+    }
+    return {};
+}
+
+void hint_directory_manager::remove_mapping(const locator::host_id& host_id) noexcept {
+    _mappings.erase(host_id);
+}
+
+void hint_directory_manager::remove_mapping(const gms::inet_address& ip) noexcept {
+    for (const auto& [host_id, ep] : _mappings) {
+        if (ep == ip) {
+            _mappings.erase(host_id);
+            break;
+        }
+    }
+}
+
+bool hint_directory_manager::has_mapping(const locator::host_id& host_id) const noexcept {
+    return _mappings.contains(host_id);
+}
+
+bool hint_directory_manager::has_mapping(const gms::inet_address& ip) const noexcept {
+    for (const auto& [_, ep] : _mappings) {
+        if (ip == ep) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void hint_directory_manager::clear() noexcept {
+    _mappings.clear();
 }
 
 } // namespace internal

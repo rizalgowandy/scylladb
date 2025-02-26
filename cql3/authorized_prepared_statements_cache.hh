@@ -3,14 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "cql3/prepared_statements_cache.hh"
 #include "auth/authenticated_user.hh"
-#include "auth/permissions_cache.hh"
 
 namespace cql3 {
 
@@ -60,7 +59,8 @@ public:
     bool operator==(const authorized_prepared_statements_cache_key&) const = default;
 
     static size_t hash(const auth::authenticated_user& user, const cql3::prepared_cache_key_type::cache_key_type& prep_cache_key) {
-        return utils::hash_combine(std::hash<auth::authenticated_user>()(user), utils::tuple_hash()(prep_cache_key));
+        return utils::hash_combine(std::hash<auth::authenticated_user>()(user),
+                                   std::hash<cql3::prepared_cache_key_type::cache_key_type>()(prep_cache_key));
     }
 };
 
@@ -180,8 +180,12 @@ struct hash<cql3::authorized_prepared_statements_cache_key> final {
     }
 };
 
-inline std::ostream& operator<<(std::ostream& out, const cql3::authorized_prepared_statements_cache_key& k) {
-    fmt::print(out, "{{{}, {}}}", k.key().first, k.key().second);
-    return out;
 }
-}
+
+template <>
+struct fmt::formatter<cql3::authorized_prepared_statements_cache_key> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const cql3::authorized_prepared_statements_cache_key& k, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{{{}, {}}}", k.key().first, k.key().second);
+    }
+};

@@ -12,7 +12,10 @@ target_link_libraries(schema
     cql3
     idl
     Seastar::seastar
-    xxHash::xxhash)
+    xxHash::xxhash
+    absl::headers
+  PRIVATE
+    alternator)
 
 check_headers(check-headers schema
   GLOB_RECURSE ${CMAKE_CURRENT_SOURCE_DIR}/*.hh)

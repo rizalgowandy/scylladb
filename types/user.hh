@@ -3,16 +3,19 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "cql3/description.hh"
 #include "types/types.hh"
 #include "types/tuple.hh"
-#include "data_dictionary/keyspace_element.hh"
 
-class user_type_impl : public tuple_type_impl, public data_dictionary::keyspace_element {
+#include <ranges>
+#include <set>
+
+class user_type_impl : public tuple_type_impl {
     using intern = type_interning_helper<user_type_impl, sstring, bytes, std::vector<bytes>, std::vector<data_type>, bool>;
 public:
     const sstring _keyspace;
@@ -28,8 +31,10 @@ public:
             , _keyspace(std::move(keyspace))
             , _name(std::move(name))
             , _field_names(std::move(field_names))
-            , _string_field_names(boost::copy_range<std::vector<sstring>>(_field_names | boost::adaptors::transformed(
-                    [] (const bytes& field_name) { return utf8_type->to_string(field_name); })))
+            , _string_field_names(_field_names
+                | std::views::transform(
+                    [] (const bytes& field_name) { return utf8_type->to_string(field_name); })
+                | std::ranges::to<std::vector<sstring>>())
             , _is_multi_cell(is_multi_cell) {
     }
     static shared_ptr<const user_type_impl> get_instance(sstring keyspace, bytes name,
@@ -47,10 +52,19 @@ public:
     sstring get_name_as_string() const;
     sstring get_name_as_cql_string() const;
 
-    virtual sstring keypace_name() const override { return _keyspace; }
-    virtual sstring element_name() const override { return get_name_as_string(); }
-    virtual sstring element_type() const override { return "type"; }
-    virtual std::ostream& describe(std::ostream& os) const override;
+    /* Returns set of user-defined types referenced by this UDT
+     * 
+     * Example:
+     * create type some_udt {
+     *   a frozen<udt_a>,
+     *   m frozen<map<udt_a, udt_b>,
+     *   t frozen<tuple<int, list<udt_c>>   
+     * }
+     * get_all_referenced_user_types() will return {udt_a, udt_b, udt_c}.
+     */
+    std::set<user_type> get_all_referenced_user_types() const;
+
+    cql3::description describe(cql3::with_create_statement) const;
 
 private:
     static sstring make_name(sstring keyspace,

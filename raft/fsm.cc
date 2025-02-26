@@ -3,11 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #include "fsm.hh"
 #include <random>
 #include <seastar/core/coroutine.hh>
+#include "utils/assert.hh"
 #include "utils/error_injection.hh"
 
 namespace raft {
@@ -19,9 +20,10 @@ leader::~leader() {
 }
 
 fsm::fsm(server_id id, term_t current_term, server_id voted_for, log log,
-        index_t commit_idx, failure_detector& failure_detector, fsm_config config) :
+        index_t commit_idx, failure_detector& failure_detector, fsm_config config,
+        seastar::condition_variable& sm_events) :
         _my_id(id), _current_term(current_term), _voted_for(voted_for),
-        _log(std::move(log)), _failure_detector(failure_detector), _config(config) {
+        _log(std::move(log)), _failure_detector(failure_detector), _config(config), _sm_events(sm_events) {
     if (id == raft::server_id{}) {
         throw std::invalid_argument("raft::fsm: raft instance cannot have id zero");
     }
@@ -40,10 +42,6 @@ fsm::fsm(server_id id, term_t current_term, server_id voted_for, log log,
         reset_election_timeout();
     }
 }
-
-fsm::fsm(server_id id, term_t current_term, server_id voted_for, log log,
-        failure_detector& failure_detector, fsm_config config) :
-        fsm(id, current_term, voted_for, std::move(log), index_t{0}, failure_detector, config) {}
 
 future<semaphore_units<>> fsm::wait_for_memory_permit(seastar::abort_source* as, size_t size) {
     check_is_leader();
@@ -118,7 +116,7 @@ const log_entry& fsm::add_entry(T command) {
         leader_state().tracker.set_configuration(_log.get_configuration(), _log.last_idx());
     }
 
-    return *_log[_log.last_idx()];
+    return *_log[_log.last_idx().value()];
 }
 
 template const log_entry& fsm::add_entry(command command);
@@ -143,7 +141,7 @@ void fsm::advance_commit_idx(index_t leader_commit_idx) {
 
 void fsm::update_current_term(term_t current_term)
 {
-    assert(_current_term < current_term);
+    SCYLLA_ASSERT(_current_term < current_term);
     _current_term = current_term;
     _voted_for = server_id{};
 }
@@ -159,7 +157,7 @@ void fsm::reset_election_timeout() {
 }
 
 void fsm::become_leader() {
-    assert(!std::holds_alternative<leader>(_state));
+    SCYLLA_ASSERT(!std::holds_alternative<leader>(_state));
     _output.state_changed = true;
     _state.emplace<leader>(_config.max_log_size, *this);
 
@@ -261,7 +259,7 @@ void fsm::become_candidate(bool is_prevote, bool is_leadership_transfer) {
         // This means we must still have access to the previous configuration.
         // Become a candidate only if we were previously a voter.
         auto prev_cfg = _log.get_prev_configuration();
-        assert(prev_cfg);
+        SCYLLA_ASSERT(prev_cfg);
         if (!prev_cfg->can_vote(_my_id)) {
             // We weren't a voter before.
             become_follower(server_id{});
@@ -269,7 +267,7 @@ void fsm::become_candidate(bool is_prevote, bool is_leadership_transfer) {
         }
     }
 
-    term_t term{_current_term + 1};
+    term_t term{_current_term + term_t{1}};
     if (!is_prevote) {
         update_current_term(term);
     }
@@ -303,23 +301,15 @@ void fsm::become_candidate(bool is_prevote, bool is_leadership_transfer) {
     }
 }
 
-future<fsm_output> fsm::poll_output() {
-    logger.trace("fsm::poll_output() {} stable index: {} last index: {}",
+bool fsm::has_output() const {
+    logger.trace("fsm::has_output() {} stable index: {} last index: {}",
         _my_id, _log.stable_idx(), _log.last_idx());
 
-    while (true) {
-        auto diff = _log.last_idx() - _log.stable_idx();
+    auto diff = _log.last_idx() - _log.stable_idx();
 
-        if (diff > 0 || !_messages.empty() || !_observed.is_equal(*this) || _output.max_read_id_with_quorum ||
-                (is_leader() && leader_state().last_read_id_changed) || _output.snp || !_output.snps_to_drop.empty() || _output.state_changed) {
-            break;
-        }
-        co_await _sm_events.wait();
-    }
-    while (utils::get_local_injector().enter("fsm::poll_output/pause")) {
-        co_await seastar::sleep(std::chrono::milliseconds(100));
-    }
-    co_return get_output();
+    return diff > index_t{0} || !_messages.empty() || !_observed.is_equal(*this) || _output.max_read_id_with_quorum
+        || (is_leader() && leader_state().last_read_id_changed) || _output.snp || !_output.snps_to_drop.empty()
+        || _output.state_changed;
 }
 
 fsm_output fsm::get_output() {
@@ -339,15 +329,15 @@ fsm_output fsm::get_output() {
 
     fsm_output output = std::exchange(_output, fsm_output{});
 
-    if (diff > 0) {
-        output.log_entries.reserve(diff);
+    if (diff.value() > 0) {
+        output.log_entries.reserve(diff.value());
 
-        for (auto i = _log.stable_idx() + 1; i <= _log.last_idx(); i++) {
+        for (auto i = _log.stable_idx() + index_t{1}; i <= _log.last_idx(); i++) {
             // Copy before saving to storage to prevent races with log updates,
             // e.g. truncation of the log.
             // TODO: avoid copies by making sure log truncate is
             // copy-on-write.
-            output.log_entries.emplace_back(_log[i]);
+            output.log_entries.emplace_back(_log[i.value()]);
         }
     }
 
@@ -361,10 +351,10 @@ fsm_output fsm::get_output() {
     // to a snapshot.
     auto observed_ci =  std::max(_observed._commit_idx, _log.get_snapshot().idx);
     if (observed_ci < _commit_idx) {
-        output.committed.reserve(_commit_idx - observed_ci);
+        output.committed.reserve((_commit_idx - observed_ci).value());
 
-        for (auto idx = observed_ci + 1; idx <= _commit_idx; ++idx) {
-            const auto& entry = _log[idx];
+        for (auto idx = observed_ci + index_t{1}; idx <= _commit_idx; ++idx) {
+            const auto& entry = _log[idx.value()];
             output.committed.push_back(entry);
         }
     }
@@ -436,7 +426,7 @@ void fsm::maybe_commit() {
     bool committed_conf_change = _commit_idx < _log.last_conf_idx() &&
         new_commit_idx >= _log.last_conf_idx();
 
-    if (_log[new_commit_idx]->term != _current_term) {
+    if (_log[new_commit_idx.value()]->term != _current_term) {
 
         // 3.6.2 Committing entries from previous terms
         // Raft never commits log entries from previous terms by
@@ -446,7 +436,7 @@ void fsm::maybe_commit() {
         // this way, then all prior entries are committed
         // indirectly because of the Log Matching Property.
         logger.trace("maybe_commit[{}]: cannot commit because of term {} != {}",
-            _my_id, _log[new_commit_idx]->term, _current_term);
+            _my_id, _log[new_commit_idx.value()]->term, _current_term);
         return;
     }
     logger.trace("maybe_commit[{}]: commit {}", _my_id, new_commit_idx);
@@ -639,7 +629,7 @@ void fsm::append_entries(server_id from, append_request&& request) {
             _my_id, request.current_term, request.prev_log_idx, request.prev_log_term,
             request.leader_commit_idx, request.entries.size() ? request.entries[0]->idx : index_t(0), request.entries.size());
 
-    assert(is_follower());
+    SCYLLA_ASSERT(is_follower());
 
     // Ensure log matching property, even if we append no entries.
     // 3.5
@@ -674,7 +664,7 @@ void fsm::append_entries(server_id from, append_request&& request) {
 }
 
 void fsm::append_entries_reply(server_id from, append_reply&& reply) {
-    assert(is_leader());
+    SCYLLA_ASSERT(is_leader());
 
     follower_progress* opt_progress = leader_state().tracker.find(from);
     if (opt_progress == nullptr) {
@@ -759,13 +749,13 @@ void fsm::append_entries_reply(server_id from, append_reply&& reply) {
         // Start re-sending from the non matching index, or from
         // the last index in the follower's log.
         // FIXME: make it more efficient
-        progress.next_idx = std::min(rejected.non_matching_idx, index_t(rejected.last_idx + 1));
+        progress.next_idx = std::min(rejected.non_matching_idx, rejected.last_idx + index_t{1});
 
         progress.become_probe();
 
         // By `is_stray_reject(rejected) == false` we know that `rejected.non_matching_idx > progress.match_idx`
         // and `rejected.last_idx + 1 > progress.match_idx`. By the assignment to `progress.next_idx` above, we get:
-        assert(progress.next_idx > progress.match_idx);
+        SCYLLA_ASSERT(progress.next_idx > progress.match_idx);
     }
 
     // We may have just applied a configuration that removes this
@@ -784,7 +774,7 @@ void fsm::request_vote(server_id from, vote_request&& request) {
     // We can cast a vote in any state. If the candidate's term is
     // lower than ours, we ignore the request. Otherwise we first
     // update our current term and convert to a follower.
-    assert(request.is_prevote || _current_term == request.current_term);
+    SCYLLA_ASSERT(request.is_prevote || _current_term == request.current_term);
 
     bool can_vote =
         // We can vote if this is a repeat of a vote we've already cast...
@@ -835,7 +825,7 @@ void fsm::request_vote(server_id from, vote_request&& request) {
 }
 
 void fsm::request_vote_reply(server_id from, vote_reply&& reply) {
-    assert(is_candidate());
+    SCYLLA_ASSERT(is_candidate());
 
     logger.trace("request_vote_reply[{}] received a {} vote from {}", _my_id, reply.vote_granted ? "yes" : "no", from);
 
@@ -863,27 +853,6 @@ void fsm::request_vote_reply(server_id from, vote_reply&& reply) {
         become_follower(server_id{});
         break;
     }
-}
-
-static size_t entry_size(const log_entry& e) {
-    struct overloaded {
-        size_t operator()(const command& c) {
-            return c.size();
-        }
-        size_t operator()(const configuration& c) {
-            size_t size = 0;
-            for (auto& s : c.current) {
-                size += sizeof(s.addr.id);
-                size += s.addr.info.size();
-                size += sizeof(s.can_vote);
-            }
-            return size;
-        }
-        size_t operator()(const log_entry::dummy& d) {
-            return 0;
-        }
-    };
-    return std::visit(overloaded{}, e.data) + sizeof(e);
 }
 
 void fsm::replicate_to(follower_progress& progress, bool allow_empty) {
@@ -941,11 +910,11 @@ void fsm::replicate_to(follower_progress& progress, bool allow_empty) {
         if (next_idx) {
             size_t size = 0;
             while (next_idx <= _log.last_idx() && size < _config.append_request_threshold) {
-                const auto& entry = _log[next_idx];
+                const auto& entry = _log[next_idx.value()];
                 req.entries.push_back(entry);
                 logger.trace("replicate_to[{}->{}]: send entry idx={}, term={}",
                              _my_id, progress.id, entry->idx, entry->term);
-                size += entry_size(*entry);
+                size += entry->get_size();
                 next_idx++;
                 if (progress.state == follower_progress::state::PROBE) {
                     break; // in PROBE mode send only one entry
@@ -972,7 +941,7 @@ void fsm::replicate_to(follower_progress& progress, bool allow_empty) {
 }
 
 void fsm::replicate() {
-    assert(is_leader());
+    SCYLLA_ASSERT(is_leader());
     for (auto& [id, progress] : leader_state().tracker) {
         if (progress.id != _my_id) {
             replicate_to(progress, false);
@@ -1010,7 +979,7 @@ bool fsm::apply_snapshot(snapshot_descriptor snp, size_t max_trailing_entries, s
     // If the snapshot is locally generated, all entries up to its index must have been locally applied,
     // so in particular they must have been observed as committed.
     // Remote snapshots are only applied if we're a follower.
-    assert((local && snp.idx <= _observed._commit_idx) || (!local && is_follower()));
+    SCYLLA_ASSERT((local && snp.idx <= _observed._commit_idx) || (!local && is_follower()));
 
     // We don't apply snapshots older than the last applied one.
     // Furthermore, for remote snapshots, we can *only* apply them if they are fresher than our commit index.
@@ -1029,8 +998,11 @@ bool fsm::apply_snapshot(snapshot_descriptor snp, size_t max_trailing_entries, s
     // If the snapshot is local, _commit_idx is larger than snp.idx.
     // Otherwise snp.idx becomes the new commit index.
     _commit_idx = std::max(_commit_idx, snp.idx);
-    _output.snp.emplace(fsm_output::applied_snapshot{snp, local});
-    size_t units = _log.apply_snapshot(std::move(snp), max_trailing_entries, max_trailing_bytes);
+    const auto [units, new_first_index] = _log.apply_snapshot(std::move(snp), max_trailing_entries, max_trailing_bytes);
+    _output.snp.emplace(fsm_output::applied_snapshot{
+        .snp = _log.get_snapshot(),
+        .is_local = local,
+        .preserved_log_entries = _log.get_snapshot().idx.value() + 1 - new_first_index.value()});
     if (is_leader()) {
         logger.trace("apply_snapshot[{}]: signal {} available units", _my_id, units);
         leader_state().log_limiter_semaphore->signal(units);
@@ -1085,7 +1057,7 @@ void fsm::broadcast_read_quorum(read_id id) {
 }
 
 void fsm::handle_read_quorum_reply(server_id from, const read_quorum_reply& reply) {
-    assert(is_leader());
+    SCYLLA_ASSERT(is_leader());
     logger.trace("handle_read_quorum_reply[{}] got reply from {} for id {}", _my_id, from, reply.id);
     auto& state = leader_state();
     follower_progress* progress = state.tracker.find(from);
@@ -1118,14 +1090,14 @@ void fsm::handle_read_quorum_reply(server_id from, const read_quorum_reply& repl
 std::optional<std::pair<read_id, index_t>> fsm::start_read_barrier(server_id requester) {
     check_is_leader();
 
-    // Make sure that only a leader or a not that is part of the config can request read barrier
+    // Make sure that only a leader or a node that is part of the config can request read barrier
     // Nodes outside of the config may never get the data, so they will not be able to read it.
     if (requester != _my_id && leader_state().tracker.find(requester) == nullptr) {
-        throw std::runtime_error("Read barrier requested by a node outside of the configuration");
+        throw std::runtime_error(fmt::format("Read barrier requested by a node outside of the configuration {}", requester));
     }
 
     auto term_for_commit_idx = _log.term_for(_commit_idx);
-    assert(term_for_commit_idx);
+    SCYLLA_ASSERT(term_for_commit_idx);
 
     if (*term_for_commit_idx != _current_term) {
         return {};
@@ -1142,42 +1114,42 @@ void fsm::stop() {
         // (in particular, abort waits on log_limiter_semaphore and prevent new ones).
         become_follower({});
     }
-    _sm_events.broken();
-}
-
-std::ostream& operator<<(std::ostream& os, const fsm& f) {
-    fmt::print(os, "current term: {}, current leader: {}, len messages: {}, voted_for: {}, commit idx: {}, log ({}), ",
-               f._current_term, f.current_leader(), f._messages.size(), f._voted_for, f._commit_idx, f._log);
-    fmt::print(os, "observed (current term: {}, voted for {}, commit index: {}), ",
-               f._observed._current_term, f._observed._voted_for, f._observed._commit_idx);
-    fmt::print(os, "current time: {}, last election time: {}, ",
-               f._clock.now(), f._last_election_time);
-    if (f.is_candidate()) {
-        fmt::print(os, "votes ({}), ", f.candidate_state().votes);
-    }
-    fmt::print(os, "messages: {}, ", f._messages.size());
-    if (std::holds_alternative<leader>(f._state)) {
-        fmt::print(os, "leader, ");
-    } else if (std::holds_alternative<candidate>(f._state)) {
-        fmt::print(os, "candidate");
-    } else if (std::holds_alternative<follower>(f._state)) {
-        fmt::print(os, "follower");
-    }
-    if (f.is_leader()) {
-        fmt::print(os, "followers (");
-        for (const auto& [server_id, follower_progress]: f.leader_state().tracker) {
-            fmt::print(os, "{}, {}, {}, ", server_id, follower_progress.next_idx, follower_progress.match_idx);
-            if (follower_progress.state == follower_progress::state::PROBE) {
-                fmt::print(os, "PROBE, ");
-            } else if (follower_progress.state == follower_progress::state::PIPELINE) {
-                fmt::print(os, "PIPELINE, ");
-            }
-            fmt::print(os, "{}; ", follower_progress.in_flight);
-        }
-        fmt::print(os, ")");
-
-    }
-    return os;
 }
 
 } // end of namespace raft
+
+auto fmt::formatter<raft::fsm>::format(const raft::fsm& f, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    auto out = ctx.out();
+    out = fmt::format_to(out, "current term: {}, current leader: {}, len messages: {}, voted_for: {}, commit idx: {}, log ({}), ",
+               f._current_term, f.current_leader(), f._messages.size(), f._voted_for, f._commit_idx, f._log);
+    out = fmt::format_to(out, "observed (current term: {}, voted for {}, commit index: {}), ",
+               f._observed._current_term, f._observed._voted_for, f._observed._commit_idx);
+    out = fmt::format_to(out, "current time: {}, last election time: {}, ",
+               f._clock.now(), f._last_election_time);
+    if (f.is_candidate()) {
+        out = fmt::format_to(out, "votes ({}), ", f.candidate_state().votes);
+    }
+    out = fmt::format_to(out, "messages: {}, ", f._messages.size());
+    if (std::holds_alternative<raft::leader>(f._state)) {
+        out = fmt::format_to(out, "leader, ");
+    } else if (std::holds_alternative<raft::candidate>(f._state)) {
+        out = fmt::format_to(out, "candidate");
+    } else if (std::holds_alternative<raft::follower>(f._state)) {
+        out = fmt::format_to(out, "follower");
+    }
+    if (f.is_leader()) {
+        out = fmt::format_to(out, "followers (");
+        for (const auto& [server_id, follower_progress]: f.leader_state().tracker) {
+            out = fmt::format_to(out, "{}, {}, {}, ", server_id, follower_progress.next_idx, follower_progress.match_idx);
+            if (follower_progress.state == raft::follower_progress::state::PROBE) {
+                out = fmt::format_to(out, "PROBE, ");
+            } else if (follower_progress.state == raft::follower_progress::state::PIPELINE) {
+                out = fmt::format_to(out, "PIPELINE, ");
+            }
+            out = fmt::format_to(out, "{}; ", follower_progress.in_flight);
+        }
+        out = fmt::format_to(out, ")");
+    }
+    return out;
+}

@@ -1,6 +1,8 @@
 add_library(message STATIC)
 target_sources(message
   PRIVATE
+    dictionary_service.cc
+    dictionary_service.hh
     messaging_service.cc
     messaging_service.hh)
 target_include_directories(message
@@ -10,6 +12,7 @@ target_link_libraries(message
   PUBLIC
     gms
     Seastar::seastar
+    absl::headers
   PRIVATE
     idl)
 

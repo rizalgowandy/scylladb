@@ -3,12 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <stdexcept>
 #include "timeout_config.hh"
 #include "db/consistency_level_type.hh"
 #include <seastar/core/sstring.hh>

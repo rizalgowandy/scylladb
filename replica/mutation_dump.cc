@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0)
  */
 
 #include "multishard_mutation_query.hh"
@@ -17,12 +17,13 @@
 #include "schema/schema_builder.hh"
 #include "schema/schema_registry.hh"
 #include "sstables/sstables.hh"
+#include "utils/hashers.hh"
 
 namespace replica::mutation_dump {
 
 namespace {
 
-class mutation_dump_reader : public flat_mutation_reader_v2::impl {
+class mutation_dump_reader : public mutation_reader::impl {
     struct mutation_source_with_params {
         mutation_source ms;
         std::vector<interval<partition_region>> region_intervals;
@@ -41,7 +42,7 @@ private:
     dht::partition_range _underlying_pr;
     // has to be sorted, because it is part of the clustering key
     std::map<sstring, mutation_source_with_params> _underlying_mutation_sources;
-    flat_mutation_reader_v2_opt _underlying_reader;
+    mutation_reader_opt _underlying_reader;
     bool _partition_start_emitted = false;
     bool _partition_end_emitted = false;
 
@@ -184,7 +185,7 @@ private:
                 auto& e = prepared_mutation_sources[ms_it->first];
                 e.ms = ms_it->second;
                 maybe_push(e.region_intervals, region_int, std::compare_three_way{});
-                maybe_push(e.underlying_crs, std::move(transformed_cr), clustering_key_view::tri_compare(*_underlying_schema));
+                maybe_push(e.underlying_crs, transformed_cr, clustering_key_view::tri_compare(*_underlying_schema));
                 ++ms_it;
             }
         }
@@ -263,8 +264,8 @@ private:
                 break;
         }
 
-        if (!ss.str().empty()) {
-            set_cell(*_schema, r, cdef, ss.str());
+        if (!ss.view().empty()) {
+            set_cell(*_schema, r, cdef, std::move(ss).str());
         }
     }
 
@@ -302,7 +303,7 @@ private:
 
         writer.writer().EndObject();
 
-        set_cell(*_schema, r, cdef, ss.str());
+        set_cell(*_schema, r, cdef, std::move(ss).str());
     }
 
     mutation_fragment_v2 transform_mutation_fragment(mutation_fragment_v2& mf, const sstring& data_source_name) {
@@ -394,7 +395,7 @@ public:
     }
 };
 
-future<flat_mutation_reader_v2> make_partition_mutation_dump_reader(
+future<mutation_reader> make_partition_mutation_dump_reader(
         schema_ptr output_schema,
         schema_ptr underlying_schema,
         reader_permit permit,
@@ -404,23 +405,37 @@ future<flat_mutation_reader_v2> make_partition_mutation_dump_reader(
         tracing::trace_state_ptr ts,
         db::timeout_clock::time_point timeout) {
     const auto& tbl = db.local().find_column_family(underlying_schema);
-    const auto shard = tbl.shard_of(dk.token());
+
+    // We can get a request for a token we don't own.
+    // Just return empty reader in this case, otherwise we will hit
+    // std::terminate because the replica side does not handle requests for
+    // un-owned tokens.
+    {
+        auto erm = tbl.get_effective_replication_map();
+        auto& topo = erm->get_topology();
+        const auto endpoints = erm->get_replicas_for_reading(dk.token());
+        if (std::ranges::find(endpoints, topo.this_node()->host_id()) == endpoints.end()) {
+            co_return make_empty_flat_reader_v2(output_schema, std::move(permit));
+        }
+    }
+
+    const auto shard = tbl.shard_for_reads(dk.token());
     if (shard == this_shard_id()) {
-        co_return make_flat_mutation_reader_v2<mutation_dump_reader>(std::move(output_schema), std::move(underlying_schema), std::move(permit),
+        co_return make_mutation_reader<mutation_dump_reader>(std::move(output_schema), std::move(underlying_schema), std::move(permit),
                 db.local(), dk, ps, std::move(ts));
     }
     auto gos = global_schema_ptr(output_schema);
     auto gus = global_schema_ptr(underlying_schema);
     auto gts = tracing::global_trace_state_ptr(ts);
     auto remote_reader = co_await db.invoke_on(shard,
-            [gos = std::move(gos), gus = std::move(gus), &dk, &ps, gts = std::move(gts), timeout] (replica::database& local_db) -> future<foreign_ptr<std::unique_ptr<flat_mutation_reader_v2>>> {
+            [gos = std::move(gos), gus = std::move(gus), &dk, &ps, gts = std::move(gts), timeout] (replica::database& local_db) -> future<foreign_ptr<std::unique_ptr<mutation_reader>>> {
         auto output_schema = gos.get();
         auto underlying_schema = gus.get();
         auto ts = gts.get();
         auto permit = co_await local_db.obtain_reader_permit(underlying_schema, "mutation-dump-remote-read", timeout, ts);
-        auto reader = make_flat_mutation_reader_v2<mutation_dump_reader>(std::move(output_schema), std::move(underlying_schema), std::move(permit),
+        auto reader = make_mutation_reader<mutation_dump_reader>(std::move(output_schema), std::move(underlying_schema), std::move(permit),
                 local_db, dk, ps, std::move(ts));
-        co_return make_foreign(std::make_unique<flat_mutation_reader_v2>(std::move(reader)));
+        co_return make_foreign(std::make_unique<mutation_reader>(std::move(reader)));
     });
     co_return make_foreign_reader(std::move(output_schema), std::move(permit), std::move(remote_reader));
 }
@@ -560,6 +575,7 @@ schema_ptr generate_output_schema_from_underlying_schema(schema_ptr underlying_s
 
 future<foreign_ptr<lw_shared_ptr<query::result>>> dump_mutations(
         sharded<database>& db,
+        locator::effective_replication_map_ptr erm_keepalive,
         schema_ptr output_schema,
         schema_ptr underlying_schema,
         const dht::partition_range_vector& prs,
@@ -576,7 +592,7 @@ future<foreign_ptr<lw_shared_ptr<query::result>>> dump_mutations(
     }
 
     auto permit = co_await db.local().obtain_reader_permit(underlying_schema, "mutation-dump", timeout, ts);
-    auto max_result_size = cmd.max_result_size ? *cmd.max_result_size : db.local().get_unlimited_query_max_result_size();
+    auto max_result_size = cmd.max_result_size ? *cmd.max_result_size : db.local().get_query_max_result_size();
     permit.set_max_result_size(max_result_size);
 
     const auto opts = query::result_options::only_result();

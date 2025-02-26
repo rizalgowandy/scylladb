@@ -3,13 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "replica/memtable.hh"
-#include "row_cache.hh"
+#include "db/row_cache.hh"
 #include "replica/dirty_memory_manager.hh"
 
 // # Flush control overview

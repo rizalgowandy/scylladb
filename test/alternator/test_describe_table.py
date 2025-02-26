@@ -1,6 +1,6 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for the DescribeTable operation.
 # Some attributes used only by a specific major feature will be tested
@@ -18,7 +18,7 @@ import pytest
 from botocore.exceptions import ClientError
 import re
 import time
-from util import multiset
+from test.alternator.util import multiset
 
 # Test that DescribeTable correctly returns the table's name and state
 def test_describe_table_basic(test_table):

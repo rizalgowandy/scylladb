@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "auth/authenticated_user.hh"
@@ -14,6 +14,7 @@
 #include "auth/default_authorizer.hh"
 #include "auth/password_authenticator.hh"
 #include "auth/permission.hh"
+#include "service/raft/raft_group0_client.hh"
 #include "utils/class_registrator.hh"
 
 namespace auth {
@@ -36,8 +37,8 @@ class transitional_authenticator : public authenticator {
 public:
     static const sstring PASSWORD_AUTHENTICATOR_NAME;
 
-    transitional_authenticator(cql3::query_processor& qp, ::service::migration_manager& mm)
-            : transitional_authenticator(std::make_unique<password_authenticator>(qp, mm)) {
+    transitional_authenticator(cql3::query_processor& qp, ::service::raft_group0_client& g0, ::service::migration_manager& mm)
+            : transitional_authenticator(std::make_unique<password_authenticator>(qp, g0, mm)) {
     }
     transitional_authenticator(std::unique_ptr<authenticator> a)
             : _authenticator(std::move(a)) {
@@ -86,20 +87,28 @@ public:
         });
     }
 
-    virtual future<> create(std::string_view role_name, const authentication_options& options) const override {
-        return _authenticator->create(role_name, options);
+    virtual future<> create(std::string_view role_name, const authentication_options& options, ::service::group0_batch& mc) override {
+        return _authenticator->create(role_name, options, mc);
     }
 
-    virtual future<> alter(std::string_view role_name, const authentication_options& options) const override {
-        return _authenticator->alter(role_name, options);
+    virtual future<> alter(std::string_view role_name, const authentication_options& options, ::service::group0_batch& mc) override {
+        return _authenticator->alter(role_name, options, mc);
     }
 
-    virtual future<> drop(std::string_view role_name) const override {
-        return _authenticator->drop(role_name);
+    virtual future<> drop(std::string_view role_name, ::service::group0_batch& mc) override {
+        return _authenticator->drop(role_name, mc);
     }
 
     virtual future<custom_options> query_custom_options(std::string_view role_name) const override {
         return _authenticator->query_custom_options(role_name);
+    }
+
+    virtual bool uses_password_hashes() const override {
+        return _authenticator->uses_password_hashes();
+    }
+
+    virtual future<std::optional<sstring>> get_password_hash(std::string_view role_name) const override {
+        return _authenticator->get_password_hash(role_name);
     }
 
     virtual const resource_set& protected_resources() const override {
@@ -137,6 +146,10 @@ public:
                         }
                     });
                 });
+	    }
+
+            const sstring& get_username() const override {
+                return _sasl->get_username();
             }
 
         private:
@@ -146,14 +159,18 @@ public:
         };
         return ::make_shared<sasl_wrapper>(_authenticator->new_sasl_challenge());
     }
+
+    virtual future<> ensure_superuser_is_created() const override {
+        return _authenticator->ensure_superuser_is_created();
+    }
 };
 
 class transitional_authorizer : public authorizer {
     std::unique_ptr<authorizer> _authorizer;
 
 public:
-    transitional_authorizer(cql3::query_processor& qp, ::service::migration_manager& mm)
-            : transitional_authorizer(std::make_unique<default_authorizer>(qp, mm)) {
+    transitional_authorizer(cql3::query_processor& qp, ::service::raft_group0_client& g0, ::service::migration_manager& mm)
+            : transitional_authorizer(std::make_unique<default_authorizer>(qp, g0, mm)) {
     }
     transitional_authorizer(std::unique_ptr<authorizer> a)
             : _authorizer(std::move(a)) {
@@ -186,24 +203,24 @@ public:
         return make_ready_future<permission_set>(transitional_permissions);
     }
 
-    virtual future<> grant(std::string_view s, permission_set ps, const resource& r) const override {
-        return _authorizer->grant(s, std::move(ps), r);
+    virtual future<> grant(std::string_view s, permission_set ps, const resource& r, ::service::group0_batch& mc)  override {
+        return _authorizer->grant(s, std::move(ps), r, mc);
     }
 
-    virtual future<> revoke(std::string_view s, permission_set ps, const resource& r) const override {
-        return _authorizer->revoke(s, std::move(ps), r);
+    virtual future<> revoke(std::string_view s, permission_set ps, const resource& r, ::service::group0_batch& mc) override {
+        return _authorizer->revoke(s, std::move(ps), r, mc);
     }
 
     virtual future<std::vector<permission_details>> list_all() const override {
         return _authorizer->list_all();
     }
 
-    virtual future<> revoke_all(std::string_view s) const override {
-        return _authorizer->revoke_all(s);
+    virtual future<> revoke_all(std::string_view s, ::service::group0_batch& mc) override {
+        return _authorizer->revoke_all(s, mc);
     }
 
-    virtual future<> revoke_all(const resource& r) const override {
-        return _authorizer->revoke_all(r);
+    virtual future<> revoke_all(const resource& r, ::service::group0_batch& mc) override {
+        return _authorizer->revoke_all(r, mc);
     }
 
     virtual const resource_set& protected_resources() const override {
@@ -221,10 +238,12 @@ static const class_registrator<
         auth::authenticator,
         auth::transitional_authenticator,
         cql3::query_processor&,
+        ::service::raft_group0_client&,
         ::service::migration_manager&> transitional_authenticator_reg(auth::PACKAGE_NAME + "TransitionalAuthenticator");
 
 static const class_registrator<
         auth::authorizer,
         auth::transitional_authorizer,
         cql3::query_processor&,
+        ::service::raft_group0_client&,
         ::service::migration_manager&> transitional_authorizer_reg(auth::PACKAGE_NAME + "TransitionalAuthorizer");

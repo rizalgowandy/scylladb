@@ -3,9 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include <algorithm>
 
 #include <boost/test/unit_test.hpp>
 #include <seastar/net/inet_address.hh>
@@ -26,7 +27,7 @@
 #include "readers/combined.hh"
 #include "replica/memtable-sstable.hh"
 #include "test/lib/index_reader_assertions.hh"
-#include "test/lib/flat_mutation_reader_assertions.hh"
+#include "test/lib/mutation_reader_assertions.hh"
 #include "test/lib/simple_schema.hh"
 #include "test/lib/sstable_utils.hh"
 #include "test/lib/make_random_string.hh"
@@ -34,7 +35,6 @@
 #include "test/lib/random_utils.hh"
 #include "test/lib/log.hh"
 
-#include <boost/range/algorithm/sort.hpp>
 #include "readers/from_fragments_v2.hh"
 
 using namespace sstables;
@@ -42,65 +42,57 @@ using namespace std::chrono_literals;
 
 SEASTAR_TEST_CASE(nonexistent_key) {
   return test_env::do_with_async([] (test_env& env) {
-    env.reusable_sst(uncompressed_schema(), uncompressed_dir()).then([&env] (auto sstp) {
-        return do_with(dht::partition_range::make_singular(make_dkey(uncompressed_schema(), "invalid_key")), [&env, sstp] (auto& pr) {
-            auto s = uncompressed_schema();
-            return with_closeable(sstp->make_reader(s, env.make_reader_permit(), pr, s->full_slice()), [sstp, s] (auto& rd) {
-              return rd().then([sstp, s] (auto mutation) {
-                BOOST_REQUIRE(!mutation);
-                return make_ready_future<>();
-              });
-            });
-        });
-    }).get();
+      auto sstp = env.reusable_sst(uncompressed_schema(), uncompressed_dir()).get();
+      auto pr = dht::partition_range::make_singular(make_dkey(uncompressed_schema(), "invalid_key"));
+      auto s = uncompressed_schema();
+      auto rd = sstp->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
+      auto close_rd = deferred_close(rd);
+      auto mutation = rd().get();
+      BOOST_REQUIRE(!mutation);
   });
 }
 
-future<> test_no_clustered(sstables::test_env& env, bytes&& key, std::unordered_map<bytes, data_value> &&map) {
-    return env.reusable_sst(uncompressed_schema(), uncompressed_dir()).then([&env, k = std::move(key), map = std::move(map)] (auto sstp) mutable {
-        return do_with(dht::partition_range::make_singular(make_dkey(uncompressed_schema(), std::move(k))), [&env, sstp, map = std::move(map)] (auto& pr) {
-            auto s = uncompressed_schema();
-            return with_closeable(sstp->make_reader(s, env.make_reader_permit(), pr, s->full_slice()), [sstp, s, map = std::move(map)] (auto& rd) mutable {
-              return read_mutation_from_flat_mutation_reader(rd).then([sstp, s, map = std::move(map)] (auto mutation) {
-                BOOST_REQUIRE(mutation);
-                auto& mp = mutation->partition();
-                for (auto&& e : mp.range(*s, nonwrapping_range<clustering_key_prefix>())) {
-                    BOOST_REQUIRE(to_bytes(e.key()) == to_bytes(""));
-                    BOOST_REQUIRE(e.row().cells().size() == map.size());
+void test_no_clustered(sstables::test_env& env, bytes&& key, std::unordered_map<bytes, data_value> &&map) {
+    auto sstp = env.reusable_sst(uncompressed_schema(), uncompressed_dir()).get();
+    auto pr = dht::partition_range::make_singular(make_dkey(uncompressed_schema(), std::move(key)));
+    auto s = uncompressed_schema();
+    auto rd = sstp->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
+    auto close_rd = deferred_close(rd);
+    auto mutation = read_mutation_from_mutation_reader(rd).get();
+    BOOST_REQUIRE(mutation);
+    auto& mp = mutation->partition();
+    for (auto&& e : mp.range(*s, interval<clustering_key_prefix>())) {
+        BOOST_REQUIRE(to_bytes(e.key()) == to_bytes(""));
+        BOOST_REQUIRE(e.row().cells().size() == map.size());
 
-                    auto &row = e.row().cells();
-                    for (auto&& c: map) {
-                        match_live_cell(row, *s, c.first, c.second);
-                    }
-                }
-                return make_ready_future<>();
-              });
-            });
-        });
-    });
+        auto &row = e.row().cells();
+        for (auto&& c: map) {
+            match_live_cell(row, *s, c.first, c.second);
+        }
+    }
 }
 
 SEASTAR_TEST_CASE(uncompressed_1) {
   return test_env::do_with_async([] (test_env& env) {
-    test_no_clustered(env, "vinna", {{ "col1", to_sstring("daughter") }, { "col2", 3 }}).get();
+    test_no_clustered(env, "vinna", {{ "col1", to_sstring("daughter") }, { "col2", 3 }});
   });
 }
 
 SEASTAR_TEST_CASE(uncompressed_2) {
   return test_env::do_with_async([] (test_env& env) {
-    test_no_clustered(env, "gustaf", {{ "col1", to_sstring("son") }, { "col2", 0 }}).get();
+    test_no_clustered(env, "gustaf", {{ "col1", to_sstring("son") }, { "col2", 0 }});
   });
 }
 
 SEASTAR_TEST_CASE(uncompressed_3) {
   return test_env::do_with_async([] (test_env& env) {
-    test_no_clustered(env, "isak", {{ "col1", to_sstring("son") }, { "col2", 1 }}).get();
+    test_no_clustered(env, "isak", {{ "col1", to_sstring("son") }, { "col2", 1 }});
   });
 }
 
 SEASTAR_TEST_CASE(uncompressed_4) {
   return test_env::do_with_async([] (test_env& env) {
-    test_no_clustered(env, "finna", {{ "col1", to_sstring("daughter") }, { "col2", 2 }}).get();
+    test_no_clustered(env, "finna", {{ "col1", to_sstring("daughter") }, { "col2", 2 }});
   });
 }
 
@@ -131,18 +123,15 @@ SEASTAR_TEST_CASE(uncompressed_4) {
  */
 
 // FIXME: we are lacking a full deletion test
-static future<mutation> generate_clustered(sstables::test_env& env, bytes&& key, generation_type gen) {
-    return env.reusable_sst(complex_schema(), "test/resource/sstables/complex", gen).then([&env, k = std::move(key)] (auto sstp) mutable {
-        return do_with(dht::partition_range::make_singular(make_dkey(complex_schema(), std::move(k))), [&env, sstp] (auto& pr) {
-            auto s = complex_schema();
-            return with_closeable(sstp->make_reader(s, env.make_reader_permit(), pr, s->full_slice()), [sstp, s] (auto& rd) {
-              return read_mutation_from_flat_mutation_reader(rd).then([sstp, s] (auto mutation) {
-                BOOST_REQUIRE(mutation);
-                return std::move(*mutation);
-              });
-            });
-        });
-    });
+static mutation generate_clustered(sstables::test_env& env, bytes&& key, generation_type gen) {
+    auto sstp = env.reusable_sst(complex_schema(), "test/resource/sstables/complex", gen).get();
+    auto pr = dht::partition_range::make_singular(make_dkey(complex_schema(), std::move(key)));
+    auto s = complex_schema();
+    auto rd = sstp->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
+    auto close_rd = deferred_close(rd);
+    auto mutation = read_mutation_from_mutation_reader(rd).get();
+    BOOST_REQUIRE(mutation);
+    return std::move(*mutation);
 }
 
 inline auto clustered_row(mutation& mutation, const schema& s, std::vector<bytes>&& v) {
@@ -152,8 +141,8 @@ inline auto clustered_row(mutation& mutation, const schema& s, std::vector<bytes
 }
 
 SEASTAR_TEST_CASE(complex_sst1_k1) {
-  return test_env::do_with_async([] (test_env& env) {
-    generate_clustered(env, "key1", generation_type{1}).then([] (auto&& mutation) {
+    return test_env::do_with_async([] (test_env& env) {
+        auto mutation = generate_clustered(env, "key1", generation_type{1});
         auto s = complex_schema();
 
         auto& sr = mutation.partition().static_row().get();
@@ -176,15 +165,12 @@ SEASTAR_TEST_CASE(complex_sst1_k1) {
         auto reg_list = match_collection(row2.cells(), *s, "reg_list", tombstone(deletion_time{1431451390, 1431451390213471l}));
         match_collection_element<status::live>(reg_list.cells[0], bytes_opt{}, to_bytes("2"));
         match_collection_element<status::live>(reg_list.cells[1], bytes_opt{}, to_bytes("1"));
-
-        return make_ready_future<>();
-    }).get();
-  });
+    });
 }
 
 SEASTAR_TEST_CASE(complex_sst1_k2) {
-  return test_env::do_with_async([] (test_env& env) {
-    generate_clustered(env, "key2", generation_type{1}).then([] (auto&& mutation) {
+    return test_env::do_with_async([] (test_env& env) {
+        auto mutation = generate_clustered(env, "key2", generation_type{1});
         auto s = complex_schema();
 
         auto& sr = mutation.partition().static_row().get();
@@ -209,15 +195,12 @@ SEASTAR_TEST_CASE(complex_sst1_k2) {
         match_absent(row2.cells(), *s, "reg_set");
         match_absent(row2.cells(), *s, "reg_map");
         match_absent(row2.cells(), *s, "reg_list");
-
-        return make_ready_future<>();
-    }).get();
-  });
+    });
 }
 
 SEASTAR_TEST_CASE(complex_sst2_k1) {
-  return test_env::do_with_async([] (test_env& env) {
-    generate_clustered(env, "key1", generation_type{2}).then([] (auto&& mutation) {
+    return test_env::do_with_async([] (test_env& env) {
+        auto mutation = generate_clustered(env, "key1", generation_type{2});
         auto s = complex_schema();
 
         auto exploded = exploded_clustering_prefix({"cl1.1", "cl2.1"});
@@ -230,14 +213,12 @@ SEASTAR_TEST_CASE(complex_sst2_k1) {
         auto row = clustered_row(mutation, *s, {"cl1.2", "cl2.2"});
         auto reg_list = match_collection(row.cells(), *s, "reg_list", tombstone(deletion_time{0, api::missing_timestamp}));
         match_collection_element<status::dead>(reg_list.cells[0], bytes_opt{}, bytes_opt{});
-        return make_ready_future<>();
-    }).get();
-  });
+    });
 }
 
 SEASTAR_TEST_CASE(complex_sst2_k2) {
-  return test_env::do_with_async([] (test_env& env) {
-    generate_clustered(env, "key2", generation_type{2}).then([] (auto&& mutation) {
+    return test_env::do_with_async([] (test_env& env) {
+        auto mutation = generate_clustered(env, "key2", generation_type{2});
         auto s = complex_schema();
 
         auto& sr = mutation.partition().static_row().get();
@@ -260,15 +241,12 @@ SEASTAR_TEST_CASE(complex_sst2_k2) {
         match_absent(row2.cells(), *s, "reg_set");
         match_dead_cell(row2.cells(), *s, "reg_fset");
         match_dead_cell(row2.cells(), *s, "reg");
-
-        return make_ready_future<>();
-    }).get();
-  });
+    });
 }
 
 SEASTAR_TEST_CASE(complex_sst2_k3) {
-  return test_env::do_with_async([] (test_env& env) {
-    generate_clustered(env, "key3", generation_type{2}).then([] (auto&& mutation) {
+    return test_env::do_with_async([] (test_env& env) {
+        auto mutation = generate_clustered(env, "key3", generation_type{2});
         auto s = complex_schema();
 
         auto& sr = mutation.partition().static_row().get();
@@ -281,14 +259,12 @@ SEASTAR_TEST_CASE(complex_sst2_k3) {
         match_absent(row1.cells(), *s, "reg_set");
         match_absent(row1.cells(), *s, "reg_map");
         match_absent(row1.cells(), *s, "reg_fset");
-        return make_ready_future<>();
-    }).get();
-  });
+    });
 }
 
 SEASTAR_TEST_CASE(complex_sst3_k1) {
-  return test_env::do_with_async([] (test_env& env) {
-    generate_clustered(env, "key1", generation_type{3}).then([] (auto&& mutation) {
+    return test_env::do_with_async([] (test_env& env) {
+        auto mutation = generate_clustered(env, "key1", generation_type{3});
         auto s = complex_schema();
 
         auto row = clustered_row(mutation, *s, {"cl1.2", "cl2.2"});
@@ -303,14 +279,12 @@ SEASTAR_TEST_CASE(complex_sst3_k1) {
         match_absent(row.cells(), *s, "reg_map");
         match_absent(row.cells(), *s, "reg");
         match_absent(row.cells(), *s, "reg_fset");
-        return make_ready_future<>();
-    }).get();
-  });
+    });
 }
 
 SEASTAR_TEST_CASE(complex_sst3_k2) {
-  return test_env::do_with_async([] (test_env& env) {
-    generate_clustered(env, "key2", generation_type{3}).then([] (auto&& mutation) {
+    return test_env::do_with_async([] (test_env& env) {
+        auto mutation = generate_clustered(env, "key2", generation_type{3});
         auto s = complex_schema();
 
         auto& sr = mutation.partition().static_row().get();
@@ -323,71 +297,54 @@ SEASTAR_TEST_CASE(complex_sst3_k2) {
         match_absent(row.cells(), *s, "reg_set");
         match_absent(row.cells(), *s, "reg");
         match_absent(row.cells(), *s, "reg_fset");
-        return make_ready_future<>();
-    }).get();
-  });
-}
-
-future<> test_range_reads(sstables::test_env& env, const dht::token& min, const dht::token& max, std::vector<bytes>& expected) {
-    return env.reusable_sst(uncompressed_schema(), uncompressed_dir()).then([&env, min, max, &expected] (auto sstp) mutable {
-        auto s = uncompressed_schema();
-        auto count = make_lw_shared<size_t>(0);
-        auto expected_size = expected.size();
-        auto stop = make_lw_shared<bool>(false);
-        return do_with(dht::partition_range::make(dht::ring_position::starting_at(min),
-                                                              dht::ring_position::ending_at(max)), [&, sstp, s] (auto& pr) {
-          return with_closeable(sstp->make_reader(s, env.make_reader_permit(), pr, s->full_slice()), [&, sstp] (auto& mutations) {
-            return do_until([stop] { return *stop; },
-                // Note: The data in the following lambda, including
-                // "mutations", continues to live until after the last
-                // iteration's future completes, so its lifetime is safe.
-                [sstp, &mutations, &expected, expected_size, count, stop] () mutable {
-                    return mutations().then([&expected, expected_size, count, stop, &mutations] (mutation_fragment_v2_opt mfopt) mutable {
-                        if (mfopt) {
-                            BOOST_REQUIRE(mfopt->is_partition_start());
-                            BOOST_REQUIRE(*count < expected_size);
-                            BOOST_REQUIRE(std::vector<bytes>({expected.back()}) == mfopt->as_partition_start().key().key().explode());
-                            expected.pop_back();
-                            (*count)++;
-                            return mutations.next_partition();
-                        } else {
-                            *stop = true;
-                            return make_ready_future<>();
-                        }
-                    });
-            }).then([count, expected_size] {
-                BOOST_REQUIRE(*count == expected_size);
-            });
-          });
-        });
     });
 }
 
+void test_range_reads(sstables::test_env& env, const dht::token& min, const dht::token& max, std::vector<bytes>& expected) {
+    auto sstp = env.reusable_sst(uncompressed_schema(), uncompressed_dir()).get();
+    auto s = uncompressed_schema();
+    size_t count = 0;
+    auto expected_size = expected.size();
+    auto pr = dht::partition_range::make(dht::ring_position::starting_at(min), dht::ring_position::ending_at(max));
+    auto mutations = sstp->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
+    auto close_m = deferred_close(mutations);
+    while (true) {
+        // Note: The data in the following lambda, including
+        // "mutations", continues to live until after the last
+        // iteration's future completes, so its lifetime is safe.
+        mutation_fragment_v2_opt mfopt = mutations().get();
+        if (!mfopt) {
+            break;
+        }
+        BOOST_REQUIRE(mfopt->is_partition_start());
+        BOOST_REQUIRE(count < expected_size);
+        BOOST_REQUIRE(std::vector<bytes>({expected.back()}) == mfopt->as_partition_start().key().key().explode());
+        expected.pop_back();
+        count++;
+        mutations.next_partition().get();
+    }
+    BOOST_REQUIRE(count == expected_size);
+}
+
 SEASTAR_TEST_CASE(read_range) {
-  return test_env::do_with_async([] (test_env& env) {
-    std::vector<bytes> expected = { to_bytes("finna"), to_bytes("isak"), to_bytes("gustaf"), to_bytes("vinna") };
-    do_with(std::move(expected), [&env] (auto& expected) {
-        return test_range_reads(env, dht::minimum_token(), dht::maximum_token(), expected);
-    }).get();
-  });
+    return test_env::do_with_async([] (test_env& env) {
+        std::vector<bytes> expected = { to_bytes("finna"), to_bytes("isak"), to_bytes("gustaf"), to_bytes("vinna") };
+        test_range_reads(env, dht::minimum_token(), dht::maximum_token(), expected);
+    });
 }
 
 SEASTAR_TEST_CASE(read_partial_range) {
-  return test_env::do_with_async([] (test_env& env) {
-    std::vector<bytes> expected = { to_bytes("finna"), to_bytes("isak") };
-    do_with(std::move(expected), [&env] (auto& expected) {
-        return test_range_reads(env, uncompressed_schema()->get_partitioner().get_token(key_view(bytes_view(expected.back()))), dht::maximum_token(), expected);
-    }).get();
-  });
+    return test_env::do_with_async([] (test_env& env) {
+        std::vector<bytes> expected = { to_bytes("finna"), to_bytes("isak") };
+        test_range_reads(env, uncompressed_schema()->get_partitioner().get_token(key_view(bytes_view(expected.back()))), dht::maximum_token(), expected);
+    });
 }
 
 SEASTAR_TEST_CASE(read_partial_range_2) {
-  return test_env::do_with_async([] (test_env& env) {
-    std::vector<bytes> expected = { to_bytes("gustaf"), to_bytes("vinna") };
-    do_with(std::move(expected), [&env] (auto& expected) {
-        return test_range_reads(env, dht::minimum_token(), uncompressed_schema()->get_partitioner().get_token(key_view(bytes_view(expected.front()))), expected);
-    }).get();
-  });
+    return test_env::do_with_async([] (test_env& env) {
+        std::vector<bytes> expected = { to_bytes("gustaf"), to_bytes("vinna") };
+        test_range_reads(env, dht::minimum_token(), uncompressed_schema()->get_partitioner().get_token(key_view(bytes_view(expected.front()))), expected);
+    });
 }
 
 static
@@ -398,8 +355,11 @@ mutation_source make_sstable_mutation_source(sstables::test_env& env, schema_ptr
 
 SEASTAR_TEST_CASE(test_sstable_can_write_and_read_range_tombstone) {
     return test_env::do_with_async([] (test_env& env) {
-        auto s = make_shared_schema({}, "ks", "cf",
-            {{"p1", utf8_type}}, {{"c1", int32_type}}, {{"r1", int32_type}}, {}, utf8_type);
+        auto s = schema_builder("ks", "cf")
+                    .with_column("p1", utf8_type, column_kind::partition_key)
+                    .with_column("c1", int32_type, column_kind::clustering_key)
+                    .with_column("r1", int32_type)
+                    .build();
         auto sst_gen = env.make_sst_factory(s);
 
         auto key = tests::generate_partition_key(s);
@@ -429,67 +389,55 @@ SEASTAR_TEST_CASE(test_sstable_can_write_and_read_range_tombstone) {
 }
 
 SEASTAR_TEST_CASE(compact_storage_sparse_read) {
-  return test_env::do_with_async([] (test_env& env) {
-    env.reusable_sst(compact_sparse_schema(), "test/resource/sstables/compact_sparse").then([&env] (auto sstp) {
-        return do_with(dht::partition_range::make_singular(make_dkey(compact_sparse_schema(), "first_row")), [&env, sstp] (auto& pr) {
-            auto s = compact_sparse_schema();
-            return with_closeable(sstp->make_reader(s, env.make_reader_permit(), pr, s->full_slice()), [sstp, s] (auto& rd) {
-              return read_mutation_from_flat_mutation_reader(rd).then([sstp, s] (auto mutation) {
-                BOOST_REQUIRE(mutation);
-                auto& mp = mutation->partition();
-                auto& row = mp.clustered_row(*s, clustering_key::make_empty());
-                match_live_cell(row.cells(), *s, "cl1", data_value(to_bytes("cl1")));
-                match_live_cell(row.cells(), *s, "cl2", data_value(to_bytes("cl2")));
-                return make_ready_future<>();
-            });
-          });
-        });
-    }).get();
-  });
+    return test_env::do_with_async([] (test_env& env) {
+        auto sstp = env.reusable_sst(compact_sparse_schema(), "test/resource/sstables/compact_sparse").get();
+        auto pr = dht::partition_range::make_singular(make_dkey(compact_sparse_schema(), "first_row"));
+        auto s = compact_sparse_schema();
+        auto rd = sstp->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
+        auto close_rd = deferred_close(rd);
+        auto mutation = read_mutation_from_mutation_reader(rd).get();
+        BOOST_REQUIRE(mutation);
+        auto& mp = mutation->partition();
+        auto& row = mp.clustered_row(*s, clustering_key::make_empty());
+        match_live_cell(row.cells(), *s, "cl1", data_value(to_bytes("cl1")));
+        match_live_cell(row.cells(), *s, "cl2", data_value(to_bytes("cl2")));
+    });
 }
 
 SEASTAR_TEST_CASE(compact_storage_simple_dense_read) {
-  return test_env::do_with_async([] (test_env& env) {
-    env.reusable_sst(compact_simple_dense_schema(), "test/resource/sstables/compact_simple_dense").then([&env] (auto sstp) {
-        return do_with(dht::partition_range::make_singular(make_dkey(compact_simple_dense_schema(), "first_row")), [&env, sstp] (auto& pr) {
-            auto s = compact_simple_dense_schema();
-            return with_closeable(sstp->make_reader(s, env.make_reader_permit(), pr, s->full_slice()), [sstp, s] (auto& rd) {
-              return read_mutation_from_flat_mutation_reader(rd).then([sstp, s] (auto mutation) {
-                auto& mp = mutation->partition();
+    return test_env::do_with_async([] (test_env& env) {
+        auto sstp = env.reusable_sst(compact_simple_dense_schema(), "test/resource/sstables/compact_simple_dense").get();
+        auto pr = dht::partition_range::make_singular(make_dkey(compact_simple_dense_schema(), "first_row"));
+        auto s = compact_simple_dense_schema();
+        auto rd = sstp->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
+        auto close_rd = deferred_close(rd);
+        auto mutation = read_mutation_from_mutation_reader(rd).get();
+        auto& mp = mutation->partition();
 
-                auto exploded = exploded_clustering_prefix({"cl1"});
-                auto clustering = clustering_key::from_clustering_prefix(*s, exploded);
+        auto exploded = exploded_clustering_prefix({"cl1"});
+        auto clustering = clustering_key::from_clustering_prefix(*s, exploded);
 
-                auto& row = mp.clustered_row(*s, clustering);
-                match_live_cell(row.cells(), *s, "cl2", data_value(to_bytes("cl2")));
-                return make_ready_future<>();
-              });
-            });
-        });
-    }).get();
-  });
+        auto& row = mp.clustered_row(*s, clustering);
+        match_live_cell(row.cells(), *s, "cl2", data_value(to_bytes("cl2")));
+    });
 }
 
 SEASTAR_TEST_CASE(compact_storage_dense_read) {
-  return test_env::do_with_async([] (test_env& env) {
-    env.reusable_sst(compact_dense_schema(), "test/resource/sstables/compact_dense").then([&env] (auto sstp) {
-        return do_with(dht::partition_range::make_singular(make_dkey(compact_dense_schema(), "first_row")), [&env, sstp] (auto& pr) {
-            auto s = compact_dense_schema();
-            return with_closeable(sstp->make_reader(s, env.make_reader_permit(), pr, s->full_slice()), [sstp, s] (auto& rd) {
-              return read_mutation_from_flat_mutation_reader(rd).then([sstp, s] (auto mutation) {
-                auto& mp = mutation->partition();
+    return test_env::do_with_async([] (test_env& env) {
+        auto sstp = env.reusable_sst(compact_dense_schema(), "test/resource/sstables/compact_dense").get();
+        auto pr = dht::partition_range::make_singular(make_dkey(compact_dense_schema(), "first_row"));
+        auto s = compact_dense_schema();
+        auto rd = sstp->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
+        auto close_rd = deferred_close(rd);
+        auto mutation = read_mutation_from_mutation_reader(rd).get();
+        auto& mp = mutation->partition();
 
-                auto exploded = exploded_clustering_prefix({"cl1", "cl2"});
-                auto clustering = clustering_key::from_clustering_prefix(*s, exploded);
+        auto exploded = exploded_clustering_prefix({"cl1", "cl2"});
+        auto clustering = clustering_key::from_clustering_prefix(*s, exploded);
 
-                auto& row = mp.clustered_row(*s, clustering);
-                match_live_cell(row.cells(), *s, "cl3", data_value(to_bytes("cl3")));
-                return make_ready_future<>();
-              });
-            });
-        });
-    }).get();
-  });
+        auto& row = mp.clustered_row(*s, clustering);
+        match_live_cell(row.cells(), *s, "cl3", data_value(to_bytes("cl3")));
+    });
 }
 
 // We recently had an issue, documented at #188, where range-reading from an
@@ -497,66 +445,50 @@ SEASTAR_TEST_CASE(compact_storage_dense_read) {
 //
 // Make sure we don't regress on that.
 SEASTAR_TEST_CASE(broken_ranges_collection) {
-  return test_env::do_with_async([] (test_env& env) {
-    env.reusable_sst(peers_schema(), "test/resource/sstables/broken_ranges", generation_type{2}).then([&env] (auto sstp) {
+    return test_env::do_with_async([] (test_env& env) {
+        auto sstp = env.reusable_sst(peers_schema(), "test/resource/sstables/broken_ranges", generation_type{2}).get();
         auto s = peers_schema();
-        return with_closeable(sstp->as_mutation_source().make_reader_v2(s, env.make_reader_permit(), query::full_partition_range), [s] (auto& reader) {
-          return repeat([s, &reader] {
-            return read_mutation_from_flat_mutation_reader(reader).then([s] (mutation_opt mut) {
-                auto key_equal = [s, &mut] (sstring ip) {
-                    return mut->key().equal(*s, partition_key::from_deeply_exploded(*s, { net::inet_address(ip) }));
-                };
+        auto reader = sstp->as_mutation_source().make_reader_v2(s, env.make_reader_permit(), query::full_partition_range);
+        auto close_r = deferred_close(reader);
+        while (true) {
+            mutation_opt mut = read_mutation_from_mutation_reader(reader).get();
+            auto key_equal = [s, &mut] (sstring ip) {
+                return mut->key().equal(*s, partition_key::from_deeply_exploded(*s, { net::inet_address(ip) }));
+            };
 
-                if (!mut) {
-                    return stop_iteration::yes;
-                } else if (key_equal("127.0.0.1")) {
-                    auto& row = mut->partition().clustered_row(*s, clustering_key::make_empty());
-                    match_absent(row.cells(), *s, "tokens");
-                } else if (key_equal("127.0.0.3")) {
-                    auto& row = mut->partition().clustered_row(*s, clustering_key::make_empty());
-                    auto tokens = match_collection(row.cells(), *s, "tokens", tombstone(deletion_time{0x55E5F2D5, 0x051EB3FC99715Dl }));
-                    match_collection_element<status::live>(tokens.cells[0], to_bytes("-8180144272884242102"), bytes_opt{});
-                } else {
-                    BOOST_REQUIRE(key_equal("127.0.0.2"));
-                    auto t = mut->partition().partition_tombstone();
-                    BOOST_REQUIRE(t.timestamp == 0x051EB3FB016850l);
-                }
-                return stop_iteration::no;
-            });
-          });
-        });
-    }).get();
-  });
+            if (!mut) {
+                break;
+            } else if (key_equal("127.0.0.1")) {
+                auto& row = mut->partition().clustered_row(*s, clustering_key::make_empty());
+                match_absent(row.cells(), *s, "tokens");
+            } else if (key_equal("127.0.0.3")) {
+                auto& row = mut->partition().clustered_row(*s, clustering_key::make_empty());
+                auto tokens = match_collection(row.cells(), *s, "tokens", tombstone(deletion_time{0x55E5F2D5, 0x051EB3FC99715Dl }));
+                match_collection_element<status::live>(tokens.cells[0], to_bytes("-8180144272884242102"), bytes_opt{});
+            } else {
+                BOOST_REQUIRE(key_equal("127.0.0.2"));
+                auto t = mut->partition().partition_tombstone();
+                BOOST_REQUIRE(t.timestamp == 0x051EB3FB016850l);
+            }
+        }
+    });
 }
 
 static schema_ptr tombstone_overlap_schema() {
     static thread_local auto s = [] {
-        schema_builder builder(make_shared_schema(generate_legacy_id("try1", "tab"), "try1", "tab",
-        // partition key
-        {{"pk", utf8_type}},
-        // clustering key
-        {{"ck1", utf8_type}, {"ck2", utf8_type}},
-        // regular columns
-        {{"data", utf8_type}},
-        // static columns
-        {},
-        // regular column name type
-        utf8_type,
-        // comment
-        ""
-       ));
-       return builder.build(schema_builder::compact_storage::no);
+        schema_builder builder("try1", "tab", generate_legacy_id("try1", "tab"));
+        builder.with_column("pk", utf8_type, column_kind::partition_key);
+        builder.with_column("ck1", utf8_type, column_kind::clustering_key);
+        builder.with_column("ck2", utf8_type, column_kind::clustering_key);
+        builder.with_column("data", utf8_type);
+        return builder.build(schema_builder::compact_storage::no);
     }();
     return s;
 }
 
 
 static future<sstable_ptr> ka_sst(sstables::test_env& env, schema_ptr schema, sstring dir, sstables::generation_type::int_t generation) {
-    auto sst = env.make_sstable(std::move(schema), dir, sstables::generation_from_value(generation), sstables::sstable::version_types::ka, big);
-    auto fut = sst->load(sst->get_schema()->get_sharder());
-    return std::move(fut).then([sst = std::move(sst)] {
-        return make_ready_future<sstable_ptr>(std::move(sst));
-    });
+    return env.reusable_sst(std::move(schema), std::move(dir), sstables::generation_from_value(generation), sstables::sstable::version_types::ka, big, sstable_open_config{});
 }
 
 //  Considering the schema above, the sstable looks like:
@@ -566,59 +498,55 @@ static future<sstable_ptr> ka_sst(sstables::test_env& env, schema_ptr schema, ss
 //                ["aaa:bbb:!","aaa:!",1459334681228103,"t",1459334681]]}
 //               ]
 SEASTAR_TEST_CASE(tombstone_in_tombstone) {
-  return test_env::do_with_async([] (test_env& env) {
-    ka_sst(env, tombstone_overlap_schema(), "test/resource/sstables/tombstone_overlap", 1).then([&env] (auto sstp) {
+    return test_env::do_with_async([] (test_env& env) {
+        auto sstp = ka_sst(env, tombstone_overlap_schema(), "test/resource/sstables/tombstone_overlap", 1).get();
         auto s = tombstone_overlap_schema();
-        return with_closeable(sstp->make_reader(s, env.make_reader_permit(), query::full_partition_range, s->full_slice()), [sstp, s] (auto& reader) {
-            return repeat([sstp, s, &reader] {
-                return read_mutation_from_flat_mutation_reader(reader).then([s] (mutation_opt mut) {
-                    if (!mut) {
-                        return stop_iteration::yes;
-                    }
-                    auto make_pkey = [s] (sstring b) {
-                        return partition_key::from_deeply_exploded(*s, { data_value(b) });
-                    };
-                    auto make_ckey = [s] (sstring c1, sstring c2 = {}) {
-                        std::vector<data_value> v;
-                        v.push_back(data_value(c1));
-                        if (!c2.empty()) {
-                            v.push_back(data_value(c2));
-                        }
-                        return clustering_key::from_deeply_exploded(*s, std::move(v));
-                    };
-                    BOOST_REQUIRE(mut->key().equal(*s, make_pkey("pk")));
-                    // Somewhat counterintuitively, scylla represents
-                    // deleting a small row with all clustering keys set - not
-                    // as a "row tombstone" but rather as a deleted clustering row.
-                    auto rts = mut->partition().row_tombstones();
-                    BOOST_REQUIRE(rts.size() == 2);
-                    auto it = rts.begin();
-                    BOOST_REQUIRE(it->tombstone().equal(*s, range_tombstone(
-                                    make_ckey("aaa"),
-                                    bound_kind::incl_start,
-                                    make_ckey("aaa", "bbb"),
-                                    bound_kind::excl_end,
-                                    tombstone(1459334681228103LL, it->tombstone().tomb.deletion_time))));
-                    ++it;
-                    BOOST_REQUIRE(it->tombstone().equal(*s, range_tombstone(
-                                    make_ckey("aaa", "bbb"),
-                                    bound_kind::excl_start,
-                                    make_ckey("aaa"),
-                                    bound_kind::incl_end,
-                                    tombstone(1459334681228103LL, it->tombstone().tomb.deletion_time))));
-                    auto rows = mut->partition().clustered_rows();
-                    BOOST_REQUIRE(rows.calculate_size() == 1);
-                    for (auto& e : rows) {
-                        BOOST_REQUIRE(e.key().equal(*s, make_ckey("aaa", "bbb")));
-                        BOOST_REQUIRE(e.row().deleted_at().tomb().timestamp == 1459334681244989LL);
-                    }
-
-                    return stop_iteration::no;
-                });
-            });
-        });
-    }).get();
-  });
+        auto reader = sstp->make_reader(s, env.make_reader_permit(), query::full_partition_range, s->full_slice());
+        auto close_r = deferred_close(reader);
+        while (true) {
+            mutation_opt mut = read_mutation_from_mutation_reader(reader).get();
+            if (!mut) {
+                break;
+            }
+            auto make_pkey = [s] (sstring b) {
+                return partition_key::from_deeply_exploded(*s, { data_value(b) });
+            };
+            auto make_ckey = [s] (sstring c1, sstring c2 = {}) {
+                std::vector<data_value> v;
+                v.push_back(data_value(c1));
+                if (!c2.empty()) {
+                    v.push_back(data_value(c2));
+                }
+                return clustering_key::from_deeply_exploded(*s, std::move(v));
+            };
+            BOOST_REQUIRE(mut->key().equal(*s, make_pkey("pk")));
+            // Somewhat counterintuitively, scylla represents
+            // deleting a small row with all clustering keys set - not
+            // as a "row tombstone" but rather as a deleted clustering row.
+            auto rts = mut->partition().row_tombstones();
+            BOOST_REQUIRE(rts.size() == 2);
+            auto it = rts.begin();
+            BOOST_REQUIRE(it->tombstone().equal(*s, range_tombstone(
+                            make_ckey("aaa"),
+                            bound_kind::incl_start,
+                            make_ckey("aaa", "bbb"),
+                            bound_kind::excl_end,
+                            tombstone(1459334681228103LL, it->tombstone().tomb.deletion_time))));
+            ++it;
+            BOOST_REQUIRE(it->tombstone().equal(*s, range_tombstone(
+                            make_ckey("aaa", "bbb"),
+                            bound_kind::excl_start,
+                            make_ckey("aaa"),
+                            bound_kind::incl_end,
+                            tombstone(1459334681228103LL, it->tombstone().tomb.deletion_time))));
+            auto rows = mut->partition().clustered_rows();
+            BOOST_REQUIRE(rows.calculate_size() == 1);
+            for (auto& e : rows) {
+                BOOST_REQUIRE(e.key().equal(*s, make_ckey("aaa", "bbb")));
+                BOOST_REQUIRE(e.row().deleted_at().tomb().timestamp == 1459334681244989LL);
+            }
+        }
+    });
 }
 
 //  Same schema as above, the sstable looks like:
@@ -631,44 +559,41 @@ SEASTAR_TEST_CASE(tombstone_in_tombstone) {
 // We're not sure how this sort of sstable can be generated with Cassandra 2's
 // CQL, but we saw a similar thing is a real use case.
 SEASTAR_TEST_CASE(range_tombstone_reading) {
-  return test_env::do_with_async([] (test_env& env) {
-    ka_sst(env, tombstone_overlap_schema(), "test/resource/sstables/tombstone_overlap", 4).then([&env] (auto sstp) {
+    return test_env::do_with_async([] (test_env& env) {
+        auto sstp = ka_sst(env, tombstone_overlap_schema(), "test/resource/sstables/tombstone_overlap", 4).get();
         auto s = tombstone_overlap_schema();
-        return with_closeable(sstp->make_reader(s, env.make_reader_permit(), query::full_partition_range, s->full_slice()), [sstp, s] (auto& reader) {
-            return repeat([sstp, s, &reader] {
-                return read_mutation_from_flat_mutation_reader(reader).then([s] (mutation_opt mut) {
-                    if (!mut) {
-                        return stop_iteration::yes;
-                    }
-                    auto make_pkey = [s] (sstring b) {
-                        return partition_key::from_deeply_exploded(*s, { data_value(b) });
-                    };
-                    auto make_ckey = [s] (sstring c1, sstring c2 = {}) {
-                        std::vector<data_value> v;
-                        v.push_back(data_value(c1));
-                        if (!c2.empty()) {
-                            v.push_back(data_value(c2));
-                        }
-                        return clustering_key::from_deeply_exploded(*s, std::move(v));
-                    };
-                    BOOST_REQUIRE(mut->key().equal(*s, make_pkey("pk")));
-                    auto rts = mut->partition().row_tombstones();
-                    BOOST_REQUIRE(rts.size() == 1);
-                    auto it = rts.begin();
-                    BOOST_REQUIRE(it->tombstone().equal(*s, range_tombstone(
-                                    make_ckey("aaa"),
-                                    bound_kind::incl_start,
-                                    make_ckey("aaa"),
-                                    bound_kind::incl_end,
-                                    tombstone(1459334681228103LL, it->tombstone().tomb.deletion_time))));
-                    auto rows = mut->partition().clustered_rows();
-                    BOOST_REQUIRE(rows.calculate_size() == 0);
-                    return stop_iteration::no;
-                });
-            });
-        });
-    }).get();
-  });
+        auto reader = sstp->make_reader(s, env.make_reader_permit(), query::full_partition_range, s->full_slice());
+        auto close_r = deferred_close(reader);
+        while (true) {
+            mutation_opt mut = read_mutation_from_mutation_reader(reader).get();
+            if (!mut) {
+                break;
+            }
+            auto make_pkey = [s] (sstring b) {
+                return partition_key::from_deeply_exploded(*s, { data_value(b) });
+            };
+            auto make_ckey = [s] (sstring c1, sstring c2 = {}) {
+                std::vector<data_value> v;
+                v.push_back(data_value(c1));
+                if (!c2.empty()) {
+                    v.push_back(data_value(c2));
+                }
+                return clustering_key::from_deeply_exploded(*s, std::move(v));
+            };
+            BOOST_REQUIRE(mut->key().equal(*s, make_pkey("pk")));
+            auto rts = mut->partition().row_tombstones();
+            BOOST_REQUIRE(rts.size() == 1);
+            auto it = rts.begin();
+            BOOST_REQUIRE(it->tombstone().equal(*s, range_tombstone(
+                            make_ckey("aaa"),
+                            bound_kind::incl_start,
+                            make_ckey("aaa"),
+                            bound_kind::incl_end,
+                            tombstone(1459334681228103LL, it->tombstone().tomb.deletion_time))));
+            auto rows = mut->partition().clustered_rows();
+            BOOST_REQUIRE(rows.calculate_size() == 0);
+        }
+    });
 }
 
 // In this test case we have *three* levels of of tombstones:
@@ -691,110 +616,89 @@ SEASTAR_TEST_CASE(range_tombstone_reading) {
 //        ["aaa:bbb:!","aaa:!",1459438519943668,"t",1459438519]]}
 static schema_ptr tombstone_overlap_schema2() {
     static thread_local auto s = [] {
-        schema_builder builder(make_shared_schema(generate_legacy_id("try1", "tab2"), "try1", "tab2",
-        // partition key
-        {{"pk", utf8_type}},
-        // clustering key
-        {{"ck1", utf8_type}, {"ck2", utf8_type}, {"ck3", utf8_type}},
-        // regular columns
-        {{"data", utf8_type}},
-        // static columns
-        {},
-        // regular column name type
-        utf8_type,
-        // comment
-        ""
-       ));
-       return builder.build(schema_builder::compact_storage::no);
+        schema_builder builder("try1", "tab2", generate_legacy_id("try1", "tab2"));
+        builder.with_column("pk", utf8_type, column_kind::partition_key);
+        builder.with_column("ck1", utf8_type, column_kind::clustering_key);
+        builder.with_column("ck2", utf8_type, column_kind::clustering_key);
+        builder.with_column("ck3", utf8_type, column_kind::clustering_key);
+        builder.with_column("data", utf8_type);
+        return builder.build(schema_builder::compact_storage::no);
     }();
     return s;
 }
 SEASTAR_TEST_CASE(tombstone_in_tombstone2) {
-  return test_env::do_with_async([] (test_env& env) {
-    ka_sst(env, tombstone_overlap_schema2(), "test/resource/sstables/tombstone_overlap", 3).then([&env] (auto sstp) {
+    return test_env::do_with_async([] (test_env& env) {
+        auto sstp = ka_sst(env, tombstone_overlap_schema2(), "test/resource/sstables/tombstone_overlap", 3).get();
         auto s = tombstone_overlap_schema2();
-        return with_closeable(sstp->make_reader(s, env.make_reader_permit(), query::full_partition_range, s->full_slice()), [sstp, s] (auto& reader) {
-            return repeat([sstp, s, &reader] {
-                return read_mutation_from_flat_mutation_reader(reader).then([s] (mutation_opt mut) {
-                    if (!mut) {
-                        return stop_iteration::yes;
-                    }
-                    auto make_pkey = [s] (sstring b) {
-                        return partition_key::from_deeply_exploded(*s, { data_value(b) });
-                    };
-                    auto make_ckey = [s] (sstring c1, sstring c2 = {}, sstring c3 = {}) {
-                        std::vector<data_value> v;
-                        v.push_back(data_value(c1));
-                        if (!c2.empty()) {
-                            v.push_back(data_value(c2));
-                        }
-                        if (!c3.empty()) {
-                            v.push_back(data_value(c3));
-                        }
-                        return clustering_key::from_deeply_exploded(*s, std::move(v));
-                    };
-                    BOOST_REQUIRE(mut->key().equal(*s, make_pkey("pk")));
-                    auto rows = mut->partition().clustered_rows();
-                    auto rts = mut->partition().row_tombstones();
+        auto reader = sstp->make_reader(s, env.make_reader_permit(), query::full_partition_range, s->full_slice());
+        auto close_r = deferred_close(reader);
+        while (true) {
+            mutation_opt mut = read_mutation_from_mutation_reader(reader).get();
+            if (!mut) {
+                break;
+            }
+            auto make_pkey = [s] (sstring b) {
+                return partition_key::from_deeply_exploded(*s, { data_value(b) });
+            };
+            auto make_ckey = [s] (sstring c1, sstring c2 = {}, sstring c3 = {}) {
+                std::vector<data_value> v;
+                v.push_back(data_value(c1));
+                if (!c2.empty()) {
+                    v.push_back(data_value(c2));
+                }
+                if (!c3.empty()) {
+                    v.push_back(data_value(c3));
+                }
+                return clustering_key::from_deeply_exploded(*s, std::move(v));
+            };
+            BOOST_REQUIRE(mut->key().equal(*s, make_pkey("pk")));
+            auto rows = mut->partition().clustered_rows();
+            auto rts = mut->partition().row_tombstones();
 
-                    auto it = rts.begin();
-                    BOOST_REQUIRE(it->start_bound().equal(*s, bound_view(make_ckey("aaa"), bound_kind::incl_start)));
-                    BOOST_REQUIRE(it->end_bound().equal(*s, bound_view(make_ckey("aaa", "bbb"), bound_kind::excl_end)));
-                    BOOST_REQUIRE(it->tombstone().tomb.timestamp == 1459438519943668L);
-                    ++it;
-                    BOOST_REQUIRE(it->start_bound().equal(*s, bound_view(make_ckey("aaa", "bbb"), bound_kind::incl_start)));
-                    BOOST_REQUIRE(it->end_bound().equal(*s, bound_view(make_ckey("aaa", "bbb", "ccc"), bound_kind::excl_end)));
-                    BOOST_REQUIRE(it->tombstone().tomb.timestamp == 1459438519950348L);
-                    ++it;
-                    BOOST_REQUIRE(it->start_bound().equal(*s, bound_view(make_ckey("aaa", "bbb", "ccc"), bound_kind::excl_start)));
-                    BOOST_REQUIRE(it->end_bound().equal(*s, bound_view(make_ckey("aaa", "bbb"), bound_kind::incl_end)));
-                    BOOST_REQUIRE(it->tombstone().tomb.timestamp == 1459438519950348L);
-                    ++it;
-                    BOOST_REQUIRE(it->start_bound().equal(*s, bound_view(make_ckey("aaa", "bbb"), bound_kind::excl_start)));
-                    BOOST_REQUIRE(it->end_bound().equal(*s, bound_view(make_ckey("aaa"), bound_kind::incl_end)));
-                    BOOST_REQUIRE(it->tombstone().tomb.timestamp == 1459438519943668L);
-                    ++it;
-                    BOOST_REQUIRE(it == rts.end());
+            auto it = rts.begin();
+            BOOST_REQUIRE(it->start_bound().equal(*s, bound_view(make_ckey("aaa"), bound_kind::incl_start)));
+            BOOST_REQUIRE(it->end_bound().equal(*s, bound_view(make_ckey("aaa", "bbb"), bound_kind::excl_end)));
+            BOOST_REQUIRE(it->tombstone().tomb.timestamp == 1459438519943668L);
+            ++it;
+            BOOST_REQUIRE(it->start_bound().equal(*s, bound_view(make_ckey("aaa", "bbb"), bound_kind::incl_start)));
+            BOOST_REQUIRE(it->end_bound().equal(*s, bound_view(make_ckey("aaa", "bbb", "ccc"), bound_kind::excl_end)));
+            BOOST_REQUIRE(it->tombstone().tomb.timestamp == 1459438519950348L);
+            ++it;
+            BOOST_REQUIRE(it->start_bound().equal(*s, bound_view(make_ckey("aaa", "bbb", "ccc"), bound_kind::excl_start)));
+            BOOST_REQUIRE(it->end_bound().equal(*s, bound_view(make_ckey("aaa", "bbb"), bound_kind::incl_end)));
+            BOOST_REQUIRE(it->tombstone().tomb.timestamp == 1459438519950348L);
+            ++it;
+            BOOST_REQUIRE(it->start_bound().equal(*s, bound_view(make_ckey("aaa", "bbb"), bound_kind::excl_start)));
+            BOOST_REQUIRE(it->end_bound().equal(*s, bound_view(make_ckey("aaa"), bound_kind::incl_end)));
+            BOOST_REQUIRE(it->tombstone().tomb.timestamp == 1459438519943668L);
+            ++it;
+            BOOST_REQUIRE(it == rts.end());
 
-                    BOOST_REQUIRE(rows.calculate_size() == 1);
-                    for (auto& e : rows) {
-                        BOOST_REQUIRE(e.key().equal(*s, make_ckey("aaa", "bbb", "ccc")));
-                        BOOST_REQUIRE(e.row().deleted_at().tomb().timestamp == 1459438519958850LL);
-                    }
-
-                    return stop_iteration::no;
-                });
-            });
-        });
-    }).get();
-  });
+            BOOST_REQUIRE(rows.calculate_size() == 1);
+            for (auto& e : rows) {
+                BOOST_REQUIRE(e.key().equal(*s, make_ckey("aaa", "bbb", "ccc")));
+                BOOST_REQUIRE(e.row().deleted_at().tomb().timestamp == 1459438519958850LL);
+            }
+        }
+    });
 }
 
 // Reproducer for #4783
 static schema_ptr buffer_overflow_schema() {
     static thread_local auto s = [] {
-        schema_builder builder(make_shared_schema(generate_legacy_id("test_ks", "test_tab"), "test_ks", "test_tab",
-        // partition key
-        {{"pk", int32_type}},
-        // clustering key
-        {{"ck1", int32_type}, {"ck2", int32_type}},
-        // regular columns
-        {{"data", utf8_type}},
-        // static columns
-        {},
-        // regular column name type
-        utf8_type,
-        // comment
-        ""
-       ));
-       return builder.build(schema_builder::compact_storage::no);
+        schema_builder builder("test_ks", "test_tab", generate_legacy_id("test_ks", "test_tab"));
+        builder.with_column("pk", int32_type, column_kind::partition_key);
+        builder.with_column("ck1", int32_type, column_kind::clustering_key);
+        builder.with_column("ck2", int32_type, column_kind::clustering_key);
+        builder.with_column("data", utf8_type);
+        return builder.build(schema_builder::compact_storage::no);
     }();
     return s;
 }
 SEASTAR_TEST_CASE(buffer_overflow) {
   return test_env::do_with_async([] (test_env& env) {
     auto s = buffer_overflow_schema();
-    auto sstp = ka_sst(env, s, "test/resource/sstables/buffer_overflow", 5).get0();
+    auto sstp = ka_sst(env, s, "test/resource/sstables/buffer_overflow", 5).get();
     auto r = sstp->make_reader(s, env.make_reader_permit(), query::full_partition_range, s->full_slice());
     auto pk1 = partition_key::from_exploded(*s, { int32_type->decompose(4) });
     auto dk1 = dht::decorate_key(*s, pk1);
@@ -847,8 +751,8 @@ SEASTAR_TEST_CASE(test_non_compound_table_row_is_not_marked_as_static) {
 
         auto sst = make_sstable_containing(env.make_sstable(s, version), {std::move(m)});
         auto mut = with_closeable(sst->make_reader(s, env.make_reader_permit(), query::full_partition_range, s->full_slice()), [] (auto& mr) {
-            return read_mutation_from_flat_mutation_reader(mr);
-        }).get0();
+            return read_mutation_from_mutation_reader(mr);
+        }).get();
         BOOST_REQUIRE(bool(mut));
       }
     });
@@ -874,12 +778,12 @@ SEASTAR_TEST_CASE(test_has_partition_key) {
             auto hk = sstables::sstable::make_hashed_key(*s, dk.key());
             auto mr = sst->make_reader(s, env.make_reader_permit(), query::full_partition_range, s->full_slice());
             auto close_mr = deferred_close(mr);
-            auto res =  sst->has_partition_key(hk, dk).get0();
+            auto res =  sst->has_partition_key(hk, dk).get();
             BOOST_REQUIRE(bool(res));
 
             auto dk2 = dht::decorate_key(*s, partition_key::from_nodetool_style_string(s, "xx"));
             auto hk2 = sstables::sstable::make_hashed_key(*s, dk2.key());
-            res =  sst->has_partition_key(hk2, dk2).get0();
+            res =  sst->has_partition_key(hk2, dk2).get();
             BOOST_REQUIRE(! bool(res));
         }
     });
@@ -1372,14 +1276,14 @@ SEASTAR_TEST_CASE(test_large_index_pages_do_not_cause_large_allocations) {
     auto pr = dht::partition_range::make_singular(small_keys[0]);
 
     mutation expected = *with_closeable(mt->make_flat_reader(s, env.make_reader_permit(), pr), [] (auto& mt_reader) {
-        return read_mutation_from_flat_mutation_reader(mt_reader);
-    }).get0();
+        return read_mutation_from_mutation_reader(mt_reader);
+    }).get();
 
     auto t0 = std::chrono::steady_clock::now();
     auto large_allocs_before = memory::stats().large_allocations();
     mutation actual = *with_closeable(sst->as_mutation_source().make_reader_v2(s, env.make_reader_permit(), pr), [] (auto& sst_reader) {
-        return read_mutation_from_flat_mutation_reader(sst_reader);
-    }).get0();
+        return read_mutation_from_mutation_reader(sst_reader);
+    }).get();
     auto large_allocs_after = memory::stats().large_allocations();
     auto duration = std::chrono::steady_clock::now() - t0;
 
@@ -1552,7 +1456,7 @@ SEASTAR_TEST_CASE(test_static_compact_tables_are_read) {
                 atomic_cell::make_live(*int32_type, 1511270919978347, int32_type->decompose(6), {}));
 
             std::vector<mutation> muts = {m1, m2};
-            boost::sort(muts, mutation_decorated_key_less_comparator{});
+            std::ranges::sort(muts, mutation_decorated_key_less_comparator{});
 
             auto ms = make_sstable_mutation_source(env, s, muts, version);
 
@@ -1607,7 +1511,7 @@ SEASTAR_TEST_CASE(writer_handles_subsequent_range_tombstone_changes_without_tomb
             fragments.push_back(make_rtc(bound_weight::after_all_prefixed, {}, {}));
             fragments.emplace_back(*s, p, partition_end{});
 
-            flat_mutation_reader_v2 input_reader = make_flat_mutation_reader_from_fragments(s, p, std::move(fragments));
+            mutation_reader input_reader = make_mutation_reader_from_fragments(s, p, std::move(fragments));
             deferred_close dc1{input_reader};
             sstable_writer_config cfg = env.manager().configure_writer();
             auto _ = env.tempdir().make_sweeper();

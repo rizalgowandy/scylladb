@@ -1,6 +1,7 @@
 add_library(lang STATIC)
 target_sources(lang
   PRIVATE
+    manager.cc
     lua.cc
     wasm.cc
     wasm_alien_thread_runner.cc
@@ -16,6 +17,7 @@ target_link_libraries(lang
     Seastar::seastar
     xxHash::xxhash
   PRIVATE
+    absl::headers
     ${LUA_LIBRARIES})
 
 check_headers(check-headers lang

@@ -4,66 +4,92 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #include "db/hints/internal/hint_endpoint_manager.hh"
 
 // Seastar features.
 #include <seastar/core/do_with.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/shared_mutex.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/sstring.hh>
+#include <seastar/coroutine/exception.hh>
 
 // Scylla includes.
 #include "db/hints/internal/common.hh"
 #include "db/hints/internal/hint_logger.hh"
 #include "db/hints/internal/hint_storage.hh"
 #include "db/hints/manager.hh"
+#include "db/timeout_clock.hh"
 #include "replica/database.hh"
+#include "utils/assert.hh"
 #include "utils/disk-error-handler.hh"
+#include "utils/error_injection.hh"
 #include "utils/runtime.hh"
 
 // STD.
 #include <algorithm>
+#include <chrono>
+#include <exception>
 #include <utility>
 #include <vector>
 
 namespace db::hints {
 namespace internal {
 
+namespace {
+
+constexpr std::chrono::seconds HINT_FILE_WRITE_TIMEOUT = std::chrono::seconds(2);
+
+} // anonymous namespace
+
+future<> hint_endpoint_manager::do_store_hint(schema_ptr s, lw_shared_ptr<const frozen_mutation> fm, tracing::trace_state_ptr tr_state) {
+    ++_hints_in_progress;
+    size_t mut_size = fm->representation().size();
+    shard_stats().size_of_hints_in_progress += mut_size;
+
+    if (utils::get_local_injector().enter("slow_down_writing_hints")) {
+        co_await seastar::sleep(std::chrono::seconds(10));
+    }
+
+    try {
+        const auto shared_lock = co_await get_shared_lock(file_update_mutex());
+
+        hints_store_ptr log_ptr = co_await get_or_load();
+        commitlog_entry_writer cew(s, *fm, commitlog::force_sync::no);
+
+        rp_handle rh = co_await log_ptr->add_entry(s->id(), cew, db::timeout_clock::now() + HINT_FILE_WRITE_TIMEOUT);
+
+        const replay_position rp = rh.release();
+        if (_last_written_rp < rp) {
+            _last_written_rp = rp;
+            manager_logger.debug("[{}] Updated last written replay position to {}", end_point_key(), rp);
+        }
+
+        ++shard_stats().written;
+
+        manager_logger.trace("Hint to {} was stored", end_point_key());
+        tracing::trace(tr_state, "Hint to {} was stored", end_point_key());
+    } catch (...) {
+        ++shard_stats().errors;
+        const auto eptr = std::current_exception();
+
+        manager_logger.debug("store_hint(): got the exception when storing a hint to {}: {}", end_point_key(), eptr);
+        tracing::trace(tr_state, "Failed to store a hint to {}: {}", end_point_key(), eptr);
+    }
+
+    --_hints_in_progress;
+    shard_stats().size_of_hints_in_progress -= mut_size;
+}
+
 bool hint_endpoint_manager::store_hint(schema_ptr s, lw_shared_ptr<const frozen_mutation> fm, tracing::trace_state_ptr tr_state) noexcept {
     try {
         // Future is waited on indirectly in `stop()` (via `_store_gate`).
-        (void)with_gate(_store_gate, [this, s = std::move(s), fm = std::move(fm), tr_state] () mutable {
-            ++_hints_in_progress;
-            size_t mut_size = fm->representation().size();
-            shard_stats().size_of_hints_in_progress += mut_size;
-
-            return with_shared(file_update_mutex(), [this, fm, s, tr_state] () mutable -> future<> {
-                return get_or_load().then([this, fm = std::move(fm), s = std::move(s), tr_state] (hints_store_ptr log_ptr) mutable {
-                    commitlog_entry_writer cew(s, *fm, db::commitlog::force_sync::no);
-                    return log_ptr->add_entry(s->id(), cew, db::timeout_clock::now() + _shard_manager.HINT_FILE_WRITE_TIMEOUT);
-                }).then([this, tr_state] (db::rp_handle rh) {
-                    auto rp = rh.release();
-                    if (_last_written_rp < rp) {
-                        _last_written_rp = rp;
-                        manager_logger.debug("[{}] Updated last written replay position to {}", end_point_key(), rp);
-                    }
-                    ++shard_stats().written;
-
-                    manager_logger.trace("Hint to {} was stored", end_point_key());
-                    tracing::trace(tr_state, "Hint to {} was stored", end_point_key());
-                }).handle_exception([this, tr_state] (std::exception_ptr eptr) {
-                    ++shard_stats().errors;
-
-                    manager_logger.debug("store_hint(): got the exception when storing a hint to {}: {}", end_point_key(), eptr);
-                    tracing::trace(tr_state, "Failed to store a hint to {}: {}", end_point_key(), eptr);
-                });
-            }).finally([this, mut_size, fm, s] {
-                --_hints_in_progress;
-                shard_stats().size_of_hints_in_progress -= mut_size;
-            });;
+        (void) with_gate(_store_gate,
+                [this, s = std::move(s), fm = std::move(fm), tr_state = tr_state] () mutable -> future<> {
+            return do_store_hint(std::move(s), std::move(fm), tr_state);
         });
     } catch (...) {
         manager_logger.trace("Failed to store a hint to {}: {}", end_point_key(), std::current_exception());
@@ -72,6 +98,7 @@ bool hint_endpoint_manager::store_hint(schema_ptr s, lw_shared_ptr<const frozen_
         ++shard_stats().dropped;
         return false;
     }
+
     return true;
 }
 
@@ -119,13 +146,13 @@ future<> hint_endpoint_manager::stop(drain should_drain) noexcept {
     });
 }
 
-hint_endpoint_manager::hint_endpoint_manager(const endpoint_id& key, manager& shard_manager)
+hint_endpoint_manager::hint_endpoint_manager(const endpoint_id& key, fs::path hint_directory, manager& shard_manager)
     : _key(key)
     , _shard_manager(shard_manager)
     , _file_update_mutex_ptr(make_lw_shared<seastar::shared_mutex>())
     , _file_update_mutex(*_file_update_mutex_ptr)
     , _state(state_set::of<state::stopped>())
-    , _hints_dir(_shard_manager.hints_dir() / format("{}", _key).c_str())
+    , _hints_dir(std::move(hint_directory))
     // Approximate the position of the last written hint by using the same formula as for segment id calculation in commitlog
     // TODO: Should this logic be deduplicated with what is in the commitlog?
     , _last_written_rp(this_shard_id(), std::chrono::duration_cast<std::chrono::milliseconds>(runtime::get_boot_time().time_since_epoch()).count())
@@ -144,7 +171,7 @@ hint_endpoint_manager::hint_endpoint_manager(hint_endpoint_manager&& other)
 {}
 
 hint_endpoint_manager::~hint_endpoint_manager() {
-    assert(stopped());
+    SCYLLA_ASSERT(stopped());
 }
 
 future<hints_store_ptr> hint_endpoint_manager::get_or_load() {
@@ -167,6 +194,7 @@ future<db::commitlog> hint_endpoint_manager::add_store() noexcept {
         return io_check([name = _hints_dir.c_str()] { return recursive_touch_directory(name); }).then([this] () {
             commitlog::config cfg;
 
+            cfg.sched_group = _shard_manager.local_db().commitlog()->active_config().sched_group;
             cfg.commit_log_location = _hints_dir.c_str();
             cfg.commitlog_segment_size_in_mb = resource_manager::hint_segment_size_in_mb;
             cfg.commitlog_total_space_in_mb = resource_manager::max_hints_per_ep_size_mb;

@@ -3,10 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <boost/range/irange.hpp>
+#include <fmt/ranges.h>
 #include "seastarx.hh"
 #include "test/lib/simple_schema.hh"
 #include "test/lib/cql_test_env.hh"
@@ -141,7 +141,7 @@ int main(int argc, char** argv) {
                 if (!reads_enabled) {
                     return;
                 }
-                auto id = env.prepare("select * from ks.cf where pk = 'key1' limit 10;").get0();
+                auto id = env.prepare("select * from ks.cf where pk = 'key1' limit 10;").get();
                 while (!cancelled) {
                     auto t0 = clock::now();
                     env.execute_prepared(id, {}).get();

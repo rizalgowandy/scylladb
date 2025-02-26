@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <boost/date_time/gregorian/greg_date.hpp>
@@ -12,12 +12,13 @@
 #include "lang/lua_scylla_types.hh"
 #include "exceptions/exceptions.hh"
 #include "concrete_types.hh"
+#include "utils/assert.hh"
 #include "utils/utf8.hh"
 #include "utils/ascii.hh"
 #include "utils/date.h"
 #include <seastar/core/align.hh>
 #include <lua.hpp>
-#include "db/config.hh"
+#include "seastarx.hh"
 
 // Lua 5.4 added an extra parameter to lua_resume
 
@@ -41,7 +42,7 @@ struct alloc_state {
         : max(max)
         , max_contiguous(max_contiguous) {
         // The max and max_contiguous limits are responsible for avoiding overflows.
-        assert(max + max_contiguous >= max);
+        SCYLLA_ASSERT(max + max_contiguous >= max);
     }
 };
 
@@ -79,7 +80,7 @@ static void* lua_alloc(void* ud, void* ptr, size_t osize, size_t nsize) {
     size_t next = s->allocated + nsize;
 
     // The max and max_contiguous limits should be small enough to avoid overflows.
-    assert(next >= s->allocated);
+    SCYLLA_ASSERT(next >= s->allocated);
 
     if (ptr) {
         next -= osize;
@@ -119,7 +120,7 @@ static void debug_hook(lua_State* l, lua_Debug* ar) {
         return;
     }
     if (lua_yield(l, 0)) {
-        assert(0 && "lua_yield failed");
+        SCYLLA_ASSERT(0 && "lua_yield failed");
     }
 }
 
@@ -223,7 +224,7 @@ requires CanHandleRawLuaTypes<Func>
 static auto visit_lua_raw_value(lua_State* l, int index, Func&& f) {
     switch (lua_type(l, index)) {
     case LUA_TNONE:
-        assert(0 && "Invalid index");
+        SCYLLA_ASSERT(0 && "Invalid index");
     case LUA_TNUMBER:
         if (lua_isinteger(l, index)) {
             return f(lua_tointeger(l, index));
@@ -244,9 +245,9 @@ static auto visit_lua_raw_value(lua_State* l, int index, Func&& f) {
         return f(*get_decimal(l, index));
     case LUA_TTHREAD:
     case LUA_TLIGHTUSERDATA:
-        assert(0 && "We never make thread or light user data visible to scripts");
+        SCYLLA_ASSERT(0 && "We never make thread or light user data visible to scripts");
     }
-    assert(0 && "invalid lua type");
+    SCYLLA_ASSERT(0 && "invalid lua type");
 }
 
 template <typename Func>
@@ -362,7 +363,7 @@ static const big_decimal& get_decimal_in_binary_op(lua_State* l) {
     if (a == nullptr) {
         lua_insert(l, 1);
         a = get_decimal(l, 1);
-        assert(a);
+        SCYLLA_ASSERT(a);
     }
     return *a;
 }
@@ -456,7 +457,7 @@ static sstring get_string(lua_State *l, int index) {
             return sstring(p.str());
         },
         [] (const auto& v) {
-            return format("{}", v);
+            return seastar::format("{}", v);
         }));
 }
 
@@ -496,17 +497,17 @@ static lua_date_table get_lua_date_table(lua_State* l, int index) {
         if (k == "month") {
             month = (unsigned char)v;
             if (*month != v) {
-                throw exceptions::invalid_request_exception(format("month is too large: '{}'", v.str()));
+                throw exceptions::invalid_request_exception(seastar::format("month is too large: '{}'", v.str()));
             }
         } else if (k == "day") {
             day = (unsigned char)v;
             if (*day != v) {
-                throw exceptions::invalid_request_exception(format("day is too large: '{}'", v.str()));
+                throw exceptions::invalid_request_exception(seastar::format("day is too large: '{}'", v.str()));
             }
         } else {
             int32_t vint(v);
             if (vint != v) {
-                throw exceptions::invalid_request_exception(format("{} is too large: '{}'", k, v.str()));
+                throw exceptions::invalid_request_exception(seastar::format("{} is too large: '{}'", k, v.str()));
             }
             if (k == "year") {
                 year = vint;
@@ -540,7 +541,7 @@ struct simple_date_return_visitor {
         return uint32_t(v);
     }
     uint32_t operator()(const std::string_view& v) {
-        return simple_date_type_impl::from_sstring(v);
+        return simple_date_type_impl::from_string_view(v);
     }
     uint32_t operator()(const lua_table&);
 };
@@ -559,7 +560,7 @@ struct timestamp_return_visitor {
         throw exceptions::invalid_request_exception("timestamp value must fit in signed 64 bits");
     }
     db_clock::time_point operator()(const std::string_view& v) {
-        return timestamp_type_impl::from_sstring(v);
+        return timestamp_type_impl::from_string_view(v);
     }
     db_clock::time_point operator()(const lua_table&);
 };
@@ -614,17 +615,17 @@ struct from_lua_visitor {
                     if (k == "months") {
                         months = int32_t(v);
                         if (v != months) {
-                            throw exceptions::invalid_request_exception(format("{} months doesn't fit in a 32 bit integer", v.str()));
+                            throw exceptions::invalid_request_exception(seastar::format("{} months doesn't fit in a 32 bit integer", v.str()));
                         }
                     } else if (k == "days") {
                         days = int32_t(v);
                         if (v != days) {
-                            throw exceptions::invalid_request_exception(format("{} days doesn't fit in a 32 bit integer", v.str()));
+                            throw exceptions::invalid_request_exception(seastar::format("{} days doesn't fit in a 32 bit integer", v.str()));
                         }
                     } else if (k == "nanoseconds") {
                         nanoseconds = int64_t(v);
                         if (v != nanoseconds) {
-                            throw exceptions::invalid_request_exception(format("{} nanoseconds doesn't fit in a 64 bit integer", v.str()));
+                            throw exceptions::invalid_request_exception(seastar::format("{} nanoseconds doesn't fit in a 64 bit integer", v.str()));
                         }
                     } else {
                         throw exceptions::invalid_request_exception(format("invalid duration field: '{}'", k));
@@ -714,7 +715,7 @@ struct from_lua_visitor {
             auto k_varint = get_varint(l, -2);
             if (k_varint > num_elements || k_varint < 1) {
                 throw exceptions::invalid_request_exception(
-                        format("key {} is not valid for a sequence of size {}", k_varint.str(), num_elements));
+                        seastar::format("key {} is not valid for a sequence of size {}", k_varint.str(), num_elements));
             }
             size_t k = size_t(k_varint);
             opt_elements[k - 1] = convert_from_lua(l, t.type(k - 1));
@@ -731,6 +732,43 @@ struct from_lua_visitor {
             elements.push_back(*opt_elements[i]);
         }
         return make_tuple_value(t.shared_from_this(), std::move(elements));
+    }
+
+    data_value operator()(const vector_type_impl& t) {
+        if (!lua_istable(l, -1)) {
+            throw exceptions::invalid_request_exception("value is not a table");
+        }
+
+        const data_type& elements_type = t.get_elements_type();
+        size_t num_elements = t.get_dimension();
+
+        using table_pair = std::pair<utils::multiprecision_int, data_value>;
+        std::vector<table_pair> pairs;
+        lua_pushnil(l);
+        while (lua_next(l, -2) != 0) {
+            auto v = convert_from_lua(l, elements_type);
+            lua_pop(l, 1);
+            auto k = get_varint(l, -1);
+            if (k > num_elements || k < 1) {
+                throw exceptions::invalid_request_exception(
+                        seastar::format("key {} is not valid for a sequence of size {}", k.str(), num_elements));
+            }
+            pairs.push_back({k, v});
+        }
+
+        std::sort(pairs.begin(), pairs.end(), [] (const table_pair& a, const table_pair& b) {
+            return a.first < b.first;
+        });
+
+        std::vector<data_value> elements;
+        for (size_t i = 0; i < num_elements; ++i) {
+            if (utils::multiprecision_int(i + 1) != pairs[i].first) {
+                throw exceptions::invalid_request_exception(
+                        format("key {} missing in sequence of size {}", i + 1, num_elements));
+            }
+            elements.push_back(pairs[i].second);
+        }
+        return make_vector_value(t.shared_from_this(), std::move(elements));
     }
 
     data_value operator()(const user_type_impl& t) {
@@ -772,15 +810,15 @@ struct from_lua_visitor {
     }
 
     data_value operator()(const inet_addr_type_impl& t) {
-        return t.from_sstring(get_string(l, -1));
+        return t.from_string_view(get_string(l, -1));
     }
 
     data_value operator()(const uuid_type_impl&) {
-        return uuid_type_impl::from_sstring(get_string(l, -1));
+        return uuid_type_impl::from_string_view(get_string(l, -1));
     }
 
     data_value operator()(const timeuuid_type_impl&) {
-        return timeuuid_native_type{timeuuid_type_impl::from_sstring(get_string(l, -1))};
+        return timeuuid_native_type{timeuuid_type_impl::from_string_view(get_string(l, -1))};
     }
 
     data_value operator()(const bytes_type_impl& t) {
@@ -794,7 +832,7 @@ struct from_lua_visitor {
         if (error_pos) {
             throw exceptions::invalid_request_exception(format("value is not valid utf8, invalid character at byte offset {}", *error_pos));
         }
-        return std::move(s);
+        return s;
     }
 
     data_value operator()(const ascii_type_impl& t) {
@@ -837,7 +875,7 @@ struct from_lua_visitor {
                        throw exceptions::invalid_request_exception("time value must fit in signed 64 bits");
                    },
                    [] (const std::string_view& v) {
-                       return time_type_impl::from_sstring(v);
+                       return time_type_impl::from_string_view(v);
                    }
                ))};
     }
@@ -1030,13 +1068,13 @@ struct to_lua_visitor {
 
     void operator()(const inet_addr_type_impl& t, const emptyable<seastar::net::inet_address>* v) {
         // returns a string
-        sstring s = inet_addr_type_impl::to_sstring(v->get());
+        sstring s = fmt::to_string(v->get());
         push_sstring(l, s);
     }
 
     void operator()(const concrete_type<utils::UUID>&, const emptyable<utils::UUID>* v) {
         // returns a string
-        push_sstring(l, v->get().to_sstring());
+        push_sstring(l, fmt::to_string(v->get())) ;
     }
 };
 }
@@ -1047,14 +1085,6 @@ static void push_argument(lua_State* l, const data_value& arg) {
         return;
     }
     ::visit(arg, to_lua_visitor{l});
-}
-
-lua::runtime_config lua::make_runtime_config(const db::config& config) {
-    utils::updateable_value<unsigned> max_bytes(config.user_defined_function_allocation_limit_bytes);
-    utils::updateable_value<unsigned> max_contiguous(config.user_defined_function_contiguous_allocation_limit_bytes());
-    utils::updateable_value<unsigned> timeout_in_ms(config.user_defined_function_time_limit_ms());
-
-    return lua::runtime_config{std::move(timeout_in_ms), std::move(max_bytes), std::move(max_contiguous)};
 }
 
 // run the script for at most max_instructions

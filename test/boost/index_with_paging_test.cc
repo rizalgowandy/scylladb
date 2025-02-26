@@ -3,15 +3,19 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
+#include "test/lib/eventually.hh"
 #include "cql3/untyped_result_set.hh"
 #include "cql3/query_processor.hh"
 #include "transport/messages/result_message.hh"
+
+BOOST_AUTO_TEST_SUITE(index_with_paging_test)
 
 SEASTAR_TEST_CASE(test_index_with_paging) {
     return do_with_cql_env_thread([] (auto& e) {
@@ -20,9 +24,9 @@ SEASTAR_TEST_CASE(test_index_with_paging) {
 
         sstring big_string(100, 'j');
         // There should be enough rows to use multiple pages
-        auto prepared_id = e.prepare("INSERT INTO tab (pk, ck, v, v2, v3) VALUES (?, ?, 1, ?, ?)").get0();
+        auto prepared_id = e.prepare("INSERT INTO tab (pk, ck, v, v2, v3) VALUES (?, ?, 1, ?, ?)").get();
         auto big_string_v = cql3::raw_value::make_value(serialized(big_string));
-        max_concurrent_for_each(boost::irange(0, 64 * 1024), 2, [&] (auto i) {
+        max_concurrent_for_each(std::views::iota(0, 64 * 1024), 2, [&] (auto i) {
             return e.execute_prepared(prepared_id, {
                 cql3::raw_value::make_value(serialized(i % 3)),                     // pk
                 cql3::raw_value::make_value(serialized(format("hello{}", i))),      // ck
@@ -40,7 +44,7 @@ SEASTAR_TEST_CASE(test_index_with_paging) {
         eventually([&] {
             auto qo = std::make_unique<cql3::query_options>(db::consistency_level::LOCAL_ONE, std::vector<cql3::raw_value>{},
                     cql3::query_options::specific_options{4321, nullptr, {}, api::new_timestamp()});
-            auto res = e.execute_cql("SELECT * FROM tab WHERE v = 1", std::move(qo)).get0();
+            auto res = e.execute_cql("SELECT * FROM tab WHERE v = 1", std::move(qo)).get();
             auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(res);
             BOOST_REQUIRE_NE(rows, nullptr);
             // It's fine to get less rows than requested due to paging limit, but never more than that
@@ -48,7 +52,7 @@ SEASTAR_TEST_CASE(test_index_with_paging) {
         });
 
         eventually([&] {
-            auto res = e.execute_cql("SELECT * FROM tab WHERE v = 1").get0();
+            auto res = e.execute_cql("SELECT * FROM tab WHERE v = 1").get();
             assert_that(res).is_rows().with_size(64 * 1024);
         });
     });
@@ -101,3 +105,5 @@ SEASTAR_TEST_CASE(test_index_with_paging_with_base_short_read_no_ck) {
         });
     });
 }
+
+BOOST_AUTO_TEST_SUITE_END()

@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "mutation/mutation.hh"
@@ -15,8 +15,6 @@
 #include "split.hh"
 #include "log.hh"
 #include "change_visitor.hh"
-
-#include <type_traits>
 
 struct atomic_column_update {
     column_id id;

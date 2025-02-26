@@ -3,15 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "utils/base64.hh"
 #include "utils/rjson.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "serialization.hh"
 #include "error.hh"
-#include "rapidjson/writer.h"
 #include "concrete_types.hh"
 #include "cql3/type_json.hh"
 #include "mutation/position_in_partition.hh"
@@ -144,17 +143,17 @@ static big_decimal parse_and_validate_number(std::string_view s) {
         big_decimal ret(s);
         auto [magnitude, precision] = internal::get_magnitude_and_precision(s);
         if (magnitude > 125) {
-            throw api_error::validation(format("Number overflow: {}. Attempting to store a number with magnitude larger than supported range.", s));
+            throw api_error::validation(fmt::format("Number overflow: {}. Attempting to store a number with magnitude larger than supported range.", s));
         }
         if (magnitude < -130) {
-            throw api_error::validation(format("Number underflow: {}. Attempting to store a number with magnitude lower than supported range.", s));
+            throw api_error::validation(fmt::format("Number underflow: {}. Attempting to store a number with magnitude lower than supported range.", s));
         }
         if (precision > 38) {
-            throw api_error::validation(format("Number too precise: {}. Attempting to store a number with more significant digits than supported.", s));
+            throw api_error::validation(fmt::format("Number too precise: {}. Attempting to store a number with more significant digits than supported.", s));
         }
         return ret;
     } catch (const marshal_exception& e) {
-        throw api_error::validation(format("The parameter cannot be converted to a numeric value: {}", s));
+        throw api_error::validation(fmt::format("The parameter cannot be converted to a numeric value: {}", s));
     }
 
 }
@@ -246,6 +245,27 @@ rjson::value deserialize_item(bytes_view bv) {
     return deserialized;
 }
 
+// This function takes a bytes_view created earlier by serialize_item(), and
+// if has the type "expected_type", the function returns the value as a
+// raw Scylla type. If the type doesn't match, returns an unset optional.
+// This function only supports the key types S (string), B (bytes) and N
+// (number) - serialize_item() serializes those types as a single-byte type
+// followed by the serialized raw Scylla type, so all this function needs to
+// do is to remove the first byte. This makes this function much more
+// efficient than deserialize_item() above because it avoids transformation
+// to/from JSON.
+std::optional<bytes> serialized_value_if_type(bytes_view bv, alternator_type expected_type) {
+    if (bv.empty() || alternator_type(bv[0]) != expected_type) {
+        return std::nullopt;
+    }
+    // Currently, serialize_item() for types in alternator_type (notably S, B
+    // and N) are nothing more than Scylla's raw format for these types
+    // preceded by a type byte. So we just need to skip that byte and we are
+    // left by exactly what we need to return.
+    bv.remove_prefix(1);
+    return bytes(bv);
+}
+
 std::string type_to_string(data_type type) {
     static thread_local std::unordered_map<data_type, std::string> types = {
         {utf8_type, "S"},
@@ -266,7 +286,7 @@ bytes get_key_column_value(const rjson::value& item, const column_definition& co
     std::string column_name = column.name_as_text();
     const rjson::value* key_typed_value = rjson::find(item, column_name);
     if (!key_typed_value) {
-        throw api_error::validation(format("Key column {} not found", column_name));
+        throw api_error::validation(fmt::format("Key column {} not found", column_name));
     }
     return get_key_from_typed_value(*key_typed_value, column);
 }
@@ -278,18 +298,25 @@ bytes get_key_column_value(const rjson::value& item, const column_definition& co
 // mentioned in the exception message).
 // If the type does match, a reference to the encoded value is returned.
 static const rjson::value& get_typed_value(const rjson::value& key_typed_value, std::string_view type_str, std::string_view name, std::string_view value_name) {
-    if (!key_typed_value.IsObject() || key_typed_value.MemberCount() != 1 ||
-            !key_typed_value.MemberBegin()->value.IsString()) {
+    if (!key_typed_value.IsObject() || key_typed_value.MemberCount() != 1) {
         throw api_error::validation(
-                format("Malformed value object for {} {}: {}",
+                fmt::format("Malformed value object for {} {}: {}",
                         value_name, name, key_typed_value));
     }
 
     auto it = key_typed_value.MemberBegin();
     if (rjson::to_string_view(it->name) != type_str) {
         throw api_error::validation(
-                format("Type mismatch: expected type {} for {} {}, got type {}",
+                fmt::format("Type mismatch: expected type {} for {} {}, got type {}",
                         type_str, value_name, name, it->name));
+    }
+    // We assume this function is called just for key types (S, B, N), and
+    // all of those always have a string value in the JSON.
+    if (!it->value.IsString()) {
+        throw api_error::validation(
+            fmt::format("Malformed value object for {} {}: {}",
+                    value_name, name, key_typed_value));
+
     }
     return it->value;
 }
@@ -396,16 +423,16 @@ position_in_partition pos_from_json(const rjson::value& item, schema_ptr schema)
 
 big_decimal unwrap_number(const rjson::value& v, std::string_view diagnostic) {
     if (!v.IsObject() || v.MemberCount() != 1) {
-        throw api_error::validation(format("{}: invalid number object", diagnostic));
+        throw api_error::validation(fmt::format("{}: invalid number object", diagnostic));
     }
     auto it = v.MemberBegin();
     if (it->name != "N") {
-        throw api_error::validation(format("{}: expected number, found type '{}'", diagnostic, it->name));
+        throw api_error::validation(fmt::format("{}: expected number, found type '{}'", diagnostic, it->name));
     }
     if (!it->value.IsString()) {
         // We shouldn't reach here. Callers normally validate their input
         // earlier with validate_value().
-        throw api_error::validation(format("{}: improperly formatted number constant", diagnostic));
+        throw api_error::validation(fmt::format("{}: improperly formatted number constant", diagnostic));
     }
     big_decimal ret = parse_and_validate_number(rjson::to_string_view(it->value));
     return ret;
@@ -486,7 +513,7 @@ rjson::value set_sum(const rjson::value& v1, const rjson::value& v2) {
     auto [set1_type, set1] = unwrap_set(v1);
     auto [set2_type, set2] = unwrap_set(v2);
     if (set1_type != set2_type) {
-        throw api_error::validation(format("Mismatched set types: {} and {}", set1_type, set2_type));
+        throw api_error::validation(fmt::format("Mismatched set types: {} and {}", set1_type, set2_type));
     }
     if (!set1 || !set2) {
         throw api_error::validation("UpdateExpression: ADD operation for sets must be given sets as arguments");
@@ -514,7 +541,7 @@ std::optional<rjson::value> set_diff(const rjson::value& v1, const rjson::value&
     auto [set1_type, set1] = unwrap_set(v1);
     auto [set2_type, set2] = unwrap_set(v2);
     if (set1_type != set2_type) {
-        throw api_error::validation(format("Set DELETE type mismatch: {} and {}", set1_type, set2_type));
+        throw api_error::validation(fmt::format("Set DELETE type mismatch: {} and {}", set1_type, set2_type));
     }
     if (!set1 || !set2) {
         throw api_error::validation("UpdateExpression: DELETE operation can only be performed on a set");

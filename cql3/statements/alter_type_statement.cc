@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include <seastar/core/coroutine.hh>
@@ -18,7 +18,6 @@
 #include "service/storage_proxy.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "data_dictionary/keyspace_metadata.hh"
-#include "boost/range/adaptor/map.hpp"
 #include "data_dictionary/user_types_metadata.hh"
 
 namespace cql3 {
@@ -57,7 +56,7 @@ future<std::vector<mutation>> alter_type_statement::prepare_announcement_mutatio
         throw exceptions::invalid_request_exception(format("No user type named {} exists.", _name.to_cql_string()));
     }
 
-    for (auto&& schema : ks.metadata()->cf_meta_data() | boost::adaptors::map_values) {
+    for (auto&& schema : ks.metadata()->cf_meta_data() | std::views::values) {
         for (auto&& column : schema->partition_key_columns()) {
             if (column.type->references_user_type(_name.get_keyspace(), _name.get_user_type_name())) {
                 throw exceptions::invalid_request_exception(format("Cannot add new field to type {} because it is used in the partition key column {} of table {}.{}",
@@ -72,7 +71,7 @@ future<std::vector<mutation>> alter_type_statement::prepare_announcement_mutatio
     auto res = co_await service::prepare_update_type_announcement(sp, updated, ts);
     std::move(res.begin(), res.end(), std::back_inserter(m));
 
-    for (auto&& schema : ks.metadata()->cf_meta_data() | boost::adaptors::map_values) {
+    for (auto&& schema : ks.metadata()->cf_meta_data() | std::views::values) {
         auto cfm = schema_builder(schema);
         bool modified = false;
         for (auto&& column : schema->all_columns()) {
@@ -88,7 +87,7 @@ future<std::vector<mutation>> alter_type_statement::prepare_announcement_mutatio
                 auto res = co_await service::prepare_view_update_announcement(sp, view_ptr(cfm.build()), ts);
                 std::move(res.begin(), res.end(), std::back_inserter(m));
             } else {
-                auto res = co_await service::prepare_column_family_update_announcement(sp, cfm.build(), false, {}, ts);
+                auto res = co_await service::prepare_column_family_update_announcement(sp, cfm.build(), {}, ts);
                 std::move(res.begin(), res.end(), std::back_inserter(m));
             }
         }
@@ -98,7 +97,7 @@ future<std::vector<mutation>> alter_type_statement::prepare_announcement_mutatio
 }
 
 future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>>
-alter_type_statement::prepare_schema_mutations(query_processor& qp, api::timestamp_type ts) const {
+alter_type_statement::prepare_schema_mutations(query_processor& qp, const query_options&, api::timestamp_type ts) const {
     try {
         auto m = co_await prepare_announcement_mutations(qp.proxy(), ts);
 
@@ -137,7 +136,7 @@ user_type alter_type_statement::add_or_alter::do_add(data_dictionary::database d
 
     if (_field_type->is_duration()) {
         auto&& ks = db.find_keyspace(keyspace());
-        for (auto&& schema : ks.metadata()->cf_meta_data() | boost::adaptors::map_values) {
+        for (auto&& schema : ks.metadata()->cf_meta_data() | std::views::values) {
             for (auto&& column : schema->clustering_key_columns()) {
                 if (column.type->references_user_type(_name.get_keyspace(), _name.get_user_type_name())) {
                     throw exceptions::invalid_request_exception(format("Cannot add new field to type {} because it is used in the clustering key column {} of table {}.{} where durations are not allowed",
@@ -211,12 +210,12 @@ user_type alter_type_statement::renames::make_updated_type(data_dictionary::data
 
 std::unique_ptr<cql3::statements::prepared_statement>
 alter_type_statement::add_or_alter::prepare(data_dictionary::database db, cql_stats& stats) {
-    return std::make_unique<prepared_statement>(make_shared<alter_type_statement::add_or_alter>(*this));
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<alter_type_statement::add_or_alter>(*this));
 }
 
 std::unique_ptr<cql3::statements::prepared_statement>
 alter_type_statement::renames::prepare(data_dictionary::database db, cql_stats& stats) {
-    return std::make_unique<prepared_statement>(make_shared<alter_type_statement::renames>(*this));
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<alter_type_statement::renames>(*this));
 }
 
 }

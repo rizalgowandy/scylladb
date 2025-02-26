@@ -5,14 +5,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include "types/types.hh"
 #include "data_dictionary/data_dictionary.hh"
-#include "exceptions/exceptions.hh"
 #include <iosfwd>
 #include "enum_set.hh"
 
@@ -36,6 +35,7 @@ public:
     bool is_counter() const { return _type->is_counter(); }
     bool is_native() const { return _type->is_native(); }
     bool is_user_type() const { return _type->is_user_type(); }
+    bool is_vector() const { return _type->is_vector(); }
     data_type get_type() const { return _type; }
     const sstring& to_string() const { return _type->cql3_type_name(); }
 
@@ -64,8 +64,8 @@ public:
         static shared_ptr<raw> list(shared_ptr<raw> t);
         static shared_ptr<raw> set(shared_ptr<raw> t);
         static shared_ptr<raw> tuple(std::vector<shared_ptr<raw>> ts);
+        static shared_ptr<raw> vector(shared_ptr<raw> t, size_t dimension);
         static shared_ptr<raw> frozen(shared_ptr<raw> t);
-        friend std::ostream& operator<<(std::ostream& os, const raw& r);
         friend sstring format_as(const raw& r) {
             return r.to_string();
         }
@@ -77,8 +77,9 @@ private:
     class raw_collection;
     class raw_ut;
     class raw_tuple;
-    friend std::ostream& operator<<(std::ostream& os, const cql3_type& t) {
-        return os << t.to_string();
+    class raw_vector;
+    friend std::string_view format_as(const cql3_type& t) {
+        return t.to_string();
     }
 
 public:
@@ -361,3 +362,10 @@ inline bool operator==(const cql3_type& a, const cql3_type& b) {
 #endif
 
 }
+
+template <>
+struct fmt::formatter<cql3::cql3_type>: fmt::formatter<string_view> {
+    auto format(const cql3::cql3_type& t, fmt::format_context& ctx) const {
+        return formatter<string_view>::format(format_as(t), ctx);
+    }
+};

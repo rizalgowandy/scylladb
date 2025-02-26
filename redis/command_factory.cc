@@ -3,13 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "redis/command_factory.hh"
 #include "service/storage_proxy.hh"
 #include "redis/commands.hh"
-#include "log.hh"
+#include "utils/log.hh"
 
 namespace redis {
 

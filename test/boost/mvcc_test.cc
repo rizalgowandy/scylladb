@@ -3,19 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/range/algorithm/copy.hpp>
-#include <boost/range/algorithm_ext/push_back.hpp>
+#include "utils/assert.hh"
 #include <boost/range/size.hpp>
 #include <seastar/core/thread.hh>
 #include <seastar/util/defer.hh>
 
 #include "mutation/partition_version.hh"
-#include "partition_snapshot_row_cursor.hh"
+#include "db/partition_snapshot_row_cursor.hh"
 #include "partition_snapshot_reader.hh"
 #include "clustering_interval_set.hh"
 
@@ -35,6 +33,7 @@ using namespace std::chrono_literals;
 
 static thread_local mutation_application_stats app_stats_for_tests;
 
+static thread_local preemption_source default_preemption_source;
 
 // Reads the rest of the partition into a mutation_partition object.
 // There must be at least one entry ahead of the cursor.
@@ -197,7 +196,7 @@ void mvcc_partition::apply_to_evictable(partition_entry&& src, schema_ptr src_sc
                 src.upgrade(region(), _s, src_cleaner, no_cache_tracker);
             }
             return _e.apply_to_incomplete(*schema(), std::move(src), src_cleaner, as, region(),
-                *_container.tracker(), _container.next_phase(), _container.accounter());
+                *_container.tracker(), _container.next_phase(), _container.accounter(), default_preemption_source);
         });
         repeat([&] {
             return c.run();
@@ -206,7 +205,7 @@ void mvcc_partition::apply_to_evictable(partition_entry&& src, schema_ptr src_sc
 }
 
 mvcc_partition& mvcc_partition::operator+=(mvcc_partition&& src) {
-    assert(_evictable);
+    SCYLLA_ASSERT(_evictable);
     apply_to_evictable(std::move(src.entry()), src.schema());
     return *this;
 }
@@ -444,7 +443,7 @@ SEASTAR_TEST_CASE(test_apply_to_incomplete_respects_continuity) {
                 }
 
                 auto before = e.squashed();
-                auto e_continuity = before.get_continuity(*s);
+                auto e_continuity = e.entry().squashed_continuity(*s);
 
                 auto expected_to_apply_slice = mutation_partition(*s, to_apply.partition());
                 if (!before.static_row_continuous()) {
@@ -461,7 +460,7 @@ SEASTAR_TEST_CASE(test_apply_to_incomplete_respects_continuity) {
 
                 // After applying to_apply the continuity can be more narrow due to compaction with tombstones
                 // present in to_apply.
-                auto continuity_after = sq.get_continuity(*s);
+                auto continuity_after = e.entry().squashed_continuity(*s);
                 if (!continuity_after.contained_in(e_continuity)) {
                     BOOST_FAIL(format("Expected later continuity to be contained in earlier, later={}\n, earlier={}",
                                       continuity_after, e_continuity));
@@ -527,7 +526,7 @@ void evict_with_consistency_check(mvcc_container& ms, mvcc_partition& e, const m
 }
 
 static void reverse(schema_ptr s, mutation_partition& m) {
-    auto dk = dht::decorated_key(dht::token(dht::token_kind::key, 0), partition_key::from_bytes(bytes()));
+    auto dk = dht::decorated_key(dht::token(0), partition_key::from_bytes(bytes()));
     m = std::move(reverse(mutation(s, std::move(dk), std::move(m))).partition());
 }
 

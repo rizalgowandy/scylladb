@@ -1,18 +1,18 @@
 #
 # Copyright 2023-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
-from rest_api_mock import expected_request
-import utils
+from test.nodetool.rest_api_mock import expected_request
+from test.nodetool.utils import check_nodetool_fails_with
 
 
 def test_gettraceprobability(nodetool):
-    out = nodetool("gettraceprobability", expected_requests=[
+    res = nodetool("gettraceprobability", expected_requests=[
         expected_request("GET", "/storage_service/trace_probability", response=0.2)])
 
-    assert out == "Current trace probability: 0.2\n"
+    assert res.stdout == "Current trace probability: 0.2\n"
 
 
 def test_settraceprobability(nodetool):
@@ -21,7 +21,7 @@ def test_settraceprobability(nodetool):
 
 
 def test_settraceprobability_missing_param(nodetool):
-    utils.check_nodetool_fails_with(
+    check_nodetool_fails_with(
             nodetool,
             ("settraceprobability",),
             {},
@@ -30,7 +30,7 @@ def test_settraceprobability_missing_param(nodetool):
 
 
 def test_settraceprobability_invalid_type(nodetool):
-    utils.check_nodetool_fails_with(
+    check_nodetool_fails_with(
             nodetool,
             ("settraceprobability", "adadad"),
             {},
@@ -40,7 +40,7 @@ def test_settraceprobability_invalid_type(nodetool):
 
 def test_settraceprobability_out_of_bounds(nodetool):
     for value in ("-0.1", "1.1", "9000"):
-        utils.check_nodetool_fails_with(
+        check_nodetool_fails_with(
                 nodetool,
                 ("settraceprobability", "--", value),
                 {},

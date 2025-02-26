@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "validation.hh"
@@ -22,7 +22,7 @@ namespace validation {
 std::optional<sstring> is_cql_key_invalid(const schema& schema, partition_key_view key) {
     // C* validates here that the thrift key is not empty.
     // It can only be empty if it is not composite and its only component in CQL form is empty.
-    if (schema.partition_key_size() == 1 && key.begin(schema)->empty()) {
+    if (schema.partition_key_size() == 1 && (*key.begin(schema)).empty()) {
         return sstring("Key may not be empty");
     }
 

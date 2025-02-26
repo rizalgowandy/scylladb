@@ -7,8 +7,8 @@ Even though ScyllaDB is a fault-tolerant system, it is recommended to regularly 
 * Backup is a per-node procedure. Make sure to back up each node in your 
   cluster. For cluster-wide backup and restore, see `ScyllaDB Manager <https://manager.docs.scylladb.com/stable/restore/>`_.
 * Backup works the same for non-encrypted and encrypted SStables. You can use 
-  `Encryption at Rest <https://enterprise.docs.scylladb.com/stable/operating-scylla/security/encryption-at-rest.html>`_ 
-  available in ScyllaDB Enterprise without affecting the backup procedure.
+  :doc:`Encryption at Rest </operating-scylla/security/encryption-at-rest>` 
+  without affecting the backup procedure.
 
 You can choose one of the following:
 
@@ -27,13 +27,23 @@ With time, SSTables are compacted, but the hard link keeps a copy of each file. 
 
 **Procedure**
 
-| 1. Data can only be restored from a snapshot of the table schema, where data exists in a backup. Backup your schema with the following command:
+| 1. Data can only be restored from a snapshot of the table schema, where data exists in a backup. Backup your schema, roles, permissions
+|    and service levels with the following command:
 
-| ``$: cqlsh -e "DESC SCHEMA" > <schema_name.cql>``
+| ``$: cqlsh -e "DESC SCHEMA WITH INTERNALS AND PASSWORDS" > <schema_name.cql>``
 
-For example:
+| For example:
 
-| ``$: cqlsh -e "DESC SCHEMA" > db_schema.cql``
+| ``$: cqlsh -e "DESC SCHEMA WITH INTERNALS AND PASSWORDS" > db_schema.cql``
+
+| The command can only be executed by a superuser.
+
+.. warning::
+
+  To get a proper schema description, you need to use cqlsh at least in version ``6.0.23``. Restoring a schema backup created by
+  an older version of cqlsh may lead to data resurrection or data loss. To check the version of your cqlsh, you can use ``cqlsh --version``.
+
+See :doc:`the relevant article to learn more </cql/describe-schema>`.
 
 |
 | 2. Take a snapshot, including every keyspace you want to backup.
@@ -44,7 +54,7 @@ For example:
 
 | ``$ nodetool snapshot mykeyspace``
 
-| The snapshot is created under Scylla data directory ``/var/lib/scylla/data``
+| The snapshot is created under ScyllaDB data directory ``/var/lib/scylla/data``
 | It will have the following structure:
 | ``keyspace_name/table_name-UUID/snapshots/snapshot_name``
 
@@ -63,11 +73,11 @@ Incremental Backup
 
   * A snapshot 
   * All incremental backups and commit logs from the time of the snapshot. 
-  * Make sure to delete unnecessary incremental backups. Scylla does not do this automatically.
+  * Make sure to delete unnecessary incremental backups. ScyllaDB does not do this automatically.
 
 **Procedure**
 
-| 1. In the ``/etc/scylla/scylla.yaml`` file set the ``incremental backups`` parameters to ``true`` and restart the Scylla service. Snapshot are created under Scylla data directory ``/var/lib/scylla/data``
+| 1. In the ``/etc/scylla/scylla.yaml`` file set the ``incremental backups`` parameters to ``true`` and restart the ScyllaDB service. Snapshot are created under ScyllaDB data directory ``/var/lib/scylla/data``
 | with the following structure:
 | ``keyspace_name/table_name-UUID/backups/backups_name``
 
@@ -78,6 +88,6 @@ Incremental Backup
 Additional Resources
 ====================
 
-* :doc:`Scylla Snapshots </kb/snapshots>`
+* :doc:`ScyllaDB Snapshots </kb/snapshots>`
 
 

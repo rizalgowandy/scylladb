@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "atomic_cell.hh"
@@ -176,10 +176,10 @@ size_t atomic_cell_or_collection::external_memory_usage(const abstract_type& t) 
     return _data.external_memory_usage();
 }
 
-std::ostream&
-operator<<(std::ostream& os, const atomic_cell_view& acv) {
+auto fmt::formatter<atomic_cell_view>::format(const atomic_cell_view& acv, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
     if (acv.is_live()) {
-        fmt::print(os, "atomic_cell{{{},ts={:d},expiry={:d},ttl={:d}}}",
+        return fmt::format_to(ctx.out(), "atomic_cell{{{},ts={:d},expiry={:d},ttl={:d}}}",
             acv.is_counter_update()
                     ? "counter_update_value=" + to_sstring(acv.counter_update_value())
                     : to_hex(to_bytes(acv.value())),
@@ -187,19 +187,14 @@ operator<<(std::ostream& os, const atomic_cell_view& acv) {
             acv.is_live_and_has_ttl() ? acv.expiry().time_since_epoch().count() : -1,
             acv.is_live_and_has_ttl() ? acv.ttl().count() : 0);
     } else {
-        fmt::print(os, "atomic_cell{{DEAD,ts={:d},deletion_time={:d}}}",
+        return fmt::format_to(ctx.out(), "atomic_cell{{DEAD,ts={:d},deletion_time={:d}}}",
             acv.timestamp(), acv.deletion_time().time_since_epoch().count());
     }
-    return os;
 }
 
-std::ostream&
-operator<<(std::ostream& os, const atomic_cell& ac) {
-    return os << atomic_cell_view(ac);
-}
-
-std::ostream&
-operator<<(std::ostream& os, const atomic_cell_view::printer& acvp) {
+auto fmt::formatter<atomic_cell_view::printer>::format(const atomic_cell_view::printer& acvp,
+                                                       fmt::format_context& ctx) const
+    ->decltype(ctx.out()) {
     auto& type = acvp._type;
     auto& acv = acvp._cell;
     if (acv.is_live()) {
@@ -214,34 +209,30 @@ operator<<(std::ostream& os, const atomic_cell_view::printer& acvp) {
         } else {
             fmt::print(cell_value_string_builder, "{}", type.to_string(to_bytes(acv.value())));
         }
-        fmt::print(os, "atomic_cell{{{},ts={:d},expiry={:d},ttl={:d}}}",
+        return fmt::format_to(ctx.out(), "atomic_cell{{{},ts={:d},expiry={:d},ttl={:d}}}",
             cell_value_string_builder.str(),
             acv.timestamp(),
             acv.is_live_and_has_ttl() ? acv.expiry().time_since_epoch().count() : -1,
             acv.is_live_and_has_ttl() ? acv.ttl().count() : 0);
     } else {
-        fmt::print(os, "atomic_cell{{DEAD,ts={:d},deletion_time={:d}}}",
+        return fmt::format_to(ctx.out(), "atomic_cell{{DEAD,ts={:d},deletion_time={:d}}}",
             acv.timestamp(), acv.deletion_time().time_since_epoch().count());
     }
-    return os;
 }
 
-std::ostream&
-operator<<(std::ostream& os, const atomic_cell::printer& acp) {
-    return operator<<(os, static_cast<const atomic_cell_view::printer&>(acp));
-}
-
-std::ostream& operator<<(std::ostream& os, const atomic_cell_or_collection::printer& p) {
+auto fmt::formatter<atomic_cell_or_collection::printer>::format(const atomic_cell_or_collection::printer& p, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    auto out = ctx.out();
     if (p._cell._data.empty()) {
-        return os << "{ null atomic_cell_or_collection }";
+        return fmt::format_to(out, "{{ null atomic_cell_or_collection }}");
     }
-    os << "{ ";
+    out = fmt::format_to(out, "{{");
     if (p._cdef.type->is_multi_cell()) {
-        os << "collection ";
+        out = fmt::format_to(out, "collection ");
         auto cmv = p._cell.as_collection_mutation();
-        os << collection_mutation_view::printer(*p._cdef.type, cmv);
+        out = fmt::format_to(out, "{}", collection_mutation_view::printer(*p._cdef.type, cmv));
     } else {
-        os << atomic_cell_view::printer(*p._cdef.type, p._cell.as_atomic_cell(p._cdef));
+        out = fmt::format_to(out, "{}", atomic_cell_view::printer(*p._cdef.type, p._cell.as_atomic_cell(p._cdef)));
     }
-    return os << " }";
+    return fmt::format_to(out, "}}");
 }

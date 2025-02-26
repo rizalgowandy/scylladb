@@ -4,14 +4,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
-#include <boost/range/algorithm/find_if.hpp>
-#include "boost/range/join.hpp"
 #include <iostream>
+#include <set>
 #include <unordered_set>
 #include <unordered_map>
 #include <seastar/core/condition-variable.hh>
@@ -24,6 +23,10 @@
 #include "service/session.hh"
 #include "mutation/canonical_mutation.hh"
 
+namespace db {
+    class system_keyspace;
+}
+
 namespace service {
 
 enum class node_state: uint16_t {
@@ -34,40 +37,47 @@ enum class node_state: uint16_t {
     replacing,           // the node replaces another dead node in the cluster and it data is being streamed to it
     rebuilding,          // the node is being rebuild and is streaming data from other replicas
     normal,              // the node does not do any streaming and serves the slice of the ring that belongs to it
-    left_token_ring,     // the node left the token ring, but not group0 yet; we wait until other nodes stop writing to it
     left,                // the node left the cluster and group0
-    rollback_to_normal,  // the node rolls back failed decommission/remove node operation
 };
 
+// The order of the requests is a priority
+// order in which requests are executes in case
+// there are multiple requests in the queue.
+// The order tries to minimize the amount of cleanups.
 enum class topology_request: uint16_t {
-    join,
-    leave,
-    remove,
     replace,
+    join,
+    remove,
+    leave,
     rebuild
+};
+
+enum class cleanup_status : uint16_t {
+    clean,
+    needed,
+    running,
 };
 
 struct join_param {
     uint32_t num_tokens;
+    sstring tokens_string;
 };
 
 struct rebuild_param {
     sstring source_dc;
 };
 
-struct removenode_param {
-    std::unordered_set<raft::server_id> ignored_ids;
-};
-
 struct replace_param {
     raft::server_id replaced_id;
-    std::unordered_set<raft::server_id> ignored_ids;
 };
 
-using request_param = std::variant<join_param, rebuild_param, removenode_param, replace_param>;
+using request_param = std::variant<join_param, rebuild_param, replace_param>;
 
 enum class global_topology_request: uint16_t {
     new_cdc_generation,
+    cleanup,
+    keyspace_rf_change,
+    truncate_table,
 };
 
 struct ring_slice {
@@ -83,6 +93,8 @@ struct replica_state {
     size_t shard_count;
     uint8_t ignore_msb;
     std::set<sstring> supported_features;
+    cleanup_status cleanup;
+    utils::UUID request_id; // id of the current request for the node or the last one if no current one exists
 };
 
 struct topology_features {
@@ -104,9 +116,23 @@ struct topology {
         write_both_read_old,
         write_both_read_new,
         tablet_migration,
+        tablet_resize_finalization,
+        tablet_split_finalization, // deprecated in favor of tablet_resize_finalization, kept for backward compatibility.
+        left_token_ring,
+        rollback_to_normal,
+        truncate_table,
+        lock,
     };
 
     std::optional<transition_state> tstate;
+
+    enum class upgrade_state_type: uint16_t {
+        not_upgraded,
+        build_coordinator_state,
+        done,
+    };
+
+    upgrade_state_type upgrade_state = upgrade_state_type::not_upgraded;
 
     using version_t = int64_t;
     static constexpr version_t initial_version = 1;
@@ -117,10 +143,13 @@ struct topology {
     std::unordered_map<raft::server_id, replica_state> normal_nodes;
     // Nodes that are left
     std::unordered_set<raft::server_id> left_nodes;
+    // Left nodes for which we need topology information.
+    std::unordered_map<raft::server_id, replica_state> left_nodes_rs;
     // Nodes that are waiting to be joined by the topology coordinator
     std::unordered_map<raft::server_id, replica_state> new_nodes;
     // Nodes that are in the process to be added to the ring
-    // Currently only at most one node at a time will be here
+    // Currently at most one node at a time will be here, but the code shouldn't assume it
+    // because we might support parallel operations in the future.
     std::unordered_map<raft::server_id, replica_state> transition_nodes;
 
     // Pending topology requests
@@ -133,13 +162,22 @@ struct topology {
     // Pending global topology request (i.e. not related to any specific node).
     std::optional<global_topology_request> global_request;
 
-    // The ID of the last introduced CDC generation.
-    std::optional<cdc::generation_id_v2> current_cdc_generation_id;
+    // Pending global topology request's id, which is a new group0's state id
+    std::optional<utils::UUID> global_request_id;
+
+    // The IDs of the committed CDC generations sorted by timestamps.
+    // The obsolete generations may not be in this list as they are continually deleted.
+    std::vector<cdc::generation_id_v2> committed_cdc_generations;
 
     // This is the time UUID used to access the data of a new CDC generation introduced
     // e.g. when a new node bootstraps, needed in `commit_cdc_generation` transition state.
     // It's used as the first column of the clustering key in CDC_GENERATIONS_V3 table.
     std::optional<utils::UUID> new_cdc_generation_data_uuid;
+
+    // The name of the KS that is being the target of the scheduled ALTER KS statement
+    std::optional<sstring> new_keyspace_rf_change_ks_name;
+    // The KS options to be used when executing the scheduled ALTER KS statement
+    std::optional<std::unordered_map<sstring, sstring>> new_keyspace_rf_change_data;
 
     // The IDs of the committed yet unpublished CDC generations sorted by timestamps.
     std::vector<cdc::generation_id_v2> unpublished_cdc_generations;
@@ -153,6 +191,9 @@ struct topology {
     // When false, tablet load balancer will not try to rebalance tablets.
     bool tablet_balancing_enabled = true;
 
+    // The set of nodes that should be considered dead during topology operations
+    std::unordered_set<raft::server_id> ignored_nodes;
+
     // Find only nodes in non 'left' state
     const std::pair<const raft::server_id, replica_state>* find(raft::server_id id) const;
     // Return true if node exists in any state including 'left' one
@@ -165,19 +206,30 @@ struct topology {
     // Returns false iff we can safely start a new topology change.
     bool is_busy() const;
 
+    // Returns the set of nodes currently excluded from synchronization-with in the topology.
+    // Barrier should not wait for those nodes. Used for tablets migration only.
+    std::unordered_set<raft::server_id> get_excluded_nodes() const;
+
+    std::optional<request_param> get_request_param(raft::server_id) const;
+    static raft::server_id parse_replaced_node(const std::optional<request_param>&);
+    // Returns the set of nodes currently excluded from based on global topology request.
+    // Used by topology coordinator code only.
+    std::unordered_set<raft::server_id> get_excluded_nodes(raft::server_id id, const std::optional<topology_request>& req) const;
+
     // Calculates a set of features that are supported by all normal nodes but not yet enabled.
     std::set<sstring> calculate_not_yet_enabled_features() const;
+
+    // Returns the set of zero-token normal nodes.
+    std::unordered_set<raft::server_id> get_normal_zero_token_nodes() const;
 };
 
-struct raft_topology_snapshot {
-    // Mutations for the system.topology table.
-    std::vector<canonical_mutation> topology_mutations;
-
-    // Mutations for system.cdc_generations_v3, contains all the CDC generation data.
-    std::vector<canonical_mutation> cdc_generation_mutations;
+struct raft_snapshot {
+    // FIXME: handle this with rpc streaming instead as we can't guarantee size bounds.
+    utils::chunked_vector<canonical_mutation> mutations;
 };
 
-struct raft_topology_pull_params {
+struct raft_snapshot_pull_params {
+    std::vector<table_id> tables;
 };
 
 // State machine that is responsible for topology change
@@ -185,6 +237,10 @@ struct topology_state_machine {
     using topology_type = topology;
     topology_type _topology;
     condition_variable event;
+    size_t reload_count = 0;
+
+    future<> await_not_busy();
+    future<sstring> wait_for_request_completion(db::system_keyspace& sys_ks, utils::UUID id, bool require_entry);
 };
 
 // Raft leader uses this command to drive bootstrap process on other nodes
@@ -194,7 +250,7 @@ struct raft_topology_cmd {
           barrier_and_drain,    // same + drain requests which use previous versions
           stream_ranges,        // request to stream data, return when streaming is
                                 // done
-          shutdown,             // a decommissioning node should shut down
+          wait_for_ip           // wait for a joining node IP to appear in gossiper
       };
       command cmd;
 
@@ -222,14 +278,51 @@ struct fencing_token {
     }
 };
 
-std::ostream& operator<<(std::ostream& os, const fencing_token& fencing_token);
-std::ostream& operator<<(std::ostream& os, topology::transition_state s);
+struct topology_request_state {
+    bool done;
+    sstring error;
+};
+
 topology::transition_state transition_state_from_string(const sstring& s);
-std::ostream& operator<<(std::ostream& os, node_state s);
 node_state node_state_from_string(const sstring& s);
-std::ostream& operator<<(std::ostream& os, const topology_request& req);
 topology_request topology_request_from_string(const sstring& s);
-std::ostream& operator<<(std::ostream&, const global_topology_request&);
 global_topology_request global_topology_request_from_string(const sstring&);
-std::ostream& operator<<(std::ostream& os, const raft_topology_cmd::command& cmd);
+cleanup_status cleanup_status_from_string(const sstring& s);
+topology::upgrade_state_type upgrade_state_from_string(const sstring&);
 }
+
+template <> struct fmt::formatter<service::cleanup_status> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(service::cleanup_status status, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <> struct fmt::formatter<service::topology::upgrade_state_type> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(service::topology::upgrade_state_type status, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <> struct fmt::formatter<service::fencing_token> : fmt::formatter<string_view> {
+    auto format(const service::fencing_token& fencing_token, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{{{}}}", fencing_token.topology_version);
+    }
+};
+
+template <> struct fmt::formatter<service::topology::transition_state> : fmt::formatter<string_view> {
+    auto format(service::topology::transition_state, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <> struct fmt::formatter<service::node_state> : fmt::formatter<string_view> {
+    auto format(service::node_state, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <> struct fmt::formatter<service::topology_request> : fmt::formatter<string_view> {
+    auto format(service::topology_request, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <> struct fmt::formatter<service::global_topology_request> : fmt::formatter<string_view> {
+    auto format(service::global_topology_request, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <> struct fmt::formatter<service::raft_topology_cmd::command> : fmt::formatter<string_view> {
+    auto format(service::raft_topology_cmd::command, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

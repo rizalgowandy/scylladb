@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include <seastar/core/shared_ptr.hh>
@@ -13,17 +13,12 @@
 #include "index/secondary_index_manager.hh"
 
 #include "cql3/statements/index_target.hh"
-#include "cql3/util.hh"
 #include "cql3/expr/expression.hh"
 #include "index/target_parser.hh"
 #include "schema/schema_builder.hh"
-#include "replica/database.hh"
 #include "db/view/view.hh"
 #include "concrete_types.hh"
-
-#include <boost/range/adaptor/map.hpp>
-#include <boost/algorithm/cxx11/any_of.hpp>
-#include <boost/algorithm/string/predicate.hpp>
+#include "db/tags/extension.hh"
 
 namespace secondary_index {
 
@@ -158,10 +153,43 @@ sstring index_table_name(const sstring& index_name) {
 }
 
 sstring index_name_from_table_name(const sstring& table_name) {
-    if (table_name.size() < 7 || !boost::algorithm::ends_with(table_name, "_index")) {
+    if (table_name.size() < 7 || !table_name.ends_with("_index")) {
         throw std::runtime_error(format("Table {} does not have _index suffix", table_name));
     }
     return table_name.substr(0, table_name.size() - 6); // remove the _index suffix from an index name;
+}
+
+std::set<sstring>
+existing_index_names(const std::vector<schema_ptr>& tables, std::string_view cf_to_exclude) {
+    std::set<sstring> names;
+    for (auto& schema : tables) {
+        if (!cf_to_exclude.empty() && schema->cf_name() == cf_to_exclude) {
+            continue;
+        }
+        for (const auto& index_name : schema->index_names()) {
+            names.emplace(index_name);
+        }
+    }
+    return names;
+}
+
+sstring get_available_index_name(
+        std::string_view ks_name,
+        std::string_view cf_name,
+        std::optional<sstring> index_name_root,
+        const std::set<sstring>& existing_names,
+        std::function<bool(std::string_view, std::string_view)> has_schema) {
+    auto base_name = index_metadata::get_default_index_name(sstring(cf_name), index_name_root);
+    sstring accepted_name = base_name;
+    int i = 0;
+    auto name_accepted = [&] {
+        auto index_table_name = secondary_index::index_table_name(accepted_name);
+        return !has_schema(ks_name, index_table_name) && !existing_names.contains(accepted_name);
+    };
+    while (!name_accepted()) {
+        accepted_name = base_name + "_" + std::to_string(++i);
+    }
+    return accepted_name;
 }
 
 static bytes get_available_column_name(const schema& schema, const bytes& root) {
@@ -191,7 +219,7 @@ static data_type type_for_computed_column(cql3::statements::index_target::target
     }
 }
 
-view_ptr secondary_index_manager::create_view_for_index(const index_metadata& im, bool new_token_column_computation) const {
+view_ptr secondary_index_manager::create_view_for_index(const index_metadata& im) const {
     auto schema = _cf.schema();
     sstring index_target_name = im.options().at(cql3::statements::index_target::target_option_name);
     schema_builder builder{schema->ks_name(), index_table_name(im.name())};
@@ -232,13 +260,7 @@ view_ptr secondary_index_manager::create_view_for_index(const index_metadata& im
         }
         // Additional token column is added to ensure token order on secondary index queries
         bytes token_column_name = get_available_token_column_name(*schema);
-        if (new_token_column_computation) {
-            builder.with_computed_column(token_column_name, long_type, column_kind::clustering_key, std::make_unique<token_column_computation>());
-        } else {
-            // FIXME(pgrabowski): this legacy code is here for backward compatibility and should be removed
-            // once "supports_correct_idx_token_in_secondary_index" is supported by every node
-            builder.with_computed_column(token_column_name, bytes_type, column_kind::clustering_key, std::make_unique<legacy_token_column_computation>());
-        }
+        builder.with_computed_column(token_column_name, long_type, column_kind::clustering_key, std::make_unique<token_column_computation>());
 
         for (auto& col : schema->partition_key_columns()) {
             if (col == *index_target) {
@@ -281,18 +303,26 @@ view_ptr secondary_index_manager::create_view_for_index(const index_metadata& im
         format("{} IS NOT NULL", index_target->name_as_cql_string()) :
         "";
     builder.with_view_info(*schema, false, where_clause);
+    // A local secondary index should be backed by a *synchronous* view,
+    // see #16371. A view is marked synchronous with a tag. Non-local indexes
+    // do not need the tags schema extension at all.
+    if (im.local()) {
+        std::map<sstring, sstring> tags_map = {{db::SYNCHRONOUS_VIEW_UPDATES_TAG_KEY, "true"}};
+        builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>(tags_map));
+    }
     return view_ptr{builder.build()};
 }
 
 std::vector<index_metadata> secondary_index_manager::get_dependent_indices(const column_definition& cdef) const {
-    return boost::copy_range<std::vector<index_metadata>>(_indices
-           | boost::adaptors::map_values
-           | boost::adaptors::filtered([&] (auto& index) { return index.depends_on(cdef); })
-           | boost::adaptors::transformed([&] (auto& index) { return index.metadata(); }));
+    return _indices
+           | std::views::values
+           | std::views::filter([&] (auto& index) { return index.depends_on(cdef); })
+           | std::views::transform([&] (auto& index) { return index.metadata(); })
+           | std::ranges::to<std::vector>();
 }
 
 std::vector<index> secondary_index_manager::list_indexes() const {
-    return boost::copy_range<std::vector<index>>(_indices | boost::adaptors::map_values);
+    return _indices | std::views::values | std::ranges::to<std::vector>();
 }
 
 bool secondary_index_manager::is_index(view_ptr view) const {
@@ -300,13 +330,13 @@ bool secondary_index_manager::is_index(view_ptr view) const {
 }
 
 bool secondary_index_manager::is_index(const schema& s) const {
-    return boost::algorithm::any_of(_indices | boost::adaptors::map_values, [&s] (const index& i) {
+    return std::ranges::any_of(_indices | std::views::values, [&s] (const index& i) {
         return s.cf_name() == index_table_name(i.metadata().name());
     });
 }
 
 bool secondary_index_manager::is_global_index(const schema& s) const {
-    return boost::algorithm::any_of(_indices | boost::adaptors::map_values, [&s] (const index& i) {
+    return std::ranges::any_of(_indices | std::views::values, [&s] (const index& i) {
         return !i.metadata().local() && s.cf_name() == index_table_name(i.metadata().name());
     });
 }

@@ -5,16 +5,15 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
+#include "exceptions/exceptions.hh"
+#include "utils/assert.hh"
 #include <unordered_set>
 #include <vector>
 
-#include <boost/range/iterator_range.hpp>
-#include <boost/range/join.hpp>
-#include <boost/range/adaptor/map.hpp>
-#include <boost/range/adaptor/transformed.hpp>
+#include <boost/regex.hpp>
 
 #include <seastar/core/coroutine.hh>
 #include "cql3/column_identifier.hh"
@@ -28,11 +27,11 @@
 #include "schema/schema_builder.hh"
 #include "service/storage_proxy.hh"
 #include "validation.hh"
-#include "db/extensions.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "gms/feature_service.hh"
 #include "db/view/view.hh"
 #include "service/migration_manager.hh"
+#include "replica/database.hh"
 
 namespace cql3 {
 
@@ -62,7 +61,7 @@ future<> create_view_statement::check_access(query_processor& qp, const service:
 
 static const column_definition* get_column_definition(const schema& schema, column_identifier::raw& identifier) {
     auto prepared = identifier.prepare(schema);
-    assert(dynamic_pointer_cast<column_identifier>(prepared));
+    SCYLLA_ASSERT(dynamic_pointer_cast<column_identifier>(prepared));
     auto id = static_pointer_cast<column_identifier>(prepared);
     return schema.get_column_definition(id->name());
 }
@@ -107,6 +106,7 @@ static bool validate_primary_key(
 
 std::pair<view_ptr, cql3::cql_warnings_vec> create_view_statement::prepare_view(data_dictionary::database db) const {
     // We need to make sure that:
+    //  - materialized view name is valid
     //  - primary key includes all columns in base table's primary key
     //  - make sure that the select statement does not have anything other than columns
     //    and their names match the base table's names
@@ -140,9 +140,20 @@ std::pair<view_ptr, cql3::cql_warnings_vec> create_view_statement::prepare_view(
         throw exceptions::invalid_request_exception(format("Cannot create a materialized view on a table in a separate keyspace ('{}' != '{}')",
                 _base_name.get_keyspace(), keyspace()));
     }
+    const sstring& cf_name = column_family();
+    boost::regex name_regex("\\w+");
+    if (!boost::regex_match(std::string(cf_name), name_regex)) {
+        throw exceptions::invalid_request_exception(format("\"{}\" is not a valid materialized view name (must contain alphanumeric character only: [0-9A-Za-z] or the underscore)", cf_name.c_str()));
+    }
+    if (cf_name.size() > size_t(schema::NAME_LENGTH)) {
+        throw exceptions::invalid_request_exception(format("materialized view names shouldn't be more than {:d} characters long (got \"{}\")", schema::NAME_LENGTH, cf_name.c_str()));
+    }
 
     schema_ptr schema = validation::validate_column_family(db, _base_name.get_keyspace(), _base_name.get_column_family());
 
+    if (!db.features().views_with_tablets && db.find_keyspace(keyspace()).get_replication_strategy().uses_tablets()) {
+        throw exceptions::invalid_request_exception(format("Materialized views are not supported on base tables with tablets"));
+    }
     if (schema->is_counter()) {
         throw exceptions::invalid_request_exception(format("Materialized views are not supported on counter tables"));
     }
@@ -165,7 +176,7 @@ std::pair<view_ptr, cql3::cql_warnings_vec> create_view_statement::prepare_view(
     }
 
     // Gather all included columns, as specified by the select clause
-    auto included = boost::copy_range<std::unordered_set<const column_definition*>>(_select_clause | boost::adaptors::transformed([&](auto&& selector) {
+    auto included = _select_clause | std::views::transform([&](auto&& selector) {
         if (selector->alias) {
             throw exceptions::invalid_request_exception(format("Cannot use alias when defining a materialized view"));
         }
@@ -182,7 +193,7 @@ std::pair<view_ptr, cql3::cql_warnings_vec> create_view_statement::prepare_view(
             throw exceptions::invalid_request_exception(format("Unknown column name detected in CREATE MATERIALIZED VIEW statement: {}", identifier));
         }
         return def;
-    }));
+    }) | std::ranges::to<std::unordered_set<const column_definition*>>();
 
     auto parameters = make_lw_shared<raw::select_statement::parameters>(raw::select_statement::parameters::orderings_type(), false, true);
     raw::select_statement raw_select(_base_name, std::move(parameters), _select_clause, _where_clause, std::nullopt, std::nullopt, {}, std::make_unique<cql3::attributes::raw>());
@@ -193,9 +204,10 @@ std::pair<view_ptr, cql3::cql_warnings_vec> create_view_statement::prepare_view(
     auto prepared = raw_select.prepare(db, ignored, true);
     auto restrictions = static_pointer_cast<statements::select_statement>(prepared->statement)->get_restrictions();
 
-    auto base_primary_key_cols = boost::copy_range<std::unordered_set<const column_definition*>>(
-            boost::range::join(schema->partition_key_columns(), schema->clustering_key_columns())
-            | boost::adaptors::transformed([](auto&& def) { return &def; }));
+    auto base_primary_key_cols =
+            schema->primary_key_columns()
+            | std::views::transform([](auto&& def) { return &def; })
+            | std::ranges::to<std::unordered_set<const column_definition*>>();
 
     // Validate the primary key clause, ensuring only one non-PK base column is used in the view's PK.
     bool has_non_pk_column = false;
@@ -246,9 +258,10 @@ std::pair<view_ptr, cql3::cql_warnings_vec> create_view_statement::prepare_view(
     }
 
     if (!missing_pk_columns.empty()) {
-        auto column_names = fmt::join(missing_pk_columns | boost::adaptors::transformed(std::mem_fn(&column_definition::name_as_text)), ", ");
-        throw exceptions::invalid_request_exception(format("Cannot create Materialized View {} without primary key columns from base {} ({})",
-                        column_family(), _base_name.get_column_family(), column_names));
+        throw exceptions::invalid_request_exception(seastar::format(
+"Cannot create Materialized View {} without primary key columns from base {} ({})",
+                        column_family(), _base_name.get_column_family(),
+                        fmt::join(missing_pk_columns | std::views::transform(std::mem_fn(&column_definition::name_as_text)), ", ")));
     }
 
     if (_partition_keys.empty()) {
@@ -289,9 +302,9 @@ std::pair<view_ptr, cql3::cql_warnings_vec> create_view_statement::prepare_view(
             target_primary_keys.contains(non_pk_restrictions.cbegin()->first)) {
         // This case (filter by new PK column of the view) works, as explained above
     } else if (!non_pk_restrictions.empty()) {
-        auto column_names = fmt::join(non_pk_restrictions | boost::adaptors::map_keys | boost::adaptors::transformed(std::mem_fn(&column_definition::name_as_text)), ", ");
-        throw exceptions::invalid_request_exception(format("Non-primary key columns cannot be restricted in the SELECT statement used for materialized view {} creation (got restrictions on: {})",
-                column_family(), column_names));
+        throw exceptions::invalid_request_exception(seastar::format("Non-primary key columns cannot be restricted in the SELECT statement used for materialized view {} creation (got restrictions on: {})",
+                column_family(),
+                fmt::join(non_pk_restrictions | std::views::keys | std::views::transform(std::mem_fn(&column_definition::name_as_text)), ", ")));
     }
 
     // IS NOT NULL restrictions are handled separately from other restrictions.
@@ -323,7 +336,16 @@ std::pair<view_ptr, cql3::cql_warnings_vec> create_view_statement::prepare_view(
         warnings.emplace_back(std::move(warning_text));
     }
 
-    schema_builder builder{keyspace(), column_family()};
+    const auto maybe_id = _properties.properties()->get_id();
+    if (maybe_id && db.try_find_table(*maybe_id)) {
+        const auto schema_ptr = db.find_schema(*maybe_id);
+        const auto& ks_name = schema_ptr->ks_name();
+        const auto& cf_name = schema_ptr->cf_name();
+
+        throw exceptions::invalid_request_exception(seastar::format("Table with ID {} already exists: {}.{}", *maybe_id, ks_name, cf_name));
+    }
+
+    schema_builder builder{keyspace(), column_family(), maybe_id};
     auto add_columns = [this, &builder] (std::vector<const column_definition*>& defs, column_kind kind) mutable {
         for (auto* def : defs) {
             auto&& type = _properties.get_reversable_type(*def->column_specification->name, def->type);
@@ -346,7 +368,7 @@ std::pair<view_ptr, cql3::cql_warnings_vec> create_view_statement::prepare_view(
             db::view::create_virtual_column(builder, def->name(), def->type);
         }
     }
-    _properties.properties()->apply_to_builder(builder, std::move(schema_extensions));
+    _properties.properties()->apply_to_builder(builder, std::move(schema_extensions), db, keyspace());
 
     if (builder.default_time_to_live().count() > 0) {
         throw exceptions::invalid_request_exception(
@@ -362,25 +384,26 @@ std::pair<view_ptr, cql3::cql_warnings_vec> create_view_statement::prepare_view(
 }
 
 future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>>
-create_view_statement::prepare_schema_mutations(query_processor& qp, api::timestamp_type ts) const {
-    ::shared_ptr<cql_transport::event::schema_change> ret;
+create_view_statement::prepare_schema_mutations(query_processor& qp, const query_options&, api::timestamp_type ts) const {
     std::vector<mutation> m;
     auto [definition, warnings] = prepare_view(qp.db());
     try {
         m = co_await service::prepare_new_view_announcement(qp.proxy(), std::move(definition), ts);
-        using namespace cql_transport;
-        ret = ::make_shared<event::schema_change>(
-                event::schema_change::change_type::CREATED,
-                event::schema_change::target_type::TABLE,
-                keyspace(),
-                column_family());
     } catch (const exceptions::already_exists_exception& e) {
         if (!_if_not_exists) {
             co_return coroutine::exception(std::current_exception());
         }
     }
 
-    co_return std::make_tuple(std::move(ret), std::move(m), std::move(warnings));
+    // If an IF NOT EXISTS clause was used and resource was already created
+    // we shouldn't emit created event. However it interacts badly with
+    // concurrent clients creating resources. The client seeing no create event
+    // assumes resource already previously existed and proceeds with its logic
+    // which may depend on that resource. But it may send requests to nodes which
+    // are not yet aware of new schema or client's metadata may be outdated.
+    // To force synchronization always emit the event (see
+    // github.com/scylladb/scylladb/issues/16909).
+    co_return std::make_tuple(created_event(), std::move(m), std::move(warnings));
 }
 
 std::unique_ptr<cql3::statements::prepared_statement>
@@ -388,7 +411,15 @@ create_view_statement::prepare(data_dictionary::database db, cql_stats& stats) {
     if (!_prepare_ctx.get_variable_specifications().empty()) {
         throw exceptions::invalid_request_exception(format("Cannot use query parameters in CREATE MATERIALIZED VIEW statements"));
     }
-    return std::make_unique<prepared_statement>(make_shared<create_view_statement>(*this));
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<create_view_statement>(*this));
+}
+
+::shared_ptr<schema_altering_statement::event_t> create_view_statement::created_event() const {
+    return make_shared<event_t>(
+            event_t::change_type::CREATED,
+            event_t::target_type::TABLE,
+            keyspace(),
+            column_family());
 }
 
 }

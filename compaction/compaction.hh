@@ -4,19 +4,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "readers/combined_reader_stats.hh"
 #include "sstables/shared_sstable.hh"
 #include "compaction/compaction_descriptor.hh"
 #include "gc_clock.hh"
-#include "compaction_weight_registration.hh"
 #include "utils/UUID.hh"
-#include "utils/pretty_printers.hh"
 #include "table_state.hh"
-#include <seastar/core/thread.hh>
 #include <seastar/core/abort_source.hh>
 
 using namespace compaction;
@@ -80,6 +78,7 @@ struct compaction_stats {
     uint64_t validation_errors = 0;
     // Bloom filter checks during max purgeable calculation
     uint64_t bloom_filter_checks = 0;
+    combined_reader_statistics reader_statistics;
 
     compaction_stats& operator+=(const compaction_stats& r) {
         ended_at = std::max(ended_at, r.ended_at);
@@ -132,6 +131,6 @@ std::unordered_set<sstables::shared_sstable>
 get_fully_expired_sstables(const table_state& table_s, const std::vector<sstables::shared_sstable>& compacting, gc_clock::time_point gc_before);
 
 // For tests, can drop after we virtualize sstables.
-flat_mutation_reader_v2 make_scrubbing_reader(flat_mutation_reader_v2 rd, compaction_type_options::scrub::mode scrub_mode, uint64_t& validation_errors);
+mutation_reader make_scrubbing_reader(mutation_reader rd, compaction_type_options::scrub::mode scrub_mode, uint64_t& validation_errors);
 
 }

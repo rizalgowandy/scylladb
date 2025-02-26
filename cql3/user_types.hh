@@ -5,15 +5,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include "column_specification.hh"
-#include "column_identifier.hh"
 #include "operation.hh"
-#include "utils/to_string.hh"
 
 namespace cql3 {
 

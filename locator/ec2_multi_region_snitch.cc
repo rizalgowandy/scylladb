@@ -5,11 +5,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "locator/ec2_multi_region_snitch.hh"
+#include "exceptions/exceptions.hh"
 #include "gms/gossiper.hh"
+#include "utils/class_registrator.hh"
 
 static constexpr const char* PUBLIC_IP_QUERY_REQ  = "/latest/meta-data/public-ipv4";
 static constexpr const char* PRIVATE_IP_QUERY_REQ = "/latest/meta-data/local-ipv4";
@@ -78,7 +80,7 @@ void ec2_multi_region_snitch::set_local_private_addr(const sstring& addr_str) {
     _local_private_address = addr_str;
 }
 
-std::list<std::pair<gms::application_state, gms::versioned_value>> ec2_multi_region_snitch::get_app_states() const {
+gms::application_state_map ec2_multi_region_snitch::get_app_states() const {
     return {
         {gms::application_state::DC, gms::versioned_value::datacenter(_my_dc)},
         {gms::application_state::RACK, gms::versioned_value::rack(_my_rack)},

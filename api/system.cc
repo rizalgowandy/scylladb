@@ -3,24 +3,25 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "api/api_init.hh"
 #include "api/api-doc/system.json.hh"
 #include "api/api-doc/metrics.json.hh"
+#include "replica/database.hh"
+#include "db/sstables-format-selector.hh"
 
-#include "api/api.hh"
-
+#include <rapidjson/document.h>
+#include <boost/lexical_cast.hpp>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/metrics_api.hh>
 #include <seastar/core/relabel_config.hh>
 #include <seastar/http/exception.hh>
 #include <seastar/util/short_streams.hh>
 #include <seastar/http/short_streams.hh>
-#include "utils/rjson.hh"
 
-#include "log.hh"
-#include "replica/database.hh"
+#include "utils/log.hh"
 
 extern logging::logger apilog;
 
@@ -29,6 +30,10 @@ using namespace seastar::httpd;
 
 namespace hs = httpd::system_json;
 namespace hm = httpd::metrics_json;
+
+extern "C" void __attribute__((weak)) __llvm_profile_dump();
+extern "C" const char * __attribute__((weak)) __llvm_profile_get_filename();
+extern "C" void __attribute__((weak)) __llvm_profile_reset_counters();
 
 void set_system(http_context& ctx, routes& r) {
     hm::get_metrics_config.set(r, [](const_req req) {
@@ -119,9 +124,9 @@ void set_system(http_context& ctx, routes& r) {
 
     hs::get_logger_level.set(r, [](const_req req) {
         try {
-            return logging::level_name(logging::logger_registry().get_logger_level(req.param["name"]));
+            return logging::level_name(logging::logger_registry().get_logger_level(req.get_path_param("name")));
         } catch (std::out_of_range& e) {
-            throw bad_param_exception("Unknown logger name " + req.param["name"]);
+            throw bad_param_exception("Unknown logger name " + req.get_path_param("name"));
         }
         // just to keep the compiler happy
         return sstring();
@@ -130,9 +135,9 @@ void set_system(http_context& ctx, routes& r) {
     hs::set_logger_level.set(r, [](const_req req) {
         try {
             logging::log_level level = boost::lexical_cast<logging::log_level>(std::string(req.get_query_param("level")));
-            logging::logger_registry().set_logger_level(req.param["name"], level);
+            logging::logger_registry().set_logger_level(req.get_path_param("name"), level);
         } catch (std::out_of_range& e) {
-            throw bad_param_exception("Unknown logger name " + req.param["name"]);
+            throw bad_param_exception("Unknown logger name " + req.get_path_param("name"));
         } catch (boost::bad_lexical_cast& e) {
             throw bad_param_exception("Unknown logging level " + req.get_query_param("level"));
         }
@@ -158,6 +163,39 @@ void set_system(http_context& ctx, routes& r) {
             return json::json_return_type(json::json_void());
         });
     });
+
+    hs::dump_profile.set(r, [](std::unique_ptr<request> req) {
+        if (!__llvm_profile_dump) {
+            apilog.info("Profile will not be dumped, executable is not instrumented with profile dumping.");
+            return make_ready_future<json::json_return_type>(json::json_return_type(json::json_void()));
+        }
+        sstring profile_dest(__llvm_profile_get_filename ? __llvm_profile_get_filename() : "disk");
+        apilog.info("Dumping profile to {}", profile_dest);
+        __llvm_profile_dump();
+        if (__llvm_profile_reset_counters) {
+            // If counters are not reset the profile dumping mechanism will issue a warning and exit
+            // next time it is attempted. If the counters are reset, profiles can be accumulated
+            // (if %m is present in LLVM_PROFILE_FILE pattern) so it can be dumped in stages or
+            // multiple times during runtime.
+            __llvm_profile_reset_counters();
+        } else {
+            apilog.warn("Could not reset profile counters, profile dumping will be skipped next time it is attempted");
+        }
+        apilog.info("Profile dumped to {}", profile_dest);
+        return make_ready_future<json::json_return_type>(json::json_return_type(json::json_void()));
+    }) ;
+}
+
+void set_format_selector(http_context& ctx, routes& r, db::sstables_format_selector& sel) {
+    hs::get_highest_supported_sstable_version.set(r, [&sel] (std::unique_ptr<request> req) {
+        return smp::submit_to(0, [&sel] {
+            return make_ready_future<json::json_return_type>(seastar::to_sstring(sel.selected_format()));
+        });
+    });
+}
+
+void unset_format_selector(http_context& ctx, routes& r) {
+    hs::get_highest_supported_sstable_version.unset(r);
 }
 
 }

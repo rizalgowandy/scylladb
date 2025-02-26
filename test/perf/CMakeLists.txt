@@ -13,7 +13,7 @@ function(add_perf_test name)
     PRIVATE
       perf-lib
       test-lib
-      seastar_perf_testing
+      Seastar::seastar_perf_testing
       Seastar::seastar
       xxHash::xxhash)
   if(parsed_args_LIBRARIES)
@@ -26,11 +26,13 @@ endfunction()
 add_library(test-perf STATIC)
 target_sources(test-perf
   PRIVATE
+    perf_alternator.cc
     perf_fast_forward.cc
     perf_row_cache_update.cc
     perf_simple_query.cc
     perf_sstable.cc
     perf_tablets.cc
+    tablet_load_balancing.cc
     perf.cc)
 target_include_directories(test-perf
   PUBLIC
@@ -90,3 +92,4 @@ add_perf_test(perf_mutation_fragment)
 add_perf_test(perf_vint)
 add_perf_test(perf_row_cache_reads)
 add_perf_test(perf_s3_client)
+add_perf_test(perf_sort_by_proximity)

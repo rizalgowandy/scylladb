@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #define BOOST_TEST_MODULE observable_test
@@ -13,7 +13,6 @@
 #include <numeric>
 
 #include "utils/observable.hh"
-#include "utils/updateable_value.hh"
 
 using namespace utils;
 

@@ -3,13 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 // Test Raft library with many candidates
 //
 // Using slower but precise clock
 
+#include <fmt/std.h>
 #include "replication.hh"
 
 #ifdef SEASTAR_DEBUG

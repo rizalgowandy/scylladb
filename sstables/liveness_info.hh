@@ -4,14 +4,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "timestamp.hh"
 #include "gc_clock.hh"
-#include "sstables/m_format_read_helpers.hh"
 #include "sstables/types.hh"
 #include "mutation/mutation_partition.hh"
 

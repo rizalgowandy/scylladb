@@ -3,13 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <string_view>
 #include <boost/algorithm/string.hpp>
-#include "locator/token_metadata.hh"
-#include "utils/to_string.hh"
+#include "locator/topology.hh"
+#include "gms/inet_address.hh"
 #include "host_filter.hh"
 
 namespace db {
@@ -28,7 +28,7 @@ host_filter::host_filter(std::unordered_set<sstring> allowed_dcs)
         , _dcs(std::move(allowed_dcs)) {
 }
 
-bool host_filter::can_hint_for(const locator::topology& topo, gms::inet_address ep) const {
+bool host_filter::can_hint_for(const locator::topology& topo, endpoint_id ep) const {
     switch (_enabled_kind) {
     case enabled_kind::enabled_for_all:
         return true;
@@ -100,16 +100,17 @@ std::string_view host_filter::enabled_kind_to_string(host_filter::enabled_kind e
     throw std::logic_error("Uncovered variant of enabled_kind");
 }
 
-std::ostream& operator<<(std::ostream& os, const host_filter& f) {
-    fmt::print(os, "host_filter{{enabled_kind={}",
+}
+}
+
+auto fmt::formatter<db::hints::host_filter>::format(const db::hints::host_filter& f, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    using db::hints::host_filter;
+    auto out = ctx.out();
+    out = fmt::format_to(out, "host_filter{{enabled_kind={}",
                host_filter::enabled_kind_to_string(f._enabled_kind));
     if (f._enabled_kind == host_filter::enabled_kind::enabled_selectively) {
-        fmt::print(os, ", dcs={{{}}}", fmt::join(f._dcs, ","));
+        out = fmt::format_to(out, ", dcs={{{}}}", fmt::join(f._dcs, ","));
     }
-    fmt::print(os, "}}");
-    return os;
+    return fmt::format_to(out, "}}");
 }
-
-}
-}
-

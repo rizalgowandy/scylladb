@@ -1,6 +1,6 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests of LSI (Local Secondary Indexes)
 #
@@ -8,10 +8,14 @@
 # need to create new tables and/or new LSIs of different types, operations
 # which are extremely slow in DynamoDB, often taking minutes (!).
 
-import pytest
 import time
+
+import pytest
+import requests
 from botocore.exceptions import ClientError
-from util import create_test_table, new_test_table, random_string, full_scan, full_query, multiset, list_tables
+
+from test.alternator.util import create_test_table, new_test_table, random_string, full_scan, full_query, multiset
+
 
 # LSIs support strongly-consistent reads, so the following functions do not
 # need to retry like we did in test_gsi.py for GSIs:
@@ -244,13 +248,21 @@ def test_lsi_describe(test_table_lsi_4):
         assert lsi['IndexArn'] == desc['Table']['TableArn'] + '/index/' + lsi['IndexName']
         assert lsi['Projection'] == {'ProjectionType': 'ALL'}
 
+# Whereas GSIs have an IndexStatus when described by DescribeTable,
+# LSIs do not. IndexStatus is not needed because LSIs cannot be added
+# after the base table is created.
+def test_lsi_describe_indexstatus(test_table_lsi_1):
+    desc = test_table_lsi_1.meta.client.describe_table(TableName=test_table_lsi_1.name)
+    assert 'Table' in desc
+    assert 'LocalSecondaryIndexes' in desc['Table']
+    lsis = desc['Table']['LocalSecondaryIndexes']
+    assert len(lsis) == 1
+    lsi = lsis[0]
+    assert not 'IndexStatus' in lsi
+
 # In addition to the basic listing of an LSI in DescribeTable tested above,
 # in this test we check additional fields that should appear in each LSI's
 # description.
-# Note that whereas GSIs also have IndexStatus and ProvisionedThroughput
-# fields, LSIs do not. IndexStatus is not needed because LSIs cannot be
-# added after the base table is created, and ProvisionedThroughput isn't
-# needed because an LSI shares its provisioning with the base table.
 @pytest.mark.xfail(reason="issues #7550, #11466")
 def test_lsi_describe_fields(test_table_lsi_1):
     desc = test_table_lsi_1.meta.client.describe_table(TableName=test_table_lsi_1.name)
@@ -262,7 +274,8 @@ def test_lsi_describe_fields(test_table_lsi_1):
     assert lsi['IndexName'] == 'hello'
     assert 'IndexSizeBytes' in lsi     # actual size depends on content
     assert 'ItemCount' in lsi
-    assert not 'IndexStatus' in lsi
+    # Whereas GSIs has ProvisionedThroughput, LSIs do not. An LSI shares
+    # its provisioning with the base table.
     assert not 'ProvisionedThroughput' in lsi
     assert lsi['KeySchema'] == [{'KeyType': 'HASH', 'AttributeName': 'p'},
                                 {'KeyType': 'RANGE', 'AttributeName': 'b'}]
@@ -538,3 +551,63 @@ def test_lsi_and_gsi_same_name(dynamodb):
                 }
             ])
         table.delete()
+
+# Test that the LSI table can be addressed in Scylla's REST API (obviously,
+# since this test is for the REST API, it is Scylla-only and can't be run on
+# DynamoDB).
+# At the time this test was written, the LSI's name has a "!" in it, so this
+# test reproduces a bug in URL decoding (#5883). But the goal of this test
+# isn't to insist that a table backing an LSI must have a specific name,
+# but rather that whatever name it does have - it can be addressed.
+def test_lsi_name_rest_api(test_table_lsi_1, rest_api):
+    # See that the LSI is listed in list of tables. It will be a table
+    # whose CQL name contains the Alternator table's name, and the
+    # LSI's name ('hello'). As of this writing, it will actually be
+    # alternator_<name>:<name>!:<lsi> - but the test doesn't enshrine this.
+    resp = requests.get(f'{rest_api}/column_family/name')
+    resp.raise_for_status()
+    lsi_rest_name = None
+    for name in resp.json():
+        if test_table_lsi_1.name in name and 'hello' in name:
+            lsi_rest_name = name
+            break
+    assert lsi_rest_name
+    # Attempt to run a request on this LSI's table name "lsi_rest_name".
+    # We'll use the compaction_strategy request here, but if for some
+    # reason in the future we decide to drop that request, any other
+    # request will be fine.
+    resp = requests.get(f'{rest_api}/column_family/compaction_strategy/{lsi_rest_name}')
+    resp.raise_for_status()
+    # Let's make things difficult for the server by URL encoding the
+    # lsi_rest_name - exposing issue #5883.
+    encoded_lsi_rest_name = requests.utils.quote(lsi_rest_name)
+    resp = requests.get(f'{rest_api}/column_family/compaction_strategy/{encoded_lsi_rest_name}')
+    resp.raise_for_status()
+
+# Test that when a table has an LSI, then if the indexed attribute is
+# missing, the item is added to the base table but not the index.
+def test_lsi_missing_attribute(test_table_lsi_1):
+    p1 = random_string()
+    c1 = random_string()
+    b1 = random_string()
+    p2 = random_string()
+    c2 = random_string()
+    test_table_lsi_1.put_item(Item={'p':  p1, 'c': c1, 'b': b1})
+    test_table_lsi_1.put_item(Item={'p':  p2, 'c': c2})  # missing b
+
+    # Both items are now in the base table:
+    assert test_table_lsi_1.get_item(Key={'p': p1, 'c': c1}, ConsistentRead=True)['Item'] == {'p': p1, 'c': c1, 'b': b1}
+    assert test_table_lsi_1.get_item(Key={'p': p2, 'c': c2}, ConsistentRead=True)['Item'] == {'p': p2, 'c': c2}
+
+    # But only the first item is in the index: The first item can be found
+    # using a Query, and a scan of the index won't find the second item.
+    # Note: with eventually consistent read, we can't really be sure that
+    # the second item will "never" appear in the index. We do that read last,
+    # so if we had a bug and such item did appear, hopefully we had enough
+    # time for the bug to become visible. At least sometimes.
+    assert_index_query(test_table_lsi_1, 'hello', [{'p': p1, 'c': c1, 'b': b1}],
+        KeyConditions={
+            'p': {'AttributeValueList': [p1], 'ComparisonOperator': 'EQ'},
+            'b': {'AttributeValueList': [b1], 'ComparisonOperator': 'EQ'},
+        })
+    assert not any([i['p'] == p2 and i['c'] == c2 for i in full_scan(test_table_lsi_1, ConsistentRead=False, IndexName='hello')])

@@ -5,12 +5,11 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
-#include <type_traits>
 #include "service/migration_listener.hh"
 #include "gms/endpoint_state.hh"
 #include <seastar/core/distributed.hh>
@@ -24,6 +23,7 @@
 #include "utils/serialized_action.hh"
 #include "service/raft/raft_group_registry.hh"
 #include "service/raft/raft_group0_client.hh"
+#include "db/timeout_clock.hh"
 
 #include <vector>
 
@@ -56,7 +56,7 @@ class migration_manager : public seastar::async_sharded_service<migration_manage
 private:
     migration_notifier& _notifier;
 
-    std::unordered_map<netw::msg_addr, serialized_action, netw::msg_addr::hash> _schema_pulls;
+    std::unordered_map<locator::host_id, serialized_action> _schema_pulls;
     serialized_action _group0_barrier;
     std::vector<gms::feature::listener_registration> _feature_listeners;
     seastar::gate _background_tasks;
@@ -95,25 +95,31 @@ public:
     const migration_notifier& get_notifier() const { return _notifier; }
     service::storage_proxy& get_storage_proxy() { return _storage_proxy; }
     const service::storage_proxy& get_storage_proxy() const { return _storage_proxy; }
+    const service::raft_group0_client& get_group0_client() const { return _group0_client; }
+    abort_source& get_abort_source() noexcept { return _as; }
+    const abort_source& get_abort_source() const noexcept { return _as; }
+    serialized_action& get_group0_barrier() noexcept { return _group0_barrier; }
+    const serialized_action& get_group0_barrier() const noexcept { return _group0_barrier; }
+    bool use_raft() const noexcept { return !_enable_schema_pulls; }
 
     // Disable schema pulls when Raft group 0 is fully responsible for managing schema.
     future<> disable_schema_pulls();
 
-    future<> submit_migration_task(const gms::inet_address& endpoint, bool can_ignore_down_node = true);
+    future<> submit_migration_task(locator::host_id endpoint, bool can_ignore_down_node = true);
 
     // Makes sure that this node knows about all schema changes known by "nodes" that were made prior to this call.
-    future<> sync_schema(const replica::database& db, const std::vector<gms::inet_address>& nodes);
+    future<> sync_schema(const replica::database& db, const std::vector<locator::host_id>& nodes);
 
     // Fetches schema from remote node and applies it locally.
     // Differs from submit_migration_task() in that all errors are propagated.
     // Coalesces requests.
-    future<> merge_schema_from(netw::msg_addr);
-    future<> do_merge_schema_from(netw::msg_addr);
+    future<> merge_schema_from(locator::host_id);
+    future<> do_merge_schema_from(locator::host_id);
     future<> reload_schema();
 
     // Merge mutations received from src.
     // Keep mutations alive around whole async operation.
-    future<> merge_schema_from(netw::msg_addr src, const std::vector<canonical_mutation>& mutations);
+    future<> merge_schema_from(locator::host_id src, const std::vector<canonical_mutation>& mutations);
     // Incremented each time the function above is called. Needed by tests.
     size_t canonical_mutation_merge_count = 0;
 
@@ -132,6 +138,7 @@ public:
 
     // Apply a group 0 change.
     // The future resolves after the change is applied locally.
+    template<typename mutation_type = schema_change>
     future<> announce(std::vector<mutation> schema, group0_guard, std::string_view description);
 
     void passive_announce(table_schema_version version);
@@ -152,43 +159,54 @@ private:
     void init_messaging_service();
     future<> uninit_messaging_service();
 
-    future<> push_schema_mutation(const gms::inet_address& endpoint, const std::vector<mutation>& schema);
+    future<> push_schema_mutation(locator::host_id endpoint, const std::vector<mutation>& schema);
 
     future<> passive_announce();
 
-    void schedule_schema_pull(const gms::inet_address& endpoint, const gms::endpoint_state& state);
+    void schedule_schema_pull(locator::host_id endpoint, const gms::endpoint_state& state);
 
-    future<> maybe_schedule_schema_pull(const table_schema_version& their_version, const gms::inet_address& endpoint);
+    future<> maybe_schedule_schema_pull(const table_schema_version& their_version, locator::host_id endpoint);
 
+    template<typename mutation_type = schema_change>
     future<> announce_with_raft(std::vector<mutation> schema, group0_guard, std::string_view description);
     future<> announce_without_raft(std::vector<mutation> schema, group0_guard);
 
 public:
-    future<> maybe_sync(const schema_ptr& s, netw::msg_addr endpoint);
+    future<> maybe_sync(const schema_ptr& s, locator::host_id endpoint);
 
     // Returns schema of given version, either from cache or from remote node identified by 'from'.
     // The returned schema may not be synchronized. See schema::is_synced().
     // Intended to be used in the read path.
-    future<schema_ptr> get_schema_for_read(table_schema_version, netw::msg_addr from, netw::messaging_service& ms, abort_source& as);
+    future<schema_ptr> get_schema_for_read(table_schema_version, locator::host_id from, unsigned shard, netw::messaging_service& ms, abort_source& as);
 
     // Returns schema of given version, either from cache or from remote node identified by 'from'.
     // Ensures that this node is synchronized with the returned schema. See schema::is_synced().
     // Intended to be used in the write path, which relies on synchronized schema.
-    future<schema_ptr> get_schema_for_write(table_schema_version, netw::msg_addr from, netw::messaging_service& ms, abort_source& as);
+    future<schema_ptr> get_schema_for_write(table_schema_version, locator::host_id from, unsigned shard, netw::messaging_service& ms, abort_source& as);
 
 private:
     virtual future<> on_join(gms::inet_address endpoint, gms::endpoint_state_ptr ep_state, gms::permit_id) override;
-    virtual future<> on_change(gms::inet_address endpoint, gms::application_state state, const gms::versioned_value& value, gms::permit_id) override;
+    virtual future<> on_change(gms::inet_address endpoint, const gms::application_state_map& states, gms::permit_id) override;
     virtual future<> on_alive(gms::inet_address endpoint, gms::endpoint_state_ptr state, gms::permit_id) override;
     virtual future<> on_dead(gms::inet_address endpoint, gms::endpoint_state_ptr state, gms::permit_id) override { return make_ready_future(); }
     virtual future<> on_remove(gms::inet_address endpoint, gms::permit_id) override { return make_ready_future(); }
     virtual future<> on_restart(gms::inet_address endpoint, gms::endpoint_state_ptr state, gms::permit_id) override { return make_ready_future(); }
-    virtual future<> before_change(gms::inet_address endpoint, gms::endpoint_state_ptr current_state, gms::application_state new_statekey, const gms::versioned_value& newvalue) override { return make_ready_future(); }
 
 public:
     // For tests only.
     void set_concurrent_ddl_retries(size_t);
 };
+
+extern template
+future<> migration_manager::announce_with_raft<schema_change>(std::vector<mutation> schema, group0_guard, std::string_view description);
+extern template
+future<> migration_manager::announce_with_raft<topology_change>(std::vector<mutation> schema, group0_guard, std::string_view description);
+
+extern template
+future<> migration_manager::announce<schema_change>(std::vector<mutation> schema, group0_guard, std::string_view description);
+extern template
+future<> migration_manager::announce<topology_change>(std::vector<mutation> schema, group0_guard, std::string_view description);
+
 
 future<column_mapping> get_column_mapping(db::system_keyspace& sys_ks, table_id, table_schema_version v);
 
@@ -199,7 +217,7 @@ std::vector<mutation> prepare_new_keyspace_announcement(replica::database& db, l
 // The timestamp parameter can be used to ensure that all nodes update their internal tables' schemas
 // with identical timestamps, which can prevent an undeeded schema exchange
 future<std::vector<mutation>> prepare_column_family_update_announcement(storage_proxy& sp,
-        schema_ptr cfm, bool from_thrift, std::vector<view_ptr> view_updates, api::timestamp_type ts);
+        schema_ptr cfm, std::vector<view_ptr> view_updates, api::timestamp_type ts);
 
 future<std::vector<mutation>> prepare_new_column_family_announcement(storage_proxy& sp, schema_ptr cfm, api::timestamp_type timestamp);
 // The ksm parameter can describe a keyspace that hasn't been created yet.

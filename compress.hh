@@ -3,20 +3,19 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <map>
+#include <optional>
 #include <set>
 
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
-
-#include "exceptions/exceptions.hh"
-
+#include "seastarx.hh"
 
 class compressor {
     sstring _name;
@@ -70,7 +69,7 @@ public:
     static thread_local const ptr_type snappy;
     static thread_local const ptr_type deflate;
 
-    static const sstring namespace_prefix;
+    static sstring make_name(std::string_view short_name);
 };
 
 template<typename BaseType, typename... Args>

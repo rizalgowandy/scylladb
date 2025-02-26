@@ -3,14 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "api/api-doc/authorization_cache.json.hh"
 
 #include "api/authorization_cache.hh"
-#include "api/api.hh"
-#include "auth/common.hh"
 #include "auth/service.hh"
 
 namespace api {

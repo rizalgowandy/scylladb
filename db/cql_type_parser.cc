@@ -4,11 +4,10 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 #include <unordered_map>
-#include <boost/range/adaptor/map.hpp>
-#include <boost/range/adaptor/sliced.hpp>
+#include <seastar/coroutine/maybe_yield.hh>
 
 #include "replica/database.hh"
 #include "cql3/CqlParser.hpp"
@@ -16,9 +15,12 @@
 #include "cql_type_parser.hh"
 #include "types/types.hh"
 #include "data_dictionary/user_types_metadata.hh"
+#include "utils/sorting.hh"
 
 static ::shared_ptr<cql3::cql3_type::raw> parse_raw(const sstring& str) {
-    return cql3::util::do_with_parser(str,
+    // In general it's a bad idea to use the default dialect, but type parsing
+    // should be dialect-agnostic.
+    return cql3::util::do_with_parser(str, cql3::dialect{},
         [] (cql3_parser::CqlParser& parser) {
             return parser.comparator_type(true);
         });
@@ -85,67 +87,47 @@ public:
     }
 
     // See cassandra Types.java
-    std::vector<user_type> build() {
+    future<std::vector<user_type>> build() {
+        struct entry_comparator {
+            inline bool operator()(const entry* a, const entry* b) const {
+                return a->name < b->name;
+            }
+        };
+
         if (_definitions.empty()) {
-            return {};
+            co_return std::vector<user_type>();
         }
 
         /*
          * build a DAG of UDT dependencies
          */
-        std::unordered_multimap<entry *, entry *> adjacency;
+        std::vector<entry *> all_definitions;
+        std::multimap<entry *, entry *, entry_comparator> adjacency;
         for (auto& e1 : _definitions) {
+            all_definitions.emplace_back(&e1);
             for (auto& e2 : _definitions) {
                 if (&e1 != &e2 && std::any_of(e1.field_types.begin(), e1.field_types.end(), [&e2](auto& t) { return t->references_user_type(e2.name); })) {
                     adjacency.emplace(&e2, &e1);
                 }
             }
-        }
-        /*
-         * resolve dependencies in topological order, using Kahn's algorithm
-         */
-        std::unordered_map<entry *, int32_t> vertices; // map values are numbers of referenced types
-        for (auto&p : adjacency) {
-            vertices[p.second]++;
-        }
-
-        std::deque<entry *> resolvable_types;
-        for (auto& e : _definitions) {
-            if (!vertices.contains(&e)) {
-                resolvable_types.emplace_back(&e);
-            }
+            co_await coroutine::maybe_yield();
         }
 
         // Create a copy of the existing types, so that we don't
         // modify the one in the keyspace. It is up to the caller to
         // do that.
         replica::user_types_metadata types = _ks.user_types();
-
         const auto &ks_name = _ks.name();
+
+        auto sorted = co_await utils::topological_sort(all_definitions, adjacency);
         std::vector<user_type> created;
+        created.reserve(sorted.size());
 
-        while (!resolvable_types.empty()) {
-            auto* e =  resolvable_types.front();
-            auto r = adjacency.equal_range(e);
-
-            while (r.first != r.second) {
-                auto* d = r.first->second;
-                if (--vertices[d] == 0) {
-                    resolvable_types.push_back(d);
-                }
-                ++r.first;
-            }
-
+        for (auto* e : sorted) {
             created.push_back(e->prepare(ks_name, types));
             types.add_type(created.back());
-            resolvable_types.pop_front();
         }
-
-        if (created.size() != _definitions.size()) {
-            throw exceptions::configuration_exception(format("Cannot resolve UDTs for keyspace {}: some types are missing", ks_name));
-        }
-
-        return created;
+        co_return created;
     }
 private:
     data_dictionary::keyspace_metadata& _ks;
@@ -163,6 +145,6 @@ void db::cql_type_parser::raw_builder::add(sstring name, std::vector<sstring> fi
     _impl->add(std::move(name), std::move(field_names), std::move(field_types));
 }
 
-std::vector<user_type> db::cql_type_parser::raw_builder::build() {
+future<std::vector<user_type>> db::cql_type_parser::raw_builder::build() {
     return _impl->build();
 }

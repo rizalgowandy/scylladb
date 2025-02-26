@@ -3,10 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
+#include "utils/assert.hh"
 #include <seastar/core/seastar.hh>
 #include <seastar/core/posix.hh>
 #include <unistd.h>
@@ -30,9 +31,9 @@ public:
         if (!_path.empty()) {
             ::unlink(_path.c_str());
         }
-        assert(_fd.get() != -1);
+        SCYLLA_ASSERT(_fd.get() != -1);
         auto r = ::lockf(_fd.get(), F_ULOCK, 0);
-        assert(r == 0);
+        SCYLLA_ASSERT(r == 0);
     }
     fs::path _path;
     file_desc _fd;
@@ -61,8 +62,4 @@ future<utils::file_lock> utils::file_lock::acquire(fs::path path) {
     } catch (...) {
         return make_exception_future<utils::file_lock>(std::current_exception());
     }
-}
-
-std::ostream& utils::operator<<(std::ostream& out, const file_lock& f) {
-    return out << "file lock '" << f.path() << "'";
 }

@@ -17,6 +17,8 @@
 # under the License.
 #
 
+trap 'echo "error $? in $0 line $LINENO"' ERR
+
 # os-release may be missing in container environment by default.
 if [ -f "/etc/os-release" ]; then
     . /etc/os-release
@@ -30,6 +32,8 @@ fi
 debian_base_packages=(
     clang
     gdb
+    cargo
+    wabt
     liblua5.3-dev
     python3-aiohttp
     python3-pyparsing
@@ -38,16 +42,18 @@ debian_base_packages=(
     libsnappy-dev
     libjsoncpp-dev
     rapidjson-dev
-    scylla-libthrift010-dev
     scylla-antlr35-c++-dev
-    thrift-compiler
     git
     pigz
     libunistring-dev
     libzstd-dev
     libdeflate-dev
-    libabsl-dev
     librapidxml-dev
+    libcrypto++-dev
+    libxxhash-dev
+    slapd
+    ldap-utils
+    libcpp-jwt-dev
 )
 
 fedora_packages=(
@@ -58,7 +64,6 @@ fedora_packages=(
     gdb
     lua-devel
     yaml-cpp-devel
-    thrift-devel
     antlr3-tool
     antlr3-C++-devel
     jsoncpp-devel
@@ -66,8 +71,9 @@ fedora_packages=(
     snappy-devel
     libdeflate-devel
     systemd-devel
-    abseil-cpp-devel
+    cryptopp-devel
     git
+    git-lfs
     python
     sudo
     patchelf
@@ -84,6 +90,8 @@ fedora_packages=(
     python3-unidiff
     python3-humanfriendly
     python3-jinja2
+    python3-deepdiff
+    python3-cryptography
     dnf-utils
     pigz
     net-tools
@@ -97,6 +105,7 @@ fedora_packages=(
     xxhash-devel
     makeself
     libzstd-static libzstd-devel
+    lz4-static lz4-devel
     rpm-build
     devscripts
     debhelper
@@ -107,10 +116,22 @@ fedora_packages=(
     rust
     cargo
     rapidxml-devel
-    rust-std-static-wasm32-wasi
+    rust-std-static-wasm32-wasip1
     wabt
     binaryen
     lcov
+    java-11-openjdk-devel # for tools/java
+
+    llvm-bolt
+    moreutils
+    iproute
+    llvm
+    openldap-servers
+    openldap-devel
+    toxiproxy
+    cyrus-sasl
+    fipscheck
+    cpp-jwt-devel
 )
 
 # lld is not available on s390x, see
@@ -124,7 +145,6 @@ fedora_python3_packages=(
     python3-urwid
     python3-pyparsing
     python3-requests
-    python3-pyudev
     python3-setuptools
     python3-psutil
     python3-distro
@@ -135,11 +155,16 @@ fedora_python3_packages=(
 
 # an associative array from packages to constrains
 declare -A pip_packages=(
-    [scylla-driver]=
+    [scylla-driver]=""
     [geomet]="<0.3,>=0.1"
-    [traceback-with-variables]=
-    [scylla-api-client]=
-    [treelib]=
+    [traceback-with-variables]=""
+    [scylla-api-client]=""
+    [treelib]=""
+    [allure-pytest]=""
+    [pytest-xdist]=""
+    [pykmip]=""
+    [universalasync]=""
+    [boto3-stubs[dynamodb]]=""
 )
 
 pip_symlinks=(
@@ -149,7 +174,6 @@ pip_symlinks=(
 centos_packages=(
     gdb
     yaml-cpp-devel
-    thrift-devel
     scylla-antlr35-tool
     scylla-antlr35-C++-devel
     jsoncpp-devel snappy-devel
@@ -158,6 +182,9 @@ centos_packages=(
     scylla-python34-pyparsing20
     systemd-devel
     pigz
+    openldap-servers
+    openldap-devel
+    cpp-jwt-devel
 )
 
 # 1) glibc 2.30-3 has sys/sdt.h (systemtap include)
@@ -181,11 +208,10 @@ arch_packages=(
     python3
     rapidjson
     snappy
-    thrift
 )
 
 go_arch() {
-    declare -A local GO_ARCH=(
+    local -A GO_ARCH=(
         ["x86_64"]=amd64
         ["aarch64"]=arm64
         ["s390x"]=s390x
@@ -193,11 +219,11 @@ go_arch() {
     echo ${GO_ARCH["$(arch)"]}
 }
 
-NODE_EXPORTER_VERSION=1.7.0
+NODE_EXPORTER_VERSION=1.9.0
 declare -A NODE_EXPORTER_CHECKSUM=(
-    ["x86_64"]=a550cd5c05f760b7934a2d0afad66d2e92e681482f5f57a917465b1fba3b02a6
-    ["aarch64"]=e386c7b53bc130eaf5e74da28efc6b444857b77df8070537be52678aefd34d96
-    ["s390x"]=aeda68884918f10b135b76bbcd4977cb7a1bb3c4c98a8551f8d2183bafdd9264
+    ["x86_64"]=e7b65ea30eec77180487d518081d3dcb121b975f6d95f1866dfb9156c5b24075
+    ["aarch64"]=5314fae1efff19abf807cfc8bd7dadbd47a35565c1043c236ffb0689dc15ef4f
+    ["s390x"]=089d2c2f87b4d716dd5ff006b89ab4424e7917f67830a8dd580d528f1d99ca58
 )
 NODE_EXPORTER_DIR=/opt/scylladb/dependencies
 
@@ -300,8 +326,9 @@ if $PRINT_NODE_EXPORTER; then
     exit 0
 fi
 
+umask 0022
+
 ./seastar/install-dependencies.sh
-./tools/jmx/install-dependencies.sh
 ./tools/java/install-dependencies.sh
 
 if [ "$ID" = "ubuntu" ] || [ "$ID" = "debian" ]; then
@@ -315,8 +342,11 @@ if [ "$ID" = "ubuntu" ] || [ "$ID" = "debian" ]; then
     else
         apt-get -y install libsystemd-dev antlr3 libyaml-cpp-dev
     fi
-    echo -e "Configure example:\n\t./configure.py --enable-dpdk --mode=release --static-thrift --static-boost --static-yaml-cpp --compiler=/opt/scylladb/bin/g++-7 --cflags=\"-I/opt/scylladb/include -L/opt/scylladb/lib/x86-linux-gnu/\" --ldflags=\"-Wl,-rpath=/opt/scylladb/lib\""
+    apt-get -y install libssl-dev
+
+    echo -e "Configure example:\n\t./configure.py --enable-dpdk --mode=release --static-boost --static-yaml-cpp --compiler=/opt/scylladb/bin/g++-7 --cflags=\"-I/opt/scylladb/include -L/opt/scylladb/lib/x86-linux-gnu/\" --ldflags=\"-Wl,-rpath=/opt/scylladb/lib\""
 elif [ "$ID" = "fedora" ]; then
+    fedora_packages+=(openssl-devel)
     if rpm -q --quiet yum-utils; then
         echo
         echo "This script will install dnf-utils package, witch will conflict with currently installed package: yum-utils"
@@ -326,13 +356,12 @@ elif [ "$ID" = "fedora" ]; then
     dnf install -y "${fedora_packages[@]}" "${fedora_python3_packages[@]}"
     PIP_DEFAULT_ARGS="--only-binary=:all: -v"
     pip_constrained_packages=""
-    for package in ${!pip_packages[@]}
+    for package in "${!pip_packages[@]}"
     do
         pip_constrained_packages="${pip_constrained_packages} ${package}${pip_packages[$package]}"
     done
-    pip3 install "$PIP_DEFAULT_ARGS" $pip_constrained_packages
+    pip3 install --upgrade "$PIP_DEFAULT_ARGS" $pip_constrained_packages
 
-    cargo --config net.git-fetch-with-cli=true install cxxbridge-cmd --root /usr/local
     if [ -f "$(node_exporter_fullpath)" ] && node_exporter_checksum; then
         echo "$(node_exporter_filename) already exists, skipping download"
     else
@@ -344,6 +373,7 @@ elif [ "$ID" = "fedora" ]; then
         fi
     fi
 elif [ "$ID" = "centos" ]; then
+    centos_packages+=(openssl-devel)
     dnf install -y "${centos_packages[@]}"
     echo -e "Configure example:\n\tpython3.4 ./configure.py --enable-dpdk --mode=release --static-boost --compiler=/opt/scylladb/bin/g++-7.3 --python python3.4 --ldflag=-Wl,-rpath=/opt/scylladb/lib64 --cflags=-I/opt/scylladb/include --with-antlr3=/opt/scylladb/bin/antlr3"
 elif [ "$ID" == "arch" ]; then
@@ -383,6 +413,8 @@ elif [ "$ID" == "arch" ]; then
     fi
     echo -e "Configure example:\n\t./configure.py\n\tninja release"
 fi
+
+cargo --config net.git-fetch-with-cli=true install cxxbridge-cmd --root /usr/local
 
 CURL_ARGS=$(minio_download_jobs)
 if [ ! -z "${CURL_ARGS}" ]; then

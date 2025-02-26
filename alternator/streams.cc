@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <type_traits>
@@ -13,8 +13,7 @@
 
 #include <seastar/json/formatter.hh>
 
-#include "utils/base64.hh"
-#include "log.hh"
+#include "auth/permission.hh"
 #include "db/config.hh"
 
 #include "cdc/log.hh"
@@ -25,7 +24,6 @@
 #include "utils/UUID_gen.hh"
 #include "cql3/selection/selection.hh"
 #include "cql3/result_set.hh"
-#include "cql3/type_json.hh"
 #include "cql3/column_identifier.hh"
 #include "schema/schema_builder.hh"
 #include "service/storage_proxy.hh"
@@ -33,7 +31,6 @@
 #include "gms/feature_service.hh"
 
 #include "executor.hh"
-#include "rmw_operation.hh"
 #include "data_dictionary/data_dictionary.hh"
 
 /**
@@ -237,11 +234,8 @@ struct shard_id {
 
     // dynamo specifies shardid as max 65 chars. 
     friend std::ostream& operator<<(std::ostream& os, const shard_id& id) {
-        boost::io::ios_flags_saver fs(os);
-        return os << marker << std::hex  
-            << id.time.time_since_epoch().count()
-            << ':' << id.id.to_bytes()
-            ;
+        fmt::print(os, "{} {:x}:{}", marker, id.time.time_since_epoch().count(), id.id.to_bytes());
+        return os;
     }
 };
 
@@ -783,7 +777,7 @@ struct event_id {
     cdc::stream_id stream;
     utils::UUID timestamp;
 
-    static const auto marker = 'E';
+    static constexpr auto marker = 'E';
 
     event_id(cdc::stream_id s, utils::UUID ts)
         : stream(s)
@@ -791,10 +785,8 @@ struct event_id {
     {}
     
     friend std::ostream& operator<<(std::ostream& os, const event_id& id) {
-        boost::io::ios_flags_saver fs(os);
-        return os << marker << std::hex << id.stream.to_bytes()
-            << ':' << id.timestamp
-            ;
+        fmt::print(os, "{}{}:{}", marker, id.stream.to_bytes(), id.timestamp);
+        return os;
     }
 };
 }
@@ -827,10 +819,12 @@ future<executor::request_return_type> executor::get_records(client_state& client
     }
 
     if (!schema || !base || !is_alternator_keyspace(schema->ks_name())) {
-        throw api_error::resource_not_found(fmt::to_string(iter.table));
+        co_return api_error::resource_not_found(fmt::to_string(iter.table));
     }
 
     tracing::add_table_name(trace_state, schema->ks_name(), schema->cf_name());
+
+    co_await verify_permission(_enforce_authorization, client_state, schema, auth::permission::SELECT);
 
     db::consistency_level cl = db::consistency_level::LOCAL_QUORUM;
     partition_key pk = iter.shard.id.to_partition_key(*schema);
@@ -850,19 +844,21 @@ future<executor::request_return_type> executor::get_records(client_state& client
     static const bytes op_column_name = cdc::log_meta_column_name_bytes("operation");
     static const bytes eor_column_name = cdc::log_meta_column_name_bytes("end_of_batch");
 
-    std::optional<attrs_to_get> key_names = boost::copy_range<attrs_to_get>(
-        boost::range::join(std::move(base->partition_key_columns()), std::move(base->clustering_key_columns()))
-        | boost::adaptors::transformed([&] (const column_definition& cdef) {
+    std::optional<attrs_to_get> key_names =
+        base->primary_key_columns()
+        | std::views::transform([&] (const column_definition& cdef) {
             return std::make_pair<std::string, attrs_to_get_node>(cdef.name_as_text(), {}); })
-    );
+        | std::ranges::to<attrs_to_get>()
+    ;
     // Include all base table columns as values (in case pre or post is enabled).
     // This will include attributes not stored in the frozen map column
-    std::optional<attrs_to_get> attr_names = boost::copy_range<attrs_to_get>(base->regular_columns()
+    std::optional<attrs_to_get> attr_names = base->regular_columns()
         // this will include the :attrs column, which we will also force evaluating. 
         // But not having this set empty forces out any cdc columns from actual result 
-        | boost::adaptors::transformed([] (const column_definition& cdef) {
+        | std::views::transform([] (const column_definition& cdef) {
             return std::make_pair<std::string, attrs_to_get_node>(cdef.name_as_text(), {}); })
-    );
+        | std::ranges::to<attrs_to_get>()
+    ;
 
     std::vector<const column_definition*> columns;
     columns.reserve(schema->all_columns().size());
@@ -873,10 +869,11 @@ future<executor::request_return_type> executor::get_records(client_state& client
     std::transform(pks.begin(), pks.end(), std::back_inserter(columns), [](auto& c) { return &c; });
     std::transform(cks.begin(), cks.end(), std::back_inserter(columns), [](auto& c) { return &c; });
 
-    auto regular_columns = boost::copy_range<query::column_id_vector>(schema->regular_columns() 
-        | boost::adaptors::filtered([](const column_definition& cdef) { return cdef.name() == op_column_name || cdef.name() == eor_column_name || !cdc::is_cdc_metacolumn_name(cdef.name_as_text()); })
-        | boost::adaptors::transformed([&] (const column_definition& cdef) { columns.emplace_back(&cdef); return cdef.id; })
-    );
+    auto regular_columns = schema->regular_columns()
+        | std::views::filter([](const column_definition& cdef) { return cdef.name() == op_column_name || cdef.name() == eor_column_name || !cdc::is_cdc_metacolumn_name(cdef.name_as_text()); })
+        | std::views::transform([&] (const column_definition& cdef) { columns.emplace_back(&cdef); return cdef.id; })
+        | std::ranges::to<query::column_id_vector>()
+    ;
 
     stream_view_type type = cdc_options_to_steam_view_type(base->cdc_options());
 
@@ -896,7 +893,7 @@ future<executor::request_return_type> executor::get_records(client_state& client
     auto command = ::make_lw_shared<query::read_command>(schema->id(), schema->version(), partition_slice, _proxy.get_max_result_size(partition_slice),
             query::tombstone_limit(_proxy.get_tombstone_limit()), query::row_limit(limit * mul));
 
-    return _proxy.query(schema, std::move(command), std::move(partition_ranges), cl, service::storage_proxy::coordinator_query_options(default_timeout(), std::move(permit), client_state)).then(
+    co_return co_await _proxy.query(schema, std::move(command), std::move(partition_ranges), cl, service::storage_proxy::coordinator_query_options(default_timeout(), std::move(permit), client_state)).then(
             [this, schema, partition_slice = std::move(partition_slice), selection = std::move(selection), start_time = std::move(start_time), limit, key_names = std::move(key_names), attr_names = std::move(attr_names), type, iter, high_ts] (service::storage_proxy::coordinator_query_result qr) mutable {       
         cql3::selection::result_set_builder builder(*selection, gc_clock::now());
         query::result_view::consume(*qr.query_result, partition_slice, cql3::selection::result_set_builder::visitor(builder, *schema, *selection));
@@ -984,7 +981,7 @@ future<executor::request_return_type> executor::get_records(client_state& client
             case cdc::operation::post_image:
             {
                 auto item = rjson::empty_object();
-                describe_single_item(*selection, row, attr_names, item, true);
+                describe_single_item(*selection, row, attr_names, item, nullptr, true);
                 describe_single_item(*selection, row, key_names, item);
                 rjson::add(dynamodb, op == cdc::operation::pre_image ? "OldImage" : "NewImage", std::move(item));
                 break;
@@ -1020,7 +1017,7 @@ future<executor::request_return_type> executor::get_records(client_state& client
             // shard did end, then the next read will have nrecords == 0 and
             // will notice end end of shard and not return NextShardIterator.
             rjson::add(ret, "NextShardIterator", next_iter);
-            _stats.api_operations.get_records_latency.add(std::chrono::steady_clock::now() - start_time);
+            _stats.api_operations.get_records_latency.mark(std::chrono::steady_clock::now() - start_time);
             return make_ready_future<executor::request_return_type>(make_jsonable(std::move(ret)));
         }
 
@@ -1043,7 +1040,7 @@ future<executor::request_return_type> executor::get_records(client_state& client
                 shard_iterator next_iter(iter.table, iter.shard, utils::UUID_gen::min_time_UUID(high_ts.time_since_epoch()), true);
                 rjson::add(ret, "NextShardIterator", iter);
             }
-            _stats.api_operations.get_records_latency.add(std::chrono::steady_clock::now() - start_time);
+            _stats.api_operations.get_records_latency.mark(std::chrono::steady_clock::now() - start_time);
             if (is_big(ret)) {
                 return make_ready_future<executor::request_return_type>(make_streamed(std::move(ret)));
             }
@@ -1061,9 +1058,6 @@ void executor::add_stream_options(const rjson::value& stream_specification, sche
     if (stream_enabled->GetBool()) {
         auto db = sp.data_dictionary();
 
-        if (!db.features().cdc) {
-            throw api_error::validation("StreamSpecification: streams (CDC) feature not enabled in cluster.");
-        }
         if (!db.features().alternator_streams) {
             throw api_error::validation("StreamSpecification: alternator streams feature not enabled in cluster.");
         }

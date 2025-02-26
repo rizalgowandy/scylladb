@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <chrono>
@@ -16,26 +16,26 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/coroutine/maybe_yield.hh>
-#include <boost/multiprecision/cpp_int.hpp>
 
 #include "exceptions/exceptions.hh"
 #include "gms/gossiper.hh"
 #include "gms/inet_address.hh"
 #include "inet_address_vectors.hh"
 #include "locator/abstract_replication_strategy.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "gc_clock.hh"
 #include "replica/database.hh"
+#include "service/client_state.hh"
 #include "service_permit.hh"
 #include "timestamp.hh"
 #include "service/storage_proxy.hh"
 #include "service/pager/paging_state.hh"
 #include "service/pager/query_pagers.hh"
 #include "gms/feature_service.hh"
-#include "sstables/types.hh"
 #include "mutation/mutation.hh"
 #include "types/types.hh"
 #include "types/map.hh"
+#include "utils/assert.hh"
 #include "utils/rjson.hh"
 #include "utils/big_decimal.hh"
 #include "cql3/selection/selection.hh"
@@ -80,6 +80,11 @@ future<executor::request_return_type> executor::update_time_to_live(client_state
         co_return api_error::validation("UpdateTimeToLive requires boolean Enabled");
     }
     bool enabled = v->GetBool();
+    // Alternator TTL doesn't yet work when the table uses tablets (#16567)
+    if (enabled && _proxy.local_db().find_keyspace(schema->ks_name()).get_replication_strategy().uses_tablets()) {
+        co_return api_error::validation("TTL not yet supported on a table using tablets (issue #16567). "
+            "Create a table with the tag 'experimental:initial_tablets' set to 'none' to use vnodes.");
+    }
     v = rjson::find(*spec, "AttributeName");
     if (!v || !v->IsString()) {
         co_return api_error::validation("UpdateTimeToLive requires string AttributeName");
@@ -93,6 +98,7 @@ future<executor::request_return_type> executor::update_time_to_live(client_state
     }
     sstring attribute_name(v->GetString(), v->GetStringLength());
 
+    co_await verify_permission(_enforce_authorization, client_state, schema, auth::permission::ALTER);
     co_await db::modify_tags(_mm, schema->ks_name(), schema->cf_name(), [&](std::map<sstring, sstring>& tags_map) {
         if (enabled) {
             if (tags_map.contains(TTL_TAG_KEY)) {
@@ -308,18 +314,19 @@ static size_t random_offset(size_t min, size_t max) {
 // this range's primary node is down. For this we need to return not just
 // a list of this node's secondary ranges - but also the primary owner of
 // each of those ranges.
-static std::vector<std::pair<dht::token_range, gms::inet_address>> get_secondary_ranges(
+static future<std::vector<std::pair<dht::token_range, locator::host_id>>> get_secondary_ranges(
         const locator::effective_replication_map_ptr& erm,
-        gms::inet_address ep) {
+        locator::host_id ep) {
     const auto& tm = *erm->get_token_metadata_ptr();
     const auto& sorted_tokens = tm.sorted_tokens();
-    std::vector<std::pair<dht::token_range, gms::inet_address>> ret;
+    std::vector<std::pair<dht::token_range, locator::host_id>> ret;
     if (sorted_tokens.empty()) {
         on_internal_error(tlogger, "Token metadata is empty");
     }
     auto prev_tok = sorted_tokens.back();
     for (const auto& tok : sorted_tokens) {
-        inet_address_vector_replica_set eps = erm->get_natural_endpoints(tok);
+        co_await coroutine::maybe_yield();
+        host_id_vector_replica_set eps = erm->get_natural_replicas(tok);
         if (eps.size() <= 1 || eps[1] != ep) {
             prev_tok = tok;
             continue;
@@ -346,7 +353,7 @@ static std::vector<std::pair<dht::token_range, gms::inet_address>> get_secondary
         }
         prev_tok = tok;
     }
-    return ret;
+    co_return ret;
 }
 
 
@@ -379,63 +386,66 @@ static std::vector<std::pair<dht::token_range, gms::inet_address>> get_secondary
 // the chances of covering all ranges during a scan when restarts occur.
 // A more deterministic way would be to regularly persist the scanning state,
 // but that incurs overhead that we want to avoid if not needed.
-enum primary_or_secondary_t {primary, secondary};
-template<primary_or_secondary_t primary_or_secondary>
-class token_ranges_owned_by_this_shard {
-    // ranges_holder_primary holds just the primary ranges themselves
-    class ranges_holder_primary {
-        const dht::token_range_vector _token_ranges;
-     public:
-        ranges_holder_primary(const locator::vnode_effective_replication_map_ptr& erm, gms::gossiper& g, gms::inet_address ep)
-            : _token_ranges(erm->get_primary_ranges(ep)) {}
-        std::size_t size() const { return _token_ranges.size(); }
-        const dht::token_range& operator[](std::size_t i) const {
-            return _token_ranges[i];
-        }
-        bool should_skip(std::size_t i) const {
-            return false;
-        }
-    };
-    // ranges_holder<secondary> holds the secondary token ranges plus each
-    // range's primary owner, needed to implement should_skip().
-    class ranges_holder_secondary {
-        std::vector<std::pair<dht::token_range, gms::inet_address>> _token_ranges;
-        gms::gossiper& _gossiper;
-     public:
-        ranges_holder_secondary(const locator::effective_replication_map_ptr& erm, gms::gossiper& g, gms::inet_address ep)
-            : _token_ranges(get_secondary_ranges(erm, ep))
-            , _gossiper(g) {}
-        std::size_t size() const { return _token_ranges.size(); }
-        const dht::token_range& operator[](std::size_t i) const {
-            return _token_ranges[i].first;
-        }
-        // range i should be skipped if its primary owner is alive.
-        bool should_skip(std::size_t i) const {
-            return _gossiper.is_alive(_token_ranges[i].second);
-        }
-    };
+//
+// FIXME: Check if this algorithm is safe with tablet migration.
+// https://github.com/scylladb/scylladb/issues/16567
 
+// ranges_holder_primary holds just the primary ranges themselves
+class ranges_holder_primary {
+    dht::token_range_vector _token_ranges;
+public:
+    explicit ranges_holder_primary(dht::token_range_vector token_ranges) : _token_ranges(std::move(token_ranges)) {}
+    static future<ranges_holder_primary> make(const locator::vnode_effective_replication_map_ptr& erm, locator::host_id ep) {
+        co_return ranges_holder_primary(co_await erm->get_primary_ranges(ep));
+    }
+    std::size_t size() const { return _token_ranges.size(); }
+    const dht::token_range& operator[](std::size_t i) const {
+        return _token_ranges[i];
+    }
+    bool should_skip(std::size_t i) const {
+        return false;
+    }
+};
+// ranges_holder<secondary> holds the secondary token ranges plus each
+// range's primary owner, needed to implement should_skip().
+class ranges_holder_secondary {
+    std::vector<std::pair<dht::token_range, locator::host_id>> _token_ranges;
+    const gms::gossiper& _gossiper;
+public:
+    explicit ranges_holder_secondary(std::vector<std::pair<dht::token_range, locator::host_id>> token_ranges, const gms::gossiper& g)
+        : _token_ranges(std::move(token_ranges))
+        , _gossiper(g) {}
+    static future<ranges_holder_secondary> make(const locator::effective_replication_map_ptr& erm, locator::host_id ep, const gms::gossiper& g) {
+        co_return ranges_holder_secondary(co_await get_secondary_ranges(erm, ep), g);
+    }
+    std::size_t size() const { return _token_ranges.size(); }
+    const dht::token_range& operator[](std::size_t i) const {
+        return _token_ranges[i].first;
+    }
+    // range i should be skipped if its primary owner is alive.
+    bool should_skip(std::size_t i) const {
+        return _gossiper.is_alive(_token_ranges[i].second);
+    }
+};
+
+template<class primary_or_secondary_t>
+class token_ranges_owned_by_this_shard {
     schema_ptr _s;
     locator::effective_replication_map_ptr _erm;
     // _token_ranges will contain a list of token ranges owned by this node.
     // We'll further need to split each such range to the pieces owned by
     // the current shard, using _intersecter.
-    using ranges_holder = std::conditional_t<
-            primary_or_secondary == primary_or_secondary_t::primary,
-            ranges_holder_primary,
-            ranges_holder_secondary>;
-    const ranges_holder _token_ranges;
+    const primary_or_secondary_t _token_ranges;
     // NOTICE: _range_idx is used modulo _token_ranges size when accessing
     // the data to ensure that it doesn't go out of bounds
     size_t _range_idx;
     size_t _end_idx;
     std::optional<dht::selective_token_range_sharder> _intersecter;
 public:
-    token_ranges_owned_by_this_shard(replica::database& db, gms::gossiper& g, schema_ptr s)
+    token_ranges_owned_by_this_shard(schema_ptr s, primary_or_secondary_t token_ranges)
         :  _s(s)
         , _erm(s->table().get_effective_replication_map())
-        , _token_ranges(db.find_keyspace(s->ks_name()).get_effective_replication_map(),
-                g, _erm->get_topology().my_address())
+        , _token_ranges(std::move(token_ranges))
         , _range_idx(random_offset(0, _token_ranges.size() - 1))
         , _end_idx(_range_idx + _token_ranges.size())
     {
@@ -491,6 +501,7 @@ struct scan_ranges_context {
     bytes column_name;
     std::optional<std::string> member;
 
+    service::client_state internal_client_state;
     ::shared_ptr<cql3::selection::selection> selection;
     std::unique_ptr<service::query_state> query_state_ptr;
     std::unique_ptr<cql3::query_options> query_options;
@@ -500,6 +511,7 @@ struct scan_ranges_context {
         : s(s)
         , column_name(column_name)
         , member(member)
+        , internal_client_state(service::client_state::internal_tag())
     {
         // FIXME: don't read the entire items - read only parts of it.
         // We must read the key columns (to be able to delete) and also
@@ -508,8 +520,9 @@ struct scan_ranges_context {
         // be good if we can read only the single item of the map - it
         // should be possible (and a must for issue #7751!).
         lw_shared_ptr<service::pager::paging_state> paging_state = nullptr;
-        auto regular_columns = boost::copy_range<query::column_id_vector>(
-            s->regular_columns() | boost::adaptors::transformed([] (const column_definition& cdef) { return cdef.id; }));
+        auto regular_columns =
+            s->regular_columns() | std::views::transform([] (const column_definition& cdef) { return cdef.id; })
+            | std::ranges::to<query::column_id_vector>();
         selection = cql3::selection::selection::wildcard(s);
         query::partition_slice::option_set opts = selection->get_query_options();
         opts.set<query::partition_slice::option::allow_short_read>();
@@ -518,10 +531,9 @@ struct scan_ranges_context {
         std::vector<query::clustering_range> ck_bounds{query::clustering_range::make_open_ended_both_sides()};
         auto partition_slice = query::partition_slice(std::move(ck_bounds), {}, std::move(regular_columns), opts);
         command = ::make_lw_shared<query::read_command>(s->id(), s->version(), partition_slice, proxy.get_max_result_size(partition_slice), query::tombstone_limit(proxy.get_tombstone_limit()));
-        executor::client_state client_state{executor::client_state::internal_tag()};
         tracing::trace_state_ptr trace_state;
         // NOTICE: empty_service_permit is used because the TTL service has fixed parallelism
-        query_state_ptr = std::make_unique<service::query_state>(client_state, trace_state, empty_service_permit());
+        query_state_ptr = std::make_unique<service::query_state>(internal_client_state, trace_state, empty_service_permit());
         // FIXME: What should we do on multi-DC? Will we run the expiration on the same ranges on all
         // DCs or only once for each range? If the latter, we need to change the CLs in the
         // scanner and deleter.
@@ -544,7 +556,7 @@ static future<> scan_table_ranges(
         expiration_service::stats& expiration_stats)
 {
     const schema_ptr& s = scan_ctx.s;
-    assert (partition_ranges.size() == 1); // otherwise issue #9167 will cause incorrect results.
+    SCYLLA_ASSERT (partition_ranges.size() == 1); // otherwise issue #9167 will cause incorrect results.
     auto p = service::pager::query_pagers::pager(proxy, s, scan_ctx.selection, *scan_ctx.query_state_ptr,
             *scan_ctx.query_options, scan_ctx.command, std::move(partition_ranges), nullptr);
     while (!p->is_exhausted()) {
@@ -717,7 +729,9 @@ static future<bool> scan_table(
     expiration_stats.scan_table++;
     // FIXME: need to pace the scan, not do it all at once.
     scan_ranges_context scan_ctx{s, proxy, std::move(column_name), std::move(member)};
-    token_ranges_owned_by_this_shard<primary> my_ranges(db.real_database(), gossiper, s);
+    auto erm = db.real_database().find_keyspace(s->ks_name()).get_vnode_effective_replication_map();
+    auto my_host_id = erm->get_topology().my_host_id();
+    token_ranges_owned_by_this_shard my_ranges(s, co_await ranges_holder_primary::make(erm, my_host_id));
     while (std::optional<dht::partition_range> range = my_ranges.next_partition_range()) {
         // Note that because of issue #9167 we need to run a separate
         // query on each partition range, and can't pass several of
@@ -737,7 +751,7 @@ static future<bool> scan_table(
     // by tasking another node to take over scanning of the dead node's primary
     // ranges. What we do here is that this node will also check expiration
     // on its *secondary* ranges - but only those whose primary owner is down.
-    token_ranges_owned_by_this_shard<secondary> my_secondary_ranges(db.real_database(), gossiper, s);
+    token_ranges_owned_by_this_shard my_secondary_ranges(s, co_await ranges_holder_secondary::make(erm, my_host_id, gossiper));
     while (std::optional<dht::partition_range> range = my_secondary_ranges.next_partition_range()) {
         expiration_stats.secondary_ranges_scanned++;
         dht::partition_range_vector partition_ranges;

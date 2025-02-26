@@ -1,14 +1,14 @@
 #
 # Copyright 2023-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
-
-from rest_api_mock import expected_request, approximate_value
+from test.nodetool.utils import check_nodetool_fails_with
+from test.nodetool.rest_api_mock import expected_request, approximate_value
 import pytest
 import re
 import time
-import utils
+from typing import NamedTuple
 
 
 def test_clearnapshot(nodetool):
@@ -34,7 +34,7 @@ def test_clearnapshot_keyspaces(nodetool):
 
 
 def test_clearnapshot_nonexistent_keyspaces(nodetool, scylla_only):
-    utils.check_nodetool_fails_with(
+    check_nodetool_fails_with(
             nodetool,
             ("clearsnapshot", "non_existent_ks"),
             {"expected_requests": [
@@ -75,7 +75,7 @@ def test_listsnapshots(nodetool, request):
         expected_request("GET", "/storage_service/snapshots/size/true", response=945235),
         ])
 
-    cassandra_expected_output =\
+    expected_output =\
 """Snapshot Details: 
 Snapshot name Keyspace name Column family name True size Size on disk
 1698236289867 ks1           tbl1               0 bytes   44 KB       
@@ -86,22 +86,17 @@ Snapshot name Keyspace name Column family name True size Size on disk
 Total TrueDiskSpaceUsed: 923.08 KiB
 
 """
-    scylla_expected_output =\
-"""Snapshot Details:
-Snapshot name Keyspace name Column family name True size Size on disk
-1698236289867 ks1           tbl1                   0 B         44 KiB
-1698236289867 ks1           tbl2                   0 B         40 KiB
-1698236070745 ks1           tbl1                   0 B         34 KiB
-1698236070745 ks1           tbl2                   0 B         20 KiB
+    assert res.stdout == expected_output
 
-Total TrueDiskSpaceUsed: 923 KiB
 
-"""
-
+def test_listsnapshots_no_snapshots(nodetool, request):
+    res = nodetool("listsnapshots", expected_requests=[
+        expected_request("GET", "/storage_service/snapshots", response=[]),
+        ])
     if request.config.getoption("nodetool") == "scylla":
-        assert res == scylla_expected_output
+        assert res.stdout == "There are no snapshots\n"
     else:
-        assert res == cassandra_expected_output
+        assert res.stdout == "Snapshot Details: \nThere are no snapshots\n"
 
 
 def check_snapshot_out(res, tag, ktlist, skip_flush):
@@ -118,6 +113,7 @@ def check_snapshot_out(res, tag, ktlist, skip_flush):
                          f" and options \\{{skipFlush={str(skip_flush).lower()}\\}}")
 
     print(res)
+    print(pattern)
 
     lines = res.split("\n")
     assert len(lines) == 3
@@ -144,13 +140,13 @@ def test_snapshot_keyspace(nodetool):
         expected_request("POST", "/storage_service/snapshots",
                          params={"tag": tag, "sf": "false", "kn": "ks1"})
     ])
-    check_snapshot_out(res, tag, ["ks1"], False)
+    check_snapshot_out(res.stdout, tag, ["ks1"], False)
 
     res = nodetool("snapshot", "--tag", tag, "ks1", "ks2", expected_requests=[
         expected_request("POST", "/storage_service/snapshots",
                          params={"tag": tag, "sf": "false", "kn": "ks1,ks2"})
     ])
-    check_snapshot_out(res, tag, ["ks1", "ks2"], False)
+    check_snapshot_out(res.stdout, tag, ["ks1", "ks2"], False)
 
 
 @pytest.mark.parametrize("option_name", ("-cf", "--column-family", "--table"))
@@ -161,13 +157,43 @@ def test_snapshot_keyspace_with_table(nodetool, option_name):
         expected_request("POST", "/storage_service/snapshots",
                          params={"tag": tag, "sf": "false", "kn": "ks1", "cf": "tbl"})
     ])
-    check_snapshot_out(res, tag, ["ks1"], False)
+    check_snapshot_out(res.stdout, tag, ["ks1"], False)
 
     res = nodetool("snapshot", "--tag", tag, "ks1", option_name, "tbl1,tbl2", expected_requests=[
         expected_request("POST", "/storage_service/snapshots",
                          params={"tag": tag, "sf": "false", "kn": "ks1", "cf": "tbl1,tbl2"})
     ])
-    check_snapshot_out(res, tag, ["ks1"], False)
+    check_snapshot_out(res.stdout, tag, ["ks1"], False)
+
+
+class kn_param(NamedTuple):
+    args: tuple[str]
+    kn: str
+    cf: str
+    snapshot_keyspaces: list[str]
+
+
+@pytest.mark.parametrize("param", (
+    kn_param(("ks1.tbl1",), "ks1", "tbl1", ["ks1.tbl1"]),
+    kn_param(("ks1.tbl1", "ks1.tbl2"), "ks1.tbl1,ks1.tbl2", "", ["ks1.tbl1", "ks1.tbl2"]),
+    kn_param(("ks1.tbl1", "ks2.tbl2"), "ks1.tbl1,ks2.tbl2", "", ["ks1.tbl1", "ks2.tbl2"]),
+    kn_param(("ks1.1/tbl1",), "ks1.1", "tbl1", ["ks1.1/tbl1"]),
+    kn_param(("ks1.1/tbl1", "ks1.2/tbl2"), "ks1.1/tbl1,ks1.2/tbl2", "", ["ks1.1/tbl1", "ks1.2/tbl2"]),
+    kn_param(("--kt-list", "ks1.1/tbl1",), "ks1.1", "tbl1", ["ks1.1/tbl1"]),
+    kn_param(("--kt-list", "ks1.1/tbl1,ks1.2/tbl2"), "ks1.1/tbl1,ks1.2/tbl2", "",
+             ["ks1.1/tbl1", "ks1.2/tbl2"]),
+))
+def test_snapshot_keyspace_table_single_arg(nodetool, param, scylla_only):
+    tag = "my_snapshot"
+
+    req_params = {"tag": tag, "sf": "false", "kn": param.kn}
+    if param.cf:
+        req_params["cf"] = param.cf
+
+    res = nodetool("snapshot", "--tag", tag, *param.args, expected_requests=[
+        expected_request("POST", "/storage_service/snapshots", params=req_params)
+    ])
+    check_snapshot_out(res.stdout, tag, param.snapshot_keyspaces, False)
 
 
 @pytest.mark.parametrize("option_name", ("-kt", "--kt-list", "-kc", "--kc.list"))
@@ -178,13 +204,19 @@ def test_snapshot_ktlist(nodetool, option_name):
         expected_request("POST", "/storage_service/snapshots",
                          params={"tag": tag, "sf": "false", "kn": "ks1", "cf": "tbl1"})
     ])
-    check_snapshot_out(res, tag, ["ks1.tbl1"], False)
+    check_snapshot_out(res.stdout, tag, ["ks1.tbl1"], False)
 
     res = nodetool("snapshot", "--tag", tag, option_name, "ks1.tbl1,ks2.tbl2", expected_requests=[
         expected_request("POST", "/storage_service/snapshots",
                          params={"tag": tag, "sf": "false", "kn": "ks1.tbl1,ks2.tbl2"})
     ])
-    check_snapshot_out(res, tag, ["ks1.tbl1", "ks2.tbl2"], False)
+    check_snapshot_out(res.stdout, tag, ["ks1.tbl1", "ks2.tbl2"], False)
+
+    res = nodetool("snapshot", "--tag", tag, option_name, "ks1,ks2", expected_requests=[
+        expected_request("POST", "/storage_service/snapshots",
+                         params={"tag": tag, "sf": "false", "kn": "ks1,ks2"})
+    ])
+    check_snapshot_out(res.stdout, tag, ["ks1" ,"ks2"], False)
 
 
 @pytest.mark.parametrize("tag", [None, "my_snapshot_tag"])
@@ -241,11 +273,11 @@ def test_snapshot_options_matrix(nodetool, tag, ktlist, skip_flush):
         expected_request("POST", "/storage_service/snapshots", params=params)
     ])
 
-    check_snapshot_out(res, tag, keyspaces, skip_flush)
+    check_snapshot_out(res.stdout, tag, keyspaces, skip_flush)
 
 
 def test_snapshot_multiple_keyspace_with_table(nodetool):
-    utils.check_nodetool_fails_with(
+    check_nodetool_fails_with(
             nodetool,
             ("snapshot", "--table", "tbl1", "ks1", "ks2"),
             {"expected_requests": []},
@@ -255,7 +287,7 @@ def test_snapshot_multiple_keyspace_with_table(nodetool):
 
 
 def test_snapshot_table_with_ktlist(nodetool):
-    utils.check_nodetool_fails_with(
+    check_nodetool_fails_with(
             nodetool,
             ("snapshot", "--table", "tbl1", "-kt", "ks1.tbl1"),
             {"expected_requests": []},
@@ -266,7 +298,7 @@ def test_snapshot_table_with_ktlist(nodetool):
 
 
 def test_snapshot_keyspace_with_ktlist(nodetool):
-    utils.check_nodetool_fails_with(
+    check_nodetool_fails_with(
             nodetool,
             ("snapshot", "-kt", "ks1.tbl1", "ks1"),
             {"expected_requests": []},
@@ -277,26 +309,8 @@ def test_snapshot_keyspace_with_ktlist(nodetool):
 
 
 def test_snapshot_keyspace_with_tables(nodetool, scylla_only):
-    utils.check_nodetool_fails_with(
+    check_nodetool_fails_with(
             nodetool,
             ("snapshot", "--table", "tbl1", "-cf", "tbl2", "ks1"),
             {"expected_requests": []},
             ["error: option '--table' cannot be specified more than once"])
-
-
-def test_snapshot_keyspace_bad_ktlist_too_many_dots(nodetool, scylla_only):
-    utils.check_nodetool_fails_with(
-            nodetool,
-            ("snapshot", "-kt", "ks1.tbl2.ss,ks2.tbl2"),
-            {"expected_requests": []},
-            ["error processing arguments: invalid keyspace.table: ks1.tbl2.ss, "
-             "keyspace and table must be separated by exactly one dot"])
-
-
-def test_snapshot_keyspace_bad_ktlist_no_dot(nodetool, scylla_only):
-    utils.check_nodetool_fails_with(
-            nodetool,
-            ("snapshot", "-kt", "ks1.tbl1,ks2"),
-            {"expected_requests": []},
-            ["error processing arguments: invalid keyspace.table: ks2, "
-             "keyspace and table must be separated by exactly one dot"])

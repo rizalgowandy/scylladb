@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 // Since Scylla 2.0, we use system tables whose schemas were introduced in
@@ -32,7 +32,6 @@
 #include "schema/schema_builder.hh"
 #include "service/storage_proxy.hh"
 #include "utils/rjson.hh"
-#include "utils/fmt-compat.hh"
 #include "cql3/query_processor.hh"
 #include "cql3/untyped_result_set.hh"
 #include "cql3/util.hh"
@@ -138,10 +137,10 @@ public:
                         db::schema_tables::legacy::read_table_mutations(_sp, dst.name, cf_name, db::system_keyspace::legacy::column_families()))
                     .then([&dst, cf_name, timestamp](result_tuple&& t) {
 
-            result_set_type tables = std::get<0>(t).get0();
-            result_set_type columns = std::get<1>(t).get0();
-            result_set_type triggers = std::get<2>(t).get0();
-            db::schema_tables::legacy::schema_mutations sm = std::get<3>(t).get0();
+            result_set_type tables = std::get<0>(t).get();
+            result_set_type columns = std::get<1>(t).get();
+            result_set_type triggers = std::get<2>(t).get();
+            db::schema_tables::legacy::schema_mutations sm = std::get<3>(t).get();
 
             row_type& td = tables->one();
 
@@ -357,12 +356,6 @@ public:
                 builder.set_regular_column_name_type(db::schema_tables::parse_type(comparator));
             }
 
-            if (td.has("read_repair_chance")) {
-                builder.set_read_repair_chance(td.get_as<double>("read_repair_chance"));
-            }
-            if (td.has("local_read_repair_chance")) {
-                builder.set_dc_local_read_repair_chance(td.get_as<double>("local_read_repair_chance"));
-            }
             if (td.has("gc_grace_seconds")) {
                 builder.set_gc_grace_seconds(td.get_as<int32_t>("gc_grace_seconds"));
             }
@@ -392,9 +385,9 @@ public:
                 try {
                     builder.set_compaction_strategy(sstables::compaction_strategy::type(strategy));
                 } catch (const exceptions::configuration_exception& e) {
-                    // If compaction strategy class isn't supported, fallback to size tiered.
-                    mlogger.warn("Falling back to size-tiered compaction strategy after the problem: {}", e.what());
-                    builder.set_compaction_strategy(sstables::compaction_strategy_type::size_tiered);
+                    // If compaction strategy class isn't supported, fallback to incremental.
+                    mlogger.warn("Falling back to incremental compaction strategy after the problem: {}", e.what());
+                    builder.set_compaction_strategy(sstables::compaction_strategy_type::incremental);
                 }
             }
             if (td.has("compaction_strategy_options")) {
@@ -549,6 +542,7 @@ public:
             auto ksm = ::make_lw_shared<keyspace_metadata>(ks.name
                             , ks.replication_params["class"] // TODO, make ksm like c3?
                             , ks.replication_params
+                            , std::nullopt
                             , ks.durable_writes);
 
             // we want separate time stamps for tables/types, so cannot bulk them into the ksm.

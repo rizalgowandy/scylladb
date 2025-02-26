@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
@@ -12,25 +12,27 @@
 #include "test/lib/scylla_test_case.hh"
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/closeable.hh>
+#include <fmt/std.h>
 
 #include "test/lib/mutation_source_test.hh"
 #include "mutation/mutation_fragment.hh"
 #include "mutation/frozen_mutation.hh"
-#include "test/lib/test_services.hh"
 #include "schema/schema_builder.hh"
 #include "test/boost/total_order_check.hh"
 #include "schema_upgrader.hh"
 #include "readers/combined.hh"
 #include "replica/memtable.hh"
-#include "mutation/mutation_rebuilder.hh"
+#include "utils/to_string.hh"
 
 #include "test/lib/mutation_assertions.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
 #include "test/lib/simple_schema.hh"
 #include "test/lib/fragment_scatterer.hh"
+#include "test/lib/test_utils.hh"
 
-#include <boost/range/algorithm/transform.hpp>
 #include "readers/from_mutations_v2.hh"
+
+#include <boost/range/join.hpp>
 
 SEASTAR_TEST_CASE(test_mutation_merger_conforms_to_mutation_source) {
     return seastar::async([] {
@@ -47,7 +49,7 @@ SEASTAR_TEST_CASE(test_mutation_merger_conforms_to_mutation_source) {
             }
 
             for (auto&& m : partitions) {
-                auto rd = make_flat_mutation_reader_from_mutations_v2(s, semaphore.make_permit(), {m});
+                auto rd = make_mutation_reader_from_mutations_v2(s, semaphore.make_permit(), {m});
                 auto close_rd = deferred_close(rd);
                 auto muts = rd.consume(fragment_scatterer(s, n)).get();
                 for (int i = 0; i < n; ++i) {
@@ -63,7 +65,7 @@ SEASTAR_TEST_CASE(test_mutation_merger_conforms_to_mutation_source) {
                     streamed_mutation::forwarding fwd,
                     mutation_reader::forwarding fwd_mr)
             {
-                std::vector<flat_mutation_reader_v2> readers;
+                std::vector<mutation_reader> readers;
                 for (int i = 0; i < n; ++i) {
                     readers.push_back(memtables[i]->make_flat_reader(s, permit, range, slice, trace_state, fwd, fwd_mr));
                 }
@@ -86,7 +88,7 @@ SEASTAR_TEST_CASE(test_range_tombstones_stream) {
         auto pk = partition_key::from_single_value(*s, int32_type->decompose(0));
         auto create_ck = [&] (std::vector<int> v) {
             std::vector<bytes> vs;
-            boost::transform(v, std::back_inserter(vs), [] (int x) { return int32_type->decompose(x); });
+            std::ranges::transform(v, std::back_inserter(vs), [] (int x) { return int32_type->decompose(x); });
             return clustering_key_prefix::from_exploded(*s, std::move(vs));
         };
 
@@ -337,9 +339,9 @@ SEASTAR_TEST_CASE(test_schema_upgrader_is_equivalent_with_mutation_upgrade) {
             if (m1.schema()->version() != m2.schema()->version()) {
                 // upgrade m1 to m2's schema
 
-                auto reader = transform(make_flat_mutation_reader_from_mutations_v2(m1.schema(), semaphore.make_permit(), {m1}), schema_upgrader_v2(m2.schema()));
+                auto reader = transform(make_mutation_reader_from_mutations_v2(m1.schema(), semaphore.make_permit(), {m1}), schema_upgrader_v2(m2.schema()));
                 auto close_reader = deferred_close(reader);
-                auto from_upgrader = read_mutation_from_flat_mutation_reader(reader).get0();
+                auto from_upgrader = read_mutation_from_mutation_reader(reader).get();
 
                 auto regular = m1;
                 regular.upgrade(m2.schema());
@@ -357,7 +359,7 @@ SEASTAR_THREAD_TEST_CASE(test_mutation_fragment_mutate_exception_safety) {
 
     reader_concurrency_semaphore sem(reader_concurrency_semaphore::for_tests{}, get_name(), 1, 100);
     auto stop_sem = deferred_stop(sem);
-    auto permit = sem.make_tracking_only_permit(s.schema().get(), get_name(), db::no_timeout, {});
+    auto permit = sem.make_tracking_only_permit(s.schema(), get_name(), db::no_timeout, {});
 
     const auto available_res = sem.available_resources();
     const sstring val(1024, 'a');
@@ -427,7 +429,7 @@ SEASTAR_THREAD_TEST_CASE(test_mutation_fragment_stream_validator) {
 
     reader_concurrency_semaphore sem(reader_concurrency_semaphore::for_tests{}, get_name(), 1, 100);
     auto stop_sem = deferred_stop(sem);
-    auto permit = sem.make_tracking_only_permit(ss.schema().get(), get_name(), db::no_timeout, {});
+    auto permit = sem.make_tracking_only_permit(ss.schema(), get_name(), db::no_timeout, {});
 
     auto expect = [&] (bool expect_valid, const char* desc, unsigned at, auto&& first_mf, auto&&... mf) {
         std::vector<mutation_fragment_v2> mfs;
@@ -618,7 +620,7 @@ SEASTAR_THREAD_TEST_CASE(test_mutation_fragment_stream_validator_mixed_api_usage
 
     reader_concurrency_semaphore sem(reader_concurrency_semaphore::for_tests{}, get_name(), 1, 100);
     auto stop_sem = deferred_stop(sem);
-    auto permit = sem.make_tracking_only_permit(ss.schema().get(), get_name(), db::no_timeout, {});
+    auto permit = sem.make_tracking_only_permit(ss.schema(), get_name(), db::no_timeout, {});
 
     mutation_fragment_stream_validator validator(*ss.schema());
 
@@ -640,4 +642,65 @@ SEASTAR_THREAD_TEST_CASE(test_mutation_fragment_stream_validator_mixed_api_usage
     BOOST_REQUIRE(validator(mf_kind::partition_end, {}));
     BOOST_REQUIRE(validator(dk0));
     BOOST_REQUIRE(!validator(dk0));
+}
+
+SEASTAR_THREAD_TEST_CASE(test_mutation_fragment_stream_validator_validation_level) {
+    simple_schema ss;
+
+    const auto dkeys = ss.make_pkeys(5);
+    const auto& dk_ = dkeys[0];
+    const auto& dk0 = dkeys[1];
+    const auto& dk1 = dkeys[2];
+
+    const auto ck0 = ss.make_ckey(0);
+    const auto ck1 = ss.make_ckey(1);
+    const auto ck2 = ss.make_ckey(2);
+    const auto ck3 = ss.make_ckey(3);
+
+    reader_concurrency_semaphore sem(reader_concurrency_semaphore::for_tests{}, get_name(), 1, 100);
+    auto stop_sem = deferred_stop(sem);
+    auto permit = sem.make_tracking_only_permit(ss.schema(), get_name(), db::no_timeout, {});
+
+    using vl = mutation_fragment_stream_validation_level;
+    using mf_kind = mutation_fragment_v2::kind;
+
+    const auto ps_pos = position_in_partition_view(position_in_partition_view::partition_start_tag_t{});
+    const auto sr_pos = position_in_partition_view(position_in_partition_view::static_row_tag_t{});
+    const auto pe_pos = position_in_partition_view(position_in_partition_view::end_of_partition_tag_t{});
+
+    for (const auto validation_level : {vl::none, vl::partition_region, vl::token, vl::partition_key, vl::clustering_key}) {
+        testlog.info("valiation_level={}", static_cast<int>(validation_level));
+
+        mutation_fragment_stream_validating_filter validator("test", *ss.schema(), validation_level, false);
+
+        BOOST_REQUIRE(validator(mf_kind::partition_start, ps_pos, {}));
+        BOOST_REQUIRE(validator(dk_));
+        BOOST_REQUIRE(validator(mf_kind::static_row, sr_pos, {}));
+
+        // OOO fragment kind
+        BOOST_REQUIRE(validator(mf_kind::clustering_row, position_in_partition::for_key(ck0), {}));
+        BOOST_REQUIRE(validation_level < vl::partition_region || !validator(mf_kind::static_row, sr_pos, {}));
+
+        // OOO clustering row
+        BOOST_REQUIRE(validator(mf_kind::clustering_row, position_in_partition::for_key(ck1), {}));
+        BOOST_REQUIRE(validation_level < vl::clustering_key || !validator(mf_kind::clustering_row, position_in_partition::for_key(ck0), {}));
+
+        // Active range tombstone at partition-end
+        BOOST_REQUIRE(validator(mf_kind::range_tombstone_change, position_in_partition::after_key(*ss.schema(), ck2), ss.new_tombstone()));
+        if (validation_level == vl::none) {
+            BOOST_REQUIRE(validator(mf_kind::partition_end, pe_pos, {}));
+        } else {
+            BOOST_REQUIRE(!validator(mf_kind::partition_end, pe_pos, {}));
+            BOOST_REQUIRE(validator(mf_kind::range_tombstone_change, position_in_partition::after_key(*ss.schema(), ck3), tombstone()));
+            BOOST_REQUIRE(validator(mf_kind::partition_end, pe_pos, {}));
+        }
+
+        BOOST_REQUIRE(validator(dk1));
+
+        // OOO partition-key
+        BOOST_REQUIRE(validation_level < vl::partition_key || !validator(dk1));
+
+        // OOO token
+        BOOST_REQUIRE(validation_level < vl::token || !validator(dk0));
+    }
 }

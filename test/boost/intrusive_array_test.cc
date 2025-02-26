@@ -3,15 +3,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <boost/test/unit_test.hpp>
 #include "test/lib/scylla_test_case.hh"
 #include <fmt/core.h>
 
+#include "utils/allocation_strategy.hh"
 #include "utils/intrusive-array.hh"
-#include "utils/logalloc.hh"
 
 class element {
     bool _head = false;

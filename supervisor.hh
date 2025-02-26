@@ -3,16 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <seastar/core/sstring.hh>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
+#include <seastar/util/log.hh>
 #include "seastarx.hh"
 #include <systemd/sd-daemon.h>
-#include "log.hh"
 
 extern logger startlog;
 

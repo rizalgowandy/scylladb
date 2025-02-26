@@ -1,21 +1,16 @@
 #
 # Copyright 2023-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
-from rest_api_mock import expected_request
-import utils
+from test.nodetool.rest_api_mock import expected_request
+from test.nodetool.utils import check_nodetool_fails_with
 
 
-def test_cleanup(nodetool):
+def test_cleanup(nodetool, scylla_only):
     nodetool("cleanup", expected_requests=[
-        expected_request("GET", "/storage_service/keyspaces", params={"type": "non_local_strategy"},
-                         response=["ks1", "ks2"]),
-        expected_request("GET", "/storage_service/keyspaces", multiple=expected_request.ANY,
-                         response=["ks1", "ks2", "system"]),
-        expected_request("POST", "/storage_service/keyspace_cleanup/ks1", response=0),
-        expected_request("POST", "/storage_service/keyspace_cleanup/ks2", response=0),
+        expected_request("POST", "/storage_service/cleanup_all", response=0),
     ])
 
 
@@ -44,7 +39,7 @@ def test_cleanup_tables(nodetool):
 
 
 def test_cleanup_nonexistent_keyspace(nodetool):
-    utils.check_nodetool_fails_with(
+    check_nodetool_fails_with(
             nodetool,
             ("cleanup", "non_existent_ks"),
             {"expected_requests": [

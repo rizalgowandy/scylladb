@@ -3,26 +3,24 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "redis/options.hh"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
 #include "redis/protocol_parser.hh"
+#pragma GCC diagnostic pop
 #include "redis/query_processor.hh"
 #include "redis/reply.hh"
 #include "redis/request.hh"
 #include "redis/stats.hh"
 
-#include "auth/authenticator.hh"
 #include "auth/service.hh"
-#include "cql3/values.hh"
-#include "service/client_state.hh"
 #include "service_permit.hh"
 #include "timeout_config.hh"
-#include "utils/estimated_histogram.hh"
-#include "utils/fragmented_temporary_buffer.hh"
 #include "generic_server.hh"
 
 #include <seastar/core/seastar.hh>

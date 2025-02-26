@@ -5,20 +5,16 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "authorization_statement.hh"
-#include "transport/messages/result_message.hh"
 #include "service/client_state.hh"
 #include "auth/resource.hh"
 #include "cql3/query_processor.hh"
 #include "exceptions/exceptions.hh"
-#include <boost/algorithm/string/join.hpp>
-#include <boost/algorithm/string/split.hpp>
-#include <boost/algorithm/string/classification.hpp>
-#include "cql3/util.hh"
 #include "db/cql_type_parser.hh"
+#include "auth/common.hh"
 
 uint32_t cql3::statements::authorization_statement::get_bound_terms() const {
     return 0;
@@ -66,14 +62,22 @@ void cql3::statements::authorization_statement::maybe_correct_resource(auth::res
         auto function_args = functions_view.function_args();
         std::vector<data_type> parsed_types;
         if (function_args) {
-            parsed_types = boost::copy_range<std::vector<data_type>>(
-                *function_args | boost::adaptors::transformed([&] (std::string_view raw_type) {
+            parsed_types =
+                *function_args | std::views::transform([&] (std::string_view raw_type) {
                     auto parsed = db::cql_type_parser::parse(sstring(keyspace->data(), keyspace->size()), sstring(raw_type.data(), raw_type.size()), utm);
                     return parsed->is_user_type() ? parsed->freeze() : parsed;
-                })
-            );
+                }) | std::ranges::to<std::vector>();
         }
         resource = auth::make_functions_resource(*keyspace, auth::encode_signature(function_name, parsed_types));
     }
+}
+
+bool cql3::statements::authorization_altering_statement::needs_guard(
+                query_processor& qp, service::query_state&) const {
+    return !auth::legacy_mode(qp);
+};
+
+audit::statement_category cql3::statements::authorization_statement::category() const {
+    return audit::statement_category::DCL;
 }
 

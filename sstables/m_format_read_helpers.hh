@@ -3,12 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <limits>
 #include <type_traits>
 #include <concepts>
 #include <seastar/core/future.hh>
@@ -16,8 +15,6 @@
 #include "timestamp.hh"
 #include "sstables/types.hh"
 #include "sstables/exceptions.hh"
-#include "clustering_bounds_comparator.hh"
-#include "sstables/mx/types.hh"
 
 namespace sstables {
 

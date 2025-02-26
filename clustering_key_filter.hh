@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -22,10 +22,6 @@ public:
     clustering_key_filter_ranges(const clustering_row_ranges& ranges) : _ref(ranges) { }
     clustering_key_filter_ranges(clustering_row_ranges&& ranges)
         : _storage(std::make_move_iterator(ranges.begin()), std::make_move_iterator(ranges.end())), _ref(_storage) {}
-
-    struct reversed { };
-    clustering_key_filter_ranges(reversed, const clustering_row_ranges& ranges)
-        : _storage(ranges.rbegin(), ranges.rend()), _ref(_storage) { }
 
     clustering_key_filter_ranges(clustering_key_filter_ranges&& other) noexcept
         : _storage(std::move(other._storage))
@@ -47,21 +43,9 @@ public:
     const clustering_row_ranges& ranges() const { return _ref; }
 
     // Returns all clustering ranges determined by `slice` inside partition determined by `key`.
-    // If the slice contains the `reversed` option, we assume that it is given in 'half-reversed' format
-    // (i.e. the ranges within are given in reverse order, but the ranges themselves are not reversed)
-    // with respect to the table order.
-    // The ranges will be returned in forward (increasing) order even if the slice is reversed.
+    // The ranges will be returned in the same order as stored in the slice. For a reversed slice
+    // a reverse schema shall be provided.
     static clustering_key_filter_ranges get_ranges(const schema& schema, const query::partition_slice& slice, const partition_key& key) {
-        const query::clustering_row_ranges& ranges = slice.row_ranges(schema, key);
-        if (slice.is_reversed()) {
-            return clustering_key_filter_ranges(clustering_key_filter_ranges::reversed{}, ranges);
-        }
-        return clustering_key_filter_ranges(ranges);
-    }
-
-    // Returns all clustering ranges determined by `slice` inside partition determined by `key`.
-    // The ranges will be returned in the same order as stored in the slice.
-    static clustering_key_filter_ranges get_native_ranges(const schema& schema, const query::partition_slice& slice, const partition_key& key) {
         const query::clustering_row_ranges& ranges = slice.row_ranges(schema, key);
         return clustering_key_filter_ranges(ranges);
     }

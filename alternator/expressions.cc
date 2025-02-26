@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "expressions.hh"
@@ -17,18 +17,15 @@
 
 #include "seastarx.hh"
 
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <seastar/util/log.hh>
-
-#include <boost/algorithm/cxx11/any_of.hpp>
-#include <boost/algorithm/cxx11/all_of.hpp>
 
 #include <functional>
 #include <unordered_map>
 
 namespace alternator {
 
-template <typename Func, typename Result = std::result_of_t<Func(expressionsParser&)>>
+template <typename Func, typename Result = std::invoke_result_t<Func, expressionsParser&>>
 static Result do_with_parser(std::string_view input, Func&& f) {
     expressionsLexer::InputStreamType input_stream{
         reinterpret_cast<const ANTLR_UINT8*>(input.data()),
@@ -43,7 +40,7 @@ static Result do_with_parser(std::string_view input, Func&& f) {
     return result;
 }
 
-template <typename Func, typename Result = std::result_of_t<Func(expressionsParser&)>>
+template <typename Func, typename Result = std::invoke_result_t<Func, expressionsParser&>>
 static Result parse(const char* input_name, std::string_view input, Func&& f) {
     if (input.length() > 4096) {
         throw expressions_syntax_error(format("{} expression size {} exceeds allowed maximum 4096.",
@@ -57,10 +54,10 @@ static Result parse(const char* input_name, std::string_view input, Func&& f) {
         // TODO: displayRecognitionError could set a position inside the
         // expressions_syntax_error in throws, and we could use it here to
         // mark the broken position in 'input'.
-        throw expressions_syntax_error(format("Failed parsing {} '{}': {}",
+        throw expressions_syntax_error(fmt::format("Failed parsing {} '{}': {}",
             input_name, input, e.what()));
     } catch (...) {
-        throw expressions_syntax_error(format("Failed parsing {} '{}': {}",
+        throw expressions_syntax_error(fmt::format("Failed parsing {} '{}': {}",
             input_name, input, std::current_exception()));
     }
 }
@@ -133,21 +130,6 @@ void path::check_depth_limit() {
     }
 }
 
-std::ostream& operator<<(std::ostream& os, const path& p) {
-    os << p.root();
-    for (const auto& op : p.operators()) {
-        std::visit(overloaded_functor {
-            [&] (const std::string& member) {
-                os << '.' << member;
-            },
-            [&] (unsigned index) {
-                os << '[' << index << ']';
-            }
-        }, op);
-    }
-    return os;
-}
-
 } // namespace parsed
 
 // The following resolve_*() functions resolve references in parsed
@@ -175,12 +157,12 @@ static std::optional<std::string> resolve_path_component(const std::string& colu
     if (column_name.size() > 0 && column_name.front() == '#') {
         if (!expression_attribute_names) {
             throw api_error::validation(
-                    format("ExpressionAttributeNames missing, entry '{}' required by expression", column_name));
+                    fmt::format("ExpressionAttributeNames missing, entry '{}' required by expression", column_name));
         }
         const rjson::value* value = rjson::find(*expression_attribute_names, column_name);
         if (!value || !value->IsString()) {
             throw api_error::validation(
-                    format("ExpressionAttributeNames missing entry '{}' required by expression", column_name));
+                    fmt::format("ExpressionAttributeNames missing entry '{}' required by expression", column_name));
         }
         used_attribute_names.emplace(column_name);
         return std::string(rjson::to_string_view(*value));
@@ -217,16 +199,16 @@ static void resolve_constant(parsed::constant& c,
         [&] (const std::string& valref) {
             if (!expression_attribute_values) {
                 throw api_error::validation(
-                        format("ExpressionAttributeValues missing, entry '{}' required by expression", valref));
+                        fmt::format("ExpressionAttributeValues missing, entry '{}' required by expression", valref));
             }
             const rjson::value* value = rjson::find(*expression_attribute_values, valref);
             if (!value) {
                 throw api_error::validation(
-                        format("ExpressionAttributeValues missing entry '{}' required by expression", valref));
+                        fmt::format("ExpressionAttributeValues missing entry '{}' required by expression", valref));
             }
             if (value->IsNull()) {
                 throw api_error::validation(
-                        format("ExpressionAttributeValues null value for entry '{}' required by expression", valref));
+                        fmt::format("ExpressionAttributeValues null value for entry '{}' required by expression", valref));
             }
             validate_value(*value, "ExpressionAttributeValues");
             used_attribute_values.emplace(valref);
@@ -723,7 +705,7 @@ rjson::value calculate_value(const parsed::value& v,
             auto function_it = function_handlers.find(std::string_view(f._function_name));
             if (function_it == function_handlers.end()) {
                 throw api_error::validation(
-                        format("{}: unknown function '{}' called.", caller, f._function_name));
+                        fmt::format("{}: unknown function '{}' called.", caller, f._function_name));
             }
             return function_it->second(caller, previous_item, f);
         },
@@ -756,3 +738,20 @@ rjson::value calculate_value(const parsed::set_rhs& rhs,
 }
 
 } // namespace alternator
+
+auto fmt::formatter<alternator::parsed::path>::format(const alternator::parsed::path& p, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    auto out = ctx.out();
+    out = fmt::format_to(out, "{}", p.root());
+    for (const auto& op : p.operators()) {
+        std::visit(overloaded_functor {
+            [&] (const std::string& member) {
+                out = fmt::format_to(out, ".{}", member);
+            },
+            [&] (unsigned index) {
+                out = fmt::format_to(out, "[{}]", index);
+            }
+        }, op);
+    }
+    return out;
+}

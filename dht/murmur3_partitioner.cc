@@ -3,15 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "murmur3_partitioner.hh"
 #include "utils/murmur_hash.hh"
 #include "sstables/key.hh"
 #include "utils/class_registrator.hh"
-#include <boost/lexical_cast.hpp>
-#include <boost/range/irange.hpp>
 
 namespace dht {
 
@@ -34,7 +32,7 @@ murmur3_partitioner::get_token(bytes_view key) const {
 
 token
 murmur3_partitioner::get_token(uint64_t value) const {
-    return token(token::kind::key, value);
+    return token(value);
 }
 
 token

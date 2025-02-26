@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/coroutine.hh>
@@ -19,7 +19,6 @@
 #include "mutation/mutation.hh"
 #include "cql3/query_processor.hh"
 #include "gms/feature_service.hh"
-#include <boost/range/adaptor/transformed.hpp>
 
 
 namespace cql3 {
@@ -38,10 +37,10 @@ seastar::future<shared_ptr<db::functions::function>> create_aggregate_statement:
     auto&& db = qp.db();
     std::vector<data_type> acc_types{state_type};
     acc_types.insert(acc_types.end(), _arg_types.begin(), _arg_types.end());
-    auto state_func = dynamic_pointer_cast<functions::scalar_function>(functions::functions::find(functions::function_name{_name.keyspace, _sfunc}, acc_types));
+    auto state_func = dynamic_pointer_cast<functions::scalar_function>(functions::instance().find(functions::function_name{_name.keyspace, _sfunc}, acc_types));
     if (!state_func) {
-        auto acc_type_names = acc_types | boost::adaptors::transformed([] (auto&& t) { return t->cql3_type_name(); });
-        throw exceptions::invalid_request_exception(format("State function {}({}) not found", _sfunc, fmt::join(acc_type_names, ", ")));
+        auto acc_type_names = acc_types | std::views::transform([] (auto&& t) { return t->cql3_type_name(); });
+        throw exceptions::invalid_request_exception(seastar::format("State function {}({}) not found", _sfunc, fmt::join(acc_type_names, ", ")));
     }
     if (state_func->return_type() != state_type) {
         throw exceptions::invalid_request_exception(format("State function '{}' doesn't return state ({})", _sfunc, state_type->cql3_type_name()));
@@ -53,14 +52,14 @@ seastar::future<shared_ptr<db::functions::function>> create_aggregate_statement:
             throw exceptions::invalid_request_exception("Cluster does not support reduction function for user-defined aggregates, upgrade the whole cluster in order to define REDUCEFUNC for UDA");
         }
 
-        reduce_func = dynamic_pointer_cast<functions::scalar_function>(functions::functions::find(functions::function_name{_name.keyspace, _rfunc.value()}, {state_type, state_type}));
+        reduce_func = dynamic_pointer_cast<functions::scalar_function>(functions::instance().find(functions::function_name{_name.keyspace, _rfunc.value()}, {state_type, state_type}));
         if (!reduce_func) {
             throw exceptions::invalid_request_exception(format("Scalar reduce function {} for state type {} not found.", _rfunc.value(), state_type->name()));
         }
     }
     ::shared_ptr<cql3::functions::scalar_function> final_func = nullptr;
     if (_ffunc) {
-        final_func = dynamic_pointer_cast<functions::scalar_function>(functions::functions::find(functions::function_name{_name.keyspace, _ffunc.value()}, {state_type}));
+        final_func = dynamic_pointer_cast<functions::scalar_function>(functions::instance().find(functions::function_name{_name.keyspace, _ffunc.value()}, {state_type}));
         if (!final_func) {
             throw exceptions::invalid_request_exception(format("Final function {}({}) not found", _ffunc.value(), state_type->cql3_type_name()));
         }
@@ -80,11 +79,11 @@ seastar::future<shared_ptr<db::functions::function>> create_aggregate_statement:
 }
 
 std::unique_ptr<prepared_statement> create_aggregate_statement::prepare(data_dictionary::database db, cql_stats& stats) {
-    return std::make_unique<prepared_statement>(make_shared<create_aggregate_statement>(*this));
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<create_aggregate_statement>(*this));
 }
 
 future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>>
-create_aggregate_statement::prepare_schema_mutations(query_processor& qp, api::timestamp_type ts) const {
+create_aggregate_statement::prepare_schema_mutations(query_processor& qp, const query_options&, api::timestamp_type ts) const {
     ::shared_ptr<cql_transport::event::schema_change> ret;
     std::vector<mutation> m;
 
@@ -122,5 +121,16 @@ create_aggregate_statement::create_aggregate_statement(functions::function_name 
         , _ffunc(std::move(ffunc))
         , _ival(std::move(ival))
     {}
+
+audit::statement_category create_aggregate_statement::category() const {
+    return audit::statement_category::DDL;
 }
+
+audit::audit_info_ptr
+create_aggregate_statement::audit_info() const {
+    return audit::audit::create_audit_info(category(), sstring(), sstring());
+}
+
+}
+
 }

@@ -77,12 +77,18 @@ private:
      */
     std::optional<cdc::generation_id> _gen_id;
     future<> _cdc_streams_rewrite_complete = make_ready_future<>();
+
+    /* Returns true if raft topology changes are enabled.
+     * Can only be called from shard 0.
+     */
+    std::function<bool()> _raft_topology_change_enabled;
 public:
     generation_service(config cfg, gms::gossiper&,
             sharded<db::system_distributed_keyspace>&,
             sharded<db::system_keyspace>& sys_ks,
             abort_source&, const locator::shared_token_metadata&,
-            gms::feature_service&, replica::database& db);
+            gms::feature_service&, replica::database& db,
+            std::function<bool()> raft_topology_change_enabled);
 
     future<> stop();
     ~generation_service();
@@ -92,7 +98,7 @@ public:
      * that generation timestamp moved in as the `startup_gen_id` parameter.
      * This passes the responsibility of managing generations from the node startup code to this service;
      * until then, the service remains dormant.
-     * At the time of writing this comment, the startup code is in `storage_service::join_token_ring`, hence
+     * The startup code is in `storage_service::join_topology`, hence
      * `after_join` should be called at the end of that function.
      * Precondition: the node has completed bootstrapping and system_distributed_keyspace is initialized.
      * Must be called on shard 0 - that's where the generation management happens.
@@ -104,14 +110,13 @@ public:
         return _cdc_metadata;
     }
 
-    virtual future<> before_change(gms::inet_address, gms::endpoint_state_ptr, gms::application_state, const gms::versioned_value&) override { return make_ready_future(); }
     virtual future<> on_alive(gms::inet_address, gms::endpoint_state_ptr, gms::permit_id) override { return make_ready_future(); }
     virtual future<> on_dead(gms::inet_address, gms::endpoint_state_ptr, gms::permit_id) override { return make_ready_future(); }
     virtual future<> on_remove(gms::inet_address, gms::permit_id) override { return make_ready_future(); }
     virtual future<> on_restart(gms::inet_address, gms::endpoint_state_ptr, gms::permit_id) override { return make_ready_future(); }
 
     virtual future<> on_join(gms::inet_address, gms::endpoint_state_ptr, gms::permit_id) override;
-    virtual future<> on_change(gms::inet_address, gms::application_state, const gms::versioned_value&, gms::permit_id) override;
+    virtual future<> on_change(gms::inet_address, const gms::application_state_map&, gms::permit_id) override;
 
     future<> check_and_repair_cdc_streams();
 

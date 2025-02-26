@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -12,6 +12,7 @@
 #include "version.hh"
 #include "shared_sstable.hh"
 #include "open_info.hh"
+#include "sstables_registry.hh"
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/future.hh>
@@ -35,11 +36,14 @@
 #include "sstables/shareable_components.hh"
 #include "sstables/storage.hh"
 #include "sstables/generation_type.hh"
+#include "sstables/types.hh"
+#include "sstables/checksummed_data_source.hh"
 #include "mutation/mutation_fragment_stream_validator.hh"
-#include "readers/flat_mutation_reader_fwd.hh"
+#include "readers/mutation_reader_fwd.hh"
+#include "readers/mutation_reader.hh"
 #include "tracing/trace_state.hh"
 #include "utils/updateable_value.hh"
-#include "locator/abstract_replication_strategy.hh"
+#include "dht/decorated_key.hh"
 
 #include <seastar/util/optimized_optional.hh>
 
@@ -50,13 +54,13 @@ namespace data_dictionary {
 class storage_options;
 }
 
+class in_memory_config_type;
+
 namespace db {
 class large_data_handler;
 }
 
 namespace sstables {
-
-class random_access_reader;
 
 class sstable_directory;
 extern thread_local utils::updateable_value<bool> global_cache_index_pages;
@@ -68,11 +72,8 @@ class writer;
 namespace fs = std::filesystem;
 
 extern logging::logger sstlog;
-class key;
 class sstable_writer;
-class sstable_writer_v2;
 class sstables_manager;
-class metadata_collector;
 
 struct foreign_sstable_open_info;
 
@@ -95,7 +96,6 @@ class data_consume_context;
 
 class index_reader;
 class partition_index_cache;
-class sstables_manager;
 
 extern size_t summary_byte_cost(double summary_ratio);
 
@@ -111,7 +111,7 @@ struct sstable_writer_config {
     run_id run_identifier = run_id::create_random_id();
     size_t summary_byte_cost;
     sstring origin;
-    locator::effective_replication_map_ptr erm;
+    bool correct_pi_block_width = true;
 
 private:
     explicit sstable_writer_config() {}
@@ -134,14 +134,7 @@ constexpr auto table_subdirectories = std::to_array({
     pending_delete_dir,
 });
 
-enum class sstable_state {
-    normal,
-    staging,
-    quarantine,
-    upload,
-};
-
-inline sstring state_to_dir(sstable_state state) {
+inline std::string_view state_to_dir(sstable_state state) {
     switch (state) {
     case sstable_state::normal:
         return normal_dir;
@@ -168,18 +161,14 @@ inline sstable_state state_from_dir(std::string_view dir) {
         return sstable_state::upload;
     }
 
-    throw std::runtime_error(format("Unknown sstable state dir {}", dir));
-}
-
-inline std::ostream& operator<<(std::ostream& o, sstable_state s) {
-    return o << state_to_dir(s);
+    throw std::runtime_error(seastar::format("Unknown sstable state dir {}", dir));
 }
 
 // FIXME -- temporary, move to fs storage after patching the rest
 inline fs::path make_path(std::string_view table_dir, sstable_state state) {
     fs::path ret(table_dir);
     if (state != sstable_state::normal) {
-        ret /= state_to_dir(state).c_str();
+        ret /= state_to_dir(state);
     }
     return ret;
 }
@@ -193,15 +182,17 @@ public:
     future<> commit();
 };
 
+class sstable_stream_sink_impl;
+
 class sstable : public enable_lw_shared_from_this<sstable> {
     friend ::sstable_assertions;
 public:
     using version_types = sstable_version_types;
     using format_types = sstable_format_types;
-    using manager_link_type = bi::list_member_hook<bi::link_mode<bi::auto_unlink>>;
+    using manager_list_link_type = bi::list_member_hook<bi::link_mode<bi::auto_unlink>>;
+    using manager_set_link_type = bi::set_member_hook<bi::link_mode<bi::auto_unlink>>;
 public:
     sstable(schema_ptr schema,
-            sstring table_dir,
             const data_dictionary::storage_options& storage,
             generation_type generation,
             sstable_state state,
@@ -246,6 +237,8 @@ public:
 
     // load sstable using components shared by a shard
     future<> load(foreign_sstable_open_info info) noexcept;
+    // Load metadata components from disk
+    future<> load_metadata(sstable_open_config cfg = {}, bool validate = true) noexcept;
     // load all components from disk
     // this variant will be useful for testing purposes and also when loading
     // a new sstable from scratch for sharing its components.
@@ -267,6 +260,10 @@ public:
     // It's up to the storage driver how to implement this.
     future<> change_state(sstable_state to, delayed_commit_changes* delay = nullptr);
 
+    sstable_state state() const {
+        return _state;
+    }
+
     // Filesystem-specific call to grab an sstable from upload dir and
     // put it into the desired destination assigning the given generation
     future<> pick_up_from_upload(sstable_state to, generation_type new_generation);
@@ -278,31 +275,31 @@ public:
     // Returns a mutation_reader for given range of partitions.
     //
     // Precondition: if the slice is reversed, the schema must be reversed as well.
-    // Reversed slices must be provided in the 'half-reversed' format (the order of ranges
-    // being reversed, but the ranges themselves are not).
-    flat_mutation_reader_v2 make_reader(
-            schema_ptr schema,
+    mutation_reader make_reader(
+            schema_ptr query_schema,
             reader_permit permit,
             const dht::partition_range& range,
             const query::partition_slice& slice,
             tracing::trace_state_ptr trace_state = {},
             streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
             mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes,
-            read_monitor& monitor = default_read_monitor());
+            read_monitor& monitor = default_read_monitor(),
+            integrity_check integrity = integrity_check::no);
 
     // A reader which doesn't use the index at all. It reads everything from the
     // sstable and it doesn't support skipping.
-    flat_mutation_reader_v2 make_crawling_reader(
+    mutation_reader make_full_scan_reader(
             schema_ptr schema,
             reader_permit permit,
             tracing::trace_state_ptr trace_state = {},
-            read_monitor& monitor = default_read_monitor());
+            read_monitor& monitor = default_read_monitor(),
+            integrity_check integrity = integrity_check::no);
 
     // Returns mutation_source containing all writes contained in this sstable.
     // The mutation_source shares ownership of this sstable.
     mutation_source as_mutation_source();
 
-    future<> write_components(flat_mutation_reader_v2 mr,
+    future<> write_components(mutation_reader mr,
             uint64_t estimated_partitions,
             schema_ptr schema,
             const sstable_writer_config&,
@@ -474,9 +471,9 @@ public:
     }
 
     // required since touch_directory has an optional parameter
-    auto sstable_touch_directory_io_check(sstring name) const noexcept {
+    auto sstable_touch_directory_io_check(std::filesystem::path name) const noexcept {
         return do_io_check(_write_error_handler, [name = std::move(name)] () mutable {
-            return touch_directory(std::move(name));
+            return touch_directory(name.native());
         });
     }
     future<> close_files();
@@ -521,15 +518,19 @@ public:
 private:
     sstring filename(component_type f) const {
         auto dir = _storage->prefix();
+        return filename(f, std::move(dir));
+    }
+
+    sstring filename(component_type f, sstring dir) const {
         return filename(dir, _schema->ks_name(), _schema->cf_name(), _version, _generation, _format, f);
     }
 
-    friend class sstable_directory;
+    friend class sstable_stream_sink_impl;
     friend class filesystem_storage;
     friend class s3_storage;
     friend class tiered_storage;
 
-    size_t sstable_buffer_size;
+    const size_t sstable_buffer_size;
 
     std::unordered_set<component_type, enum_hash<component_type>> _recognized_components;
     std::vector<sstring> _unrecognized_components;
@@ -590,7 +591,11 @@ private:
     sstables_manager& _manager;
 
     sstables_stats _stats;
-    manager_link_type _manager_link;
+    // link used by the _active list of sstables manager
+    manager_list_link_type _manager_list_link;
+    // link used by the _reclaimed set of sstables manager
+    manager_set_link_type _manager_set_link;
+
 
     // The _large_data_stats map stores e.g. largest partitions, rows, cells sizes,
     // and max number of rows in a partition.
@@ -599,6 +604,15 @@ private:
     // information in their scylla metadata.
     std::optional<scylla_metadata::large_data_stats> _large_data_stats;
     sstring _origin;
+    std::optional<scylla_metadata::ext_timestamp_stats> _ext_timestamp_stats;
+    optimized_optional<sstable_id> _sstable_identifier;
+
+    // Total reclaimable memory from all the components of the SSTable.
+    // It is initialized to 0 to prevent the sstables manager from reclaiming memory
+    // from the components before the SSTable has been fully loaded.
+    mutable std::optional<size_t> _total_reclaimable_memory{0};
+    // Total memory reclaimed so far from this sstable
+    size_t _total_memory_reclaimed{0};
 public:
     bool has_component(component_type f) const;
     sstables_manager& manager() { return _manager; }
@@ -607,7 +621,7 @@ public:
     static future<std::vector<sstring>> read_and_parse_toc(file f);
 private:
     void unused(); // Called when reference count drops to zero
-    future<file> open_file(component_type, open_flags, file_open_options = {}) noexcept;
+    future<file> open_file(component_type, open_flags, file_open_options = {}) const noexcept;
 
     template <component_type Type, typename T>
     future<> read_simple(T& comp);
@@ -628,13 +642,13 @@ private:
     void write_crc(const checksum& c);
     void write_digest(uint32_t full_checksum);
 
-    future<file> new_sstable_component_file(const io_error_handler& error_handler, component_type f, open_flags flags, file_open_options options = {}) noexcept;
+    future<file> new_sstable_component_file(const io_error_handler& error_handler, component_type f, open_flags flags, file_open_options options = {}) const noexcept;
 
     future<file_writer> make_component_file_writer(component_type c, file_output_stream_options options,
             open_flags oflags = open_flags::wo | open_flags::create | open_flags::exclusive) noexcept;
 
     void generate_toc();
-    void open_sstable();
+    void open_sstable(const sstring& origin);
 
     future<> read_compression();
     void write_compression();
@@ -642,15 +656,19 @@ private:
     future<> read_scylla_metadata() noexcept;
 
     void write_scylla_metadata(shard_id shard,
-                               const dht::sharder& sharder,
                                sstable_enabled_features features,
                                run_identifier identifier,
                                std::optional<scylla_metadata::large_data_stats> ld_stats,
-                               sstring origin);
+                               std::optional<scylla_metadata::ext_timestamp_stats> ts_stats);
 
     future<> read_filter(sstable_open_config cfg = {});
 
     void write_filter();
+    // Rebuild a bloom filter from the index with the given number of
+    // partitions, if the partition estimate provided during bloom
+    // filter initialisation was not good.
+    // This should be called only before an sstable is sealed.
+    void maybe_rebuild_filter_from_index(uint64_t num_partitions);
 
     future<> read_summary() noexcept;
 
@@ -691,6 +709,18 @@ private:
 
     future<> create_data() noexcept;
 
+    // Note that only bloom filters are reclaimable by the following methods.
+    // Return the total reclaimable memory in this SSTable
+    size_t total_reclaimable_memory_size() const;
+    // Reclaim memory from the components back to the system.
+    size_t reclaim_memory_from_components();
+    // Return memory reclaimed so far from this sstable
+    size_t total_memory_reclaimed() const;
+    // Reload components from which memory was previously reclaimed
+    future<> reload_reclaimed_components();
+    // Disable reload of components for this sstable
+    void disable_component_memory_reload();
+
 public:
     // Finds first position_in_partition in a given partition.
     // If reversed is false, then the first position is actually the first row (can be the static one).
@@ -709,9 +739,19 @@ public:
     //
     // When created with `raw_stream::yes`, the sstable data file will be
     // streamed as-is, without decompressing (if compressed).
+    //
+    // When created with `integrity_check::yes`, the integrity mechanisms
+    // of the underlying data streams will be enabled.
+    //
+    // The `error_handler` parameter allows to customize the error handling
+    // logic when a checksum or digest mismatch is detected on an
+    // integrity-checked stream with no compression. The parameter is ignored
+    // if integrity checking is disabled or the SSTable is compressed.
     using raw_stream = bool_class<class raw_stream_tag>;
     input_stream<char> data_stream(uint64_t pos, size_t len,
-            reader_permit permit, tracing::trace_state_ptr trace_state, lw_shared_ptr<file_input_stream_history> history, raw_stream raw = raw_stream::no);
+            reader_permit permit, tracing::trace_state_ptr trace_state, lw_shared_ptr<file_input_stream_history> history,
+            raw_stream raw = raw_stream::no, integrity_check integrity = integrity_check::no,
+            integrity_error_handler error_handler = throwing_integrity_error_handler);
 
     // Read exactly the specific byte range from the data file (after
     // uncompression, if the file is compressed). This can be used to read
@@ -751,6 +791,9 @@ private:
 public:
     future<> read_toc() noexcept;
 
+    shareable_components& get_shared_components() const {
+        return *_components;
+    }
     schema_ptr get_schema() const {
         return _schema;
     }
@@ -758,6 +801,15 @@ public:
     bool has_scylla_component() const {
         return has_component(component_type::Scylla);
     }
+
+    // Returns an optional boolean value set to true iff the
+    // sstable's `originating_host_id` in stats metadata equals
+    // this node's host_id.
+    //
+    // The returned value may be nullopt if:
+    // - The sstable format is older than version_types::me, or
+    // - The local host_id is unknown yet (may happen early in the start-up process)
+    std::optional<bool> originated_on_this_node() const;
 
     void validate_originating_host_id() const;
 
@@ -867,6 +919,19 @@ public:
             const schema& s, const serialization_header& h, const sstable_enabled_features& f) {
         return _column_translation.get_for_schema(s, h, f);
     }
+    column_translation get_column_translation(const schema& s) {
+        if (get_version() >= sstable_version_types::mc) [[likely]] {
+            return _column_translation.get_for_schema(s, get_serialization_header(), features());
+        } else {
+            return _column_translation.get_for_schema(s);
+        }
+    }
+    column_translation get_column_translation() {
+        if (!_column_translation.version()) {
+            return get_column_translation(*_schema);
+        }
+        return _column_translation;
+    }
     const std::vector<unsigned>& get_shards_for_this_sstable() const {
         return _shards;
     }
@@ -898,9 +963,18 @@ public:
         return _components->summary;
     }
 
+    const lw_shared_ptr<const checksum> get_checksum() const {
+        return _components->checksum ? _components->checksum->shared_from_this() : nullptr;
+    }
+
+    std::optional<uint32_t> get_digest() const {
+        return _components->digest;
+    }
+
     // Gets ratio of droppable tombstone. A tombstone is considered droppable here
-    // for cells expired before gc_before and regular tombstones older than gc_before.
-    double estimate_droppable_tombstone_ratio(gc_clock::time_point gc_before) const;
+    // for cells and tombstones expired before the time point "GC before", which
+    // is the point before which expiring data can be purged.
+    double estimate_droppable_tombstone_ratio(const gc_clock::time_point& compaction_time, const tombstone_gc_state& gc_state, const schema_ptr& s) const;
 
     // get sstable open info from a loaded sstable, which can be used to quickly open a sstable
     // at another shard.
@@ -929,12 +1003,35 @@ public:
     // the map.  Otherwise, return a disengaged optional.
     std::optional<large_data_stats_entry> get_large_data_stat(large_data_type t) const noexcept;
 
+    // Return the extended timestamp statistics map.
+    // Some or all entries may be missing if not present in scylla_metadata
+    scylla_metadata::ext_timestamp_stats::map_type get_ext_timestamp_stats() const noexcept;
+
     const sstring& get_origin() const noexcept {
         return _origin;
     }
 
+    // sstable_id is null iff not present in scylla_metadata
+    const optimized_optional<sstable_id>& sstable_identifier() const noexcept {
+        return _sstable_identifier;
+    }
+
     // Drops all evictable in-memory caches of on-disk content.
     future<> drop_caches();
+
+    // Returns a read-only file for all existing components of the sstable
+    future<std::unordered_map<component_type, file>> readable_file_for_all_components() const;
+
+    // Clones this sstable with a new generation, under the same location as the original one.
+    // Implementation is underlying storage specific.
+    future<entry_descriptor> clone(generation_type new_generation) const;
+
+    struct lesser_reclaimed_memory {
+        // comparator class to be used by the _reclaimed set in sstables manager
+        bool operator()(const sstable& sst1, const sstable& sst2) const {
+            return sst1.total_memory_reclaimed() < sst2.total_memory_reclaimed();
+        }
+    };
 
     // Allow the test cases from sstable_test.cc to test private methods. We use
     // a placeholder to avoid cluttering this class too much. The sstable_test class
@@ -947,19 +1044,21 @@ public:
     friend class sstables_manager;
     template <typename DataConsumeRowsContext>
     friend std::unique_ptr<DataConsumeRowsContext>
-    data_consume_rows(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&, disk_read_range, uint64_t);
+    data_consume_rows(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&, disk_read_range, uint64_t, integrity_check);
     template <typename DataConsumeRowsContext>
     friend std::unique_ptr<DataConsumeRowsContext>
-    data_consume_single_partition(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&, disk_read_range);
+    data_consume_single_partition(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&, disk_read_range, integrity_check);
     template <typename DataConsumeRowsContext>
     friend std::unique_ptr<DataConsumeRowsContext>
-    data_consume_rows(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&);
+    data_consume_rows(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&, integrity_check);
     friend void lw_shared_ptr_deleter<sstables::sstable>::dispose(sstable* s);
     gc_clock::time_point get_gc_before_for_drop_estimation(const gc_clock::time_point& compaction_time, const tombstone_gc_state& gc_state, const schema_ptr& s) const;
     gc_clock::time_point get_gc_before_for_fully_expire(const gc_clock::time_point& compaction_time, const tombstone_gc_state& gc_state, const schema_ptr& s) const;
 
-    future<uint32_t> read_digest();
-    future<checksum> read_checksum();
+    future<std::optional<uint32_t>> read_digest();
+    future<lw_shared_ptr<checksum>> read_checksum();
+
+    friend in_memory_config_type;
 };
 
 // Validate checksums
@@ -983,9 +1082,21 @@ public:
 // This method validates both the full checksum and the per-chunk checksum
 // for the entire Data.db.
 //
-// Returns true if all checksums are valid.
+// Returns `valid` if all checksums are valid.
+// Returns `invalid` if at least one checksum is invalid.
+// Returns `no_checksum` if the sstable is uncompressed and does not have
+// a CRC component (CRC.db is missing from TOC.txt).
 // Validation errors are logged individually.
-future<bool> validate_checksums(shared_sstable sst, reader_permit permit);
+enum class validate_checksums_status {
+    invalid = 0,
+    valid = 1,
+    no_checksum = 2
+};
+struct validate_checksums_result {
+    validate_checksums_status status;
+    bool has_digest;
+};
+future<validate_checksums_result> validate_checksums(shared_sstable sst, reader_permit permit);
 
 struct index_sampling_state {
     static constexpr size_t default_summary_byte_cost = 2000;
@@ -1023,4 +1134,60 @@ future<> remove_table_directory_if_has_no_snapshots(fs::path table_dir);
 // TOC is there
 future<sstring> make_toc_temporary(sstring sstable_toc_name, storage::sync_dir sync = storage::sync_dir::yes);
 
+// This snapshot allows the sstable files to be read even if they were removed from the directory
+struct sstable_files_snapshot {
+    shared_sstable sst;
+    std::unordered_map<component_type, file> files;
+};
+
+// A sstable_stream_source gives back
+// component input streams suitable for streaming to other nodes,
+// in appropriate order. Data will be decrypted and sanitized as required.
+class sstable_stream_source {
+protected:
+    shared_sstable _sst;
+    component_type _type;
+public:
+    sstable_stream_source(shared_sstable, component_type);
+    virtual ~sstable_stream_source() = default;
+
+    // Input stream for data appropriate for stream transfer for this component
+    virtual future<input_stream<char>> input(const file_input_stream_options&) const = 0;
+
+    // source sstable
+    const sstable& source() const {
+        return *_sst;
+    }
+    // component
+    component_type type() const {
+        return _type;
+    }
+    std::string component_basename() const;
+};
+
+// Translates the result of gathering readable snapshot files into ordered items for streaming.
+std::vector<std::unique_ptr<sstable_stream_source>> create_stream_sources(const sstables::sstable_files_snapshot&);
+
+class sstable_stream_sink {
+public:
+    virtual ~sstable_stream_sink() = default;
+    // Stream to the component file
+    virtual future<output_stream<char>> output(const file_open_options&, const file_output_stream_options&) = 0;
+    // closes this component. If this is the last component in a set (see "last_component" in creating method below)
+    // the table on disk will be sealed.
+    // Returns sealed sstable if last, or nullptr otherwise.
+    virtual future<shared_sstable> close_and_seal() = 0;
+    virtual future<> abort() = 0;
+};
+
+// Creates a sink object which can receive a component file sourced from above source object data.
+
+std::unique_ptr<sstable_stream_sink> create_stream_sink(schema_ptr, sstables_manager&, const data_dictionary::storage_options&, sstable_state, std::string_view component_filename, bool last_component);
+
 } // namespace sstables
+
+template <> struct fmt::formatter<sstables::sstable_state> : fmt::formatter<string_view> {
+    auto format(sstables::sstable_state state, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", state_to_dir(state));
+    }
+};

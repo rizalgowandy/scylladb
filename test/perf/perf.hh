@@ -3,12 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <seastar/core/print.hh>
+#include <ranges>
+#include <seastar/core/format.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/distributed.hh>
 #include <seastar/core/weak_ptr.hh>
@@ -22,7 +23,7 @@
 
 #include <chrono>
 #include <iosfwd>
-#include <boost/range/irange.hpp>
+#include <vector>
 
 template <typename Func>
 static
@@ -50,8 +51,10 @@ void time_it(Func func, int iterations = 5, int iterations_between_clock_reading
 struct executor_shard_stats {
     uint64_t invocations = 0;
     uint64_t allocations = 0;
+    uint64_t log_allocations = 0;
     uint64_t tasks_executed = 0;
     uint64_t instructions_retired = 0;
+    uint64_t cpu_cycles_retired = 0;
     uint64_t errors = 0;
 };
 
@@ -60,8 +63,10 @@ executor_shard_stats
 operator+(executor_shard_stats a, executor_shard_stats b) {
     a.invocations += b.invocations;
     a.allocations += b.allocations;
+    a.log_allocations += b.log_allocations;
     a.tasks_executed += b.tasks_executed;
     a.instructions_retired += b.instructions_retired;
+    a.cpu_cycles_retired += b.cpu_cycles_retired;
     a.errors += b.errors;
     return a;
 }
@@ -71,14 +76,17 @@ executor_shard_stats
 operator-(executor_shard_stats a, executor_shard_stats b) {
     a.invocations -= b.invocations;
     a.allocations -= b.allocations;
+    a.log_allocations -= b.log_allocations;
     a.tasks_executed -= b.tasks_executed;
     a.instructions_retired -= b.instructions_retired;
+    a.cpu_cycles_retired -= b.cpu_cycles_retired;
     a.errors -= b.errors;
     return a;
 }
 
 uint64_t perf_tasks_processed();
 uint64_t perf_mallocs();
+uint64_t perf_logallocs();
 
 // Drives concurrent and continuous execution of given asynchronous action
 // until a deadline. Counts invocations and collects statistics.
@@ -92,6 +100,7 @@ class executor {
     uint64_t _count;
     uint64_t _errors;
     linux_perf_event _instructions_retired_counter = linux_perf_event::user_instructions_retired();
+    linux_perf_event _cpu_cycles_retired_counter = linux_perf_event::user_cpu_cycles_retired();
 private:
     executor_shard_stats executor_shard_stats_snapshot();
     future<> run_worker() {
@@ -122,11 +131,13 @@ public:
     future<executor_shard_stats> run() {
         auto stats_start = executor_shard_stats_snapshot();
         _instructions_retired_counter.enable();
-        auto idx = boost::irange(0, (int)_n_workers);
+        _cpu_cycles_retired_counter.enable();
+        auto idx = std::views::iota(0, (int)_n_workers);
         return parallel_for_each(idx.begin(), idx.end(), [this] (auto idx) mutable {
             return this->run_worker();
         }).then([this, stats_start] {
             _instructions_retired_counter.disable();
+            _cpu_cycles_retired_counter.disable();
             auto stats_end = executor_shard_stats_snapshot();
             return stats_end - stats_start;
         });
@@ -143,8 +154,10 @@ executor<Func>::executor_shard_stats_snapshot() {
     return executor_shard_stats{
         .invocations = _count,
         .allocations = perf_mallocs(),
+        .log_allocations = perf_logallocs(),
         .tasks_executed = perf_tasks_processed(),
         .instructions_retired = _instructions_retired_counter.read(),
+        .cpu_cycles_retired = _cpu_cycles_retired_counter.read(),
         .errors = _errors,
     };
 }
@@ -152,13 +165,33 @@ executor<Func>::executor_shard_stats_snapshot() {
 struct perf_result {
     double throughput;
     double mallocs_per_op;
+    double logallocs_per_op;
     double tasks_per_op;
     double instructions_per_op;
+    double cpu_cycles_per_op;
     uint64_t errors;
 };
 
-std::ostream& operator<<(std::ostream& os, const perf_result& result);
 
+struct aggregated_perf_results {
+    struct stats_t {
+        double median;
+        double median_absolute_deviation;
+        double min;
+        double max;
+        double mean;
+        double stdev;
+    };
+    std::unordered_map<std::string, stats_t> stats;
+    perf_result median_by_throughput; // Simplification, median element is considered based on throughput value
+
+    aggregated_perf_results(std::vector<perf_result>& results);
+
+private:
+    stats_t calculate_stats(std::vector<perf_result>&, std::function<double(const perf_result&)> get_stat) const;
+};
+
+std::ostream& operator<<(std::ostream& os, const aggregated_perf_results& result);
 // Use to make a perf_result with aio_writes added. Need to give "update" as
 // update-func to time_parallel_ex to make it work.
 struct aio_writes_result_mixin {
@@ -172,7 +205,9 @@ struct aio_writes_result_mixin {
 
 struct perf_result_with_aio_writes : public perf_result, public aio_writes_result_mixin {};
 
-std::ostream& operator<<(std::ostream& os, const perf_result_with_aio_writes& result);
+template <> struct fmt::formatter<perf_result_with_aio_writes> : fmt::formatter<string_view> {
+    auto format(const perf_result_with_aio_writes&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
 
 /**
  * Measures throughput of an asynchronous action. Executes the action on all cores
@@ -201,19 +236,21 @@ std::vector<Res> time_parallel_ex(Func func, unsigned concurrency_per_core, int 
             exec.stop().get();
         });
         auto stats = exec.map_reduce0(std::mem_fn(&executor<Func>::run),
-                executor_shard_stats(), std::plus<executor_shard_stats>()).get0();
+                executor_shard_stats(), std::plus<executor_shard_stats>()).get();
         auto end = clk::now();
         auto duration = std::chrono::duration<double>(end - start).count();
 
         result.throughput = static_cast<double>(stats.invocations) / duration;
         result.mallocs_per_op = double(stats.allocations) / stats.invocations;
+        result.logallocs_per_op = double(stats.log_allocations) / stats.invocations;
         result.tasks_per_op = double(stats.tasks_executed) / stats.invocations;
         result.instructions_per_op = double(stats.instructions_retired) / stats.invocations;
+        result.cpu_cycles_per_op = double(stats.cpu_cycles_retired) / stats.invocations;
         result.errors = stats.errors;
 
         uf(result, stats);
 
-        std::cout << result << std::endl;
+        fmt::print("{}\n", result);
         results.emplace_back(result);
     }
     return results;
@@ -282,3 +319,11 @@ public:
 };
 
 } // namespace perf
+
+template <> struct fmt::formatter<scheduling_latency_measurer> : fmt::formatter<string_view> {
+    auto format(const scheduling_latency_measurer&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <> struct fmt::formatter<perf_result> : fmt::formatter<string_view> {
+    auto format(const perf_result&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

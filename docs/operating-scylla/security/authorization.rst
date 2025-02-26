@@ -5,7 +5,7 @@
 Grant Authorization CQL Reference
 ---------------------------------
 
-Authorization is the process by where users are granted permissions, which entitle them to access, or permission to change data on specific keyspaces, tables or an entire datacenter. Authorization for Scylla is done internally within Scylla and is not done with a third-party such as LDAP or OAuth. Granting permissions to users requires the use of a role such as a Database Administrator as well as :doc:`enabling the CassandraAuthorizer </operating-scylla/security/enable-authorization>`. It also requires a user who has been :doc:`authenticated </operating-scylla/security/authentication>`.
+Authorization is the process by where users are granted permissions, which entitle them to access, or permission to change data on specific keyspaces, tables or an entire datacenter. Authorization for ScyllaDB is done internally within ScyllaDB and is not done with a third-party such as LDAP or OAuth. Granting permissions to users requires the use of a role such as a Database Administrator as well as :doc:`enabling the CassandraAuthorizer </operating-scylla/security/enable-authorization>`. It also requires a user who has been :doc:`authenticated </operating-scylla/security/authentication>`.
 
 
 
@@ -66,7 +66,7 @@ If a role has the ``LOGIN`` privilege, clients may identify as that role when co
 connection, the client will acquire any roles and privileges granted to that role.
 
 Only a client with the ``CREATE`` permission on the database roles resource may issue ``CREATE ROLE`` requests (see
-the :ref:`relevant section <cql-permissions>` below) unless the client is a ``SUPERUSER``. Role management in Scylla
+the :ref:`relevant section <cql-permissions>` below) unless the client is a ``SUPERUSER``. Role management in ScyllaDB
 is pluggable, and custom implementations may support only a subset of the listed options.
 
 Role names should be quoted if they contain non-alphanumeric characters.
@@ -90,6 +90,50 @@ If the option is used and the role exists, the statement is a no-op::
 
     CREATE ROLE other_role;
     CREATE ROLE IF NOT EXISTS other_role;
+
+Creating a role with a hashed password
+``````````````````````````````````````
+
+When you create a role with a password, the password is hashed by ScyllaDB and only then inserted into the database.
+However, there also exists a version of the statement allowing you to create a role with a pre-hashed password; the syntax:
+
+.. code-block::
+
+   create_role_statement: CREATE ROLE [ IF NOT EXISTS ] `role_name`
+                        : WITH HASHED PASSWORD `hashed_password`
+                        :     ( AND `role_option` )*
+   hashed_password: `string`
+   role_option: LOGIN '=' `boolean`
+              :| SUPERUSER '=' `boolean`
+              :| OPTIONS '=' `map_literal`
+
+When that statement is executed, ScyllaDB will not hash the provided hashed password; it will be inserted into
+the database directly, with no additional processing of it. The statement only works with an authenticator that
+uses passwords, e.g. PasswordAuthenticator. It can only be executed by a role with the superuser privilege.
+
+The provided hashed password must be an encrypted string using the library function `crypt(3)` specified by POSIX,
+and it must use one of the encryption algorithms that ScyllaDB supports: bcrypt, sha512crypt, sha256crypt, md5crypt.
+If the hashed password doesn't satisfy those requirements, logging in as the role may be impossible.
+
+Example how to generate a hashed password using `crypt(3)`:
+
+.. code-block:: c
+
+  #include <crypt.h>
+  #include <stdio.h>
+
+  int main(void) {
+    // Generate a hashed password using sha256.
+    const char* pwd = crypt("myPassword", "$5$");
+    printf("The hashed password is %s\n", pwd);
+    return 0;
+  }
+
+Example how to create a role with a hashed password:
+
+.. code-block:: cql
+
+  cqlsh> CREATE ROLE bob WITH HASHED PASSWORD = '$5$$QdpObVOY40UOyo.BuWdpRq0Cr/DPkw7ckBEs2NqWVn5';
 
 
 .. _alter-role-statement:
@@ -217,8 +261,8 @@ lists all roles directly granted to ``bob`` without including any of the transit
 Users
 ^^^^^
 
-Prior to the introduction of roles in Scylla 2.2, authentication and authorization were based around the concept of a
-``USER``. For backward compatibility, this syntax has been preserved. From Scylla 2.2 and onward, it is recommended to use :ref:`roles <db-roles>`.
+Prior to the introduction of roles in ScyllaDB 2.2, authentication and authorization were based around the concept of a
+``USER``. For backward compatibility, this syntax has been preserved. From ScyllaDB 2.2 and onward, it is recommended to use :ref:`roles <db-roles>`.
 
 .. _create-user-statement:
 
@@ -307,7 +351,7 @@ Data Control
 Permissions
 ~~~~~~~~~~~
 
-Permissions on resources are granted to users; there are several different types of resources in Scylla, and each type
+Permissions on resources are granted to users; there are several different types of resources in ScyllaDB, and each type
 is modelled hierarchically:
 
 - The hierarchy of Data resources, Keyspaces, and Tables has the structure ``ALL KEYSPACES`` -> ``KEYSPACE`` ->

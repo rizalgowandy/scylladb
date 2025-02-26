@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/distributed.hh>
@@ -14,9 +14,7 @@
 
 #include "utils/managed_bytes.hh"
 #include "utils/logalloc.hh"
-#include "utils/managed_ref.hh"
-#include "test/perf/perf.hh"
-#include "log.hh"
+#include "utils/log.hh"
 
 void print_stats() {
     std::cout << "free " << memory::stats().free_memory()

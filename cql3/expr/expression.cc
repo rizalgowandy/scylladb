@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "expression.hh"
@@ -13,32 +13,21 @@
 
 #include <seastar/core/on_internal_error.hh>
 
-#include <boost/algorithm/cxx11/all_of.hpp>
-#include <boost/algorithm/cxx11/any_of.hpp>
-#include <boost/range/adaptors.hpp>
-#include <boost/range/algorithm/set_algorithm.hpp>
-#include <boost/range/algorithm/unique.hpp>
-#include <boost/range/algorithm/sort.hpp>
-#include <boost/range/numeric.hpp>
 #include <fmt/ostream.h>
 #include <unordered_map>
+#include <algorithm>
+#include <ranges>
 
-#include "cql3/constants.hh"
-#include "cql3/lists.hh"
-#include "cql3/statements/request_validations.hh"
 #include "cql3/selection/selection.hh"
 #include "cql3/util.hh"
 #include "index/secondary_index_manager.hh"
 #include "types/list.hh"
 #include "types/map.hh"
 #include "types/set.hh"
+#include "types/vector.hh"
 #include "utils/like_matcher.hh"
 #include "query-result-reader.hh"
 #include "types/user.hh"
-#include "cql3/lists.hh"
-#include "cql3/sets.hh"
-#include "cql3/maps.hh"
-#include "cql3/user_types.hh"
 #include "cql3/functions/scalar_function.hh"
 #include "cql3/functions/first_function.hh"
 #include "cql3/prepare_context.hh"
@@ -47,9 +36,6 @@ namespace cql3 {
 namespace expr {
 
 logging::logger expr_logger("cql_expression");
-
-using boost::adaptors::filtered;
-using boost::adaptors::transformed;
 
 bool operator==(const expression& e1, const expression& e2) {
     if (e1._v->v.index() != e2._v->v.index()) {
@@ -156,7 +142,7 @@ get_value(const subscript& s, const evaluation_inputs& inputs) {
     auto col_type = static_pointer_cast<const collection_type_impl>(type_of(s.val));
     const auto deserialized = type_of(s.val)->deserialize(managed_bytes_view(*serialized));
     const auto key = evaluate(s.sub, inputs);
-    auto&& key_type = col_type->is_map() ? col_type->name_comparator() : int32_type;
+    auto&& key_type = col_type->is_list() ? int32_type : col_type->name_comparator();
     if (key.is_null()) {
         // For m[null] return null.
         // This is different from Cassandra - which treats m[null]
@@ -177,6 +163,15 @@ get_value(const subscript& s, const evaluation_inputs& inputs) {
             });
         });
         return found == data_map.cend() ? std::nullopt : managed_bytes_opt(found->second.serialize_nonnull());
+    } else if (col_type->is_set()) {
+        const auto& data_set = value_cast<set_type_impl::native_type>(deserialized);
+        const auto found = key.view().with_linearized([&] (bytes_view key_bv) {
+            using entry = data_value;
+            return std::find_if(data_set.cbegin(), data_set.cend(), [&] (const entry& element) {
+                return key_type->compare(element.serialize_nonnull(), key_bv) == 0;
+            });
+        });
+        return found == data_set.cend() ? std::nullopt : managed_bytes_opt(found->serialize_nonnull());
     } else if (col_type->is_list()) {
         const auto& data_list = value_cast<list_type_impl::native_type>(deserialized);
         auto key_deserialized = key.view().with_linearized([&] (bytes_view key_bv) {
@@ -301,7 +296,7 @@ bool limits(managed_bytes_view lhs, oper_t op, managed_bytes_view rhs, const abs
 }
 
 bool list_contains_null(managed_bytes_view list) {
-    return boost::algorithm::any_of_equal(partially_deserialize_listlike(list), std::nullopt);
+    return std::ranges::contains(partially_deserialize_listlike(list), managed_bytes_opt());
 }
 
 /// True iff the column value is limited by rhs in the manner prescribed by op.
@@ -344,6 +339,8 @@ bool_or_null limits(const expression& lhs, oper_t op, null_handling_style null_h
                 } else {
                     return list_contains_null(*sides_bytes.second);
                 }
+            case oper_t::NOT_IN:
+                on_internal_error(expr_logger, "NOT IN operator on limits(), despite being rejected via !is_slice()");
             }
         }
     }
@@ -382,7 +379,7 @@ bool_or_null contains(const expression& lhs, const expression& rhs, const evalua
     } else if (collection_type->is_map()) {
         auto data_map = value_cast<map_type_impl::native_type>(lhs_collection);
         using entry = std::pair<data_value, data_value>;
-        return exists_in(data_map | transformed([](const entry& e) { return e.second; }));
+        return exists_in(data_map | std::views::transform([](const entry& e) { return e.second; }));
     } else {
         on_internal_error(expr_logger, "unsupported collection type in a CONTAINS expression");
     }
@@ -507,6 +504,50 @@ bool_or_null is_one_of(const expression& lhs, const expression& rhs, const evalu
     return false;
 }
 
+/// True iff the column value is NOT in the set defined by rhs. Differs from !is_one_of() in handling NULLs.
+bool_or_null is_none_of(const expression& lhs, const expression& rhs, const evaluation_inputs& inputs, null_handling_style null_handling) {
+    std::pair<managed_bytes_opt, managed_bytes_opt> sides_bytes =
+        evaluate_binop_sides(lhs, rhs, oper_t::IN, inputs);
+    if (!sides_bytes.first || !sides_bytes.second) {
+        switch (null_handling) {
+        case null_handling_style::sql:
+            return bool_or_null::null();
+        case null_handling_style::lwt_nulls:
+            if (!sides_bytes.second) {
+                return true;
+            } else {
+                return !list_contains_null(*sides_bytes.second);
+            }
+        }
+    }
+
+    auto [lhs_bytes, rhs_bytes] = std::move(sides_bytes);
+
+    expression lhs_constant = constant(raw_value::make_value(std::move(*lhs_bytes)), type_of(lhs));
+    utils::chunked_vector<managed_bytes_opt> list_elems = get_list_elements(raw_value::make_value(std::move(*rhs_bytes)));
+    bool saw_null = false;
+    for (const managed_bytes_opt& elem : list_elems) {
+        auto cmp_result = equal(lhs_constant, elem, inputs);
+        if (cmp_result.is_null()) {
+            // If we match another element in the list, we can return `false` with
+            // confidence. If we don't, we return NULL to indicate we don't know.
+            saw_null = true;
+        } else if (cmp_result.is_true()) {
+            return false;
+        }
+    }
+    if (saw_null) {
+            switch (null_handling) {
+            case null_handling_style::sql:
+                return bool_or_null::null();
+            case null_handling_style::lwt_nulls:
+                // In LWT, `3 NOT IN (NULL, 5)` counts as true
+                return true;
+            }
+    }
+    return true;
+}
+
 bool is_not_null(const expression& lhs, const expression& rhs, const evaluation_inputs& inputs) {
     cql3::raw_value lhs_val = evaluate(lhs, inputs);
     cql3::raw_value rhs_val = evaluate(rhs, inputs);
@@ -516,83 +557,12 @@ bool is_not_null(const expression& lhs, const expression& rhs, const evaluation_
     return !lhs_val.is_null();
 }
 
-const value_set empty_value_set = value_list{};
-const value_set unbounded_value_set = nonwrapping_range<managed_bytes>::make_open_ended_both_sides();
-
-struct intersection_visitor {
-    const abstract_type* type;
-    value_set operator()(const value_list& a, const value_list& b) const {
-        value_list common;
-        common.reserve(std::max(a.size(), b.size()));
-        boost::set_intersection(a, b, back_inserter(common), type->as_less_comparator());
-        return std::move(common);
-    }
-
-    value_set operator()(const nonwrapping_range<managed_bytes>& a, const value_list& b) const {
-        const auto common = b | filtered([&] (const managed_bytes& el) { return a.contains(el, type->as_tri_comparator()); });
-        return value_list(common.begin(), common.end());
-    }
-
-    value_set operator()(const value_list& a, const nonwrapping_range<managed_bytes>& b) const {
-        return (*this)(b, a);
-    }
-
-    value_set operator()(const nonwrapping_range<managed_bytes>& a, const nonwrapping_range<managed_bytes>& b) const {
-        const auto common_range = a.intersection(b, type->as_tri_comparator());
-        return common_range ? *common_range : empty_value_set;
-    }
-};
-
-value_set intersection(value_set a, value_set b, const abstract_type* type) {
-    return std::visit(intersection_visitor{type}, std::move(a), std::move(b));
-}
-
 } // anonymous namespace
 
 bool is_satisfied_by(const expression& restr, const evaluation_inputs& inputs) {
     static auto true_value = managed_bytes_opt(data_value(true).serialize_nonnull());
     return evaluate(restr, inputs).to_managed_bytes_opt() == true_value;
 }
-
-namespace {
-
-template<typename Range>
-value_list to_sorted_vector(Range r, const serialized_compare& comparator) {
-    BOOST_CONCEPT_ASSERT((boost::ForwardRangeConcept<Range>));
-    value_list tmp(r.begin(), r.end()); // Need random-access range to sort (r is not necessarily random-access).
-    const auto unique = boost::unique(boost::sort(tmp, comparator));
-    return value_list(unique.begin(), unique.end());
-}
-
-const auto non_null = boost::adaptors::filtered([] (const managed_bytes_opt& b) { return b.has_value(); });
-
-const auto deref = boost::adaptors::transformed([] (const managed_bytes_opt& b) { return b.value(); });
-
-/// Returns possible values from t, which must be RHS of IN.
-value_list get_IN_values(
-        const expression& e, const query_options& options, const serialized_compare& comparator,
-        sstring_view column_name) {
-    const cql3::raw_value in_list = evaluate(e, options);
-    if (in_list.is_null()) {
-        return value_list();
-    }
-    utils::chunked_vector<managed_bytes_opt> list_elems = get_list_elements(in_list);
-    return to_sorted_vector(std::move(list_elems) | non_null | deref, comparator);
-}
-
-/// Returns possible values for k-th column from t, which must be RHS of IN.
-value_list get_IN_values(const expression& e, size_t k, const query_options& options,
-                         const serialized_compare& comparator) {
-    const cql3::raw_value in_list = evaluate(e, options);
-    const auto split_values = get_list_of_tuples_elements(in_list, *type_of(e)); // Need lvalue from which to make std::view.
-    const auto result_range = split_values
-            | boost::adaptors::transformed([k] (const std::vector<managed_bytes_opt>& v) { return v[k]; }) | non_null | deref;
-    return to_sorted_vector(std::move(result_range), comparator);
-}
-
-static constexpr bool inclusive = true, exclusive = false;
-
-} // anonymous namespace
 
 const column_value& get_subscripted_column(const subscript& sub) {
     if (!is<column_value>(sub.val)) {
@@ -617,7 +587,7 @@ const column_value& get_subscripted_column(const expression& e) {
 
 expression make_conjunction(expression a, expression b) {
     auto children = explode_conjunction(std::move(a));
-    boost::copy(explode_conjunction(std::move(b)), back_inserter(children));
+    std::ranges::copy(explode_conjunction(std::move(b)), back_inserter(children));
     return conjunction{std::move(children)};
 }
 
@@ -648,396 +618,18 @@ void for_each_boolean_factor(const expression& e, const noncopyable_function<voi
     }
 }
 
-template<typename T>
-nonwrapping_range<std::remove_cvref_t<T>> to_range(oper_t op, T&& val) {
-    using U = std::remove_cvref_t<T>;
-    static constexpr bool inclusive = true, exclusive = false;
-    switch (op) {
-    case oper_t::EQ:
-        return nonwrapping_range<U>::make_singular(std::forward<T>(val));
-    case oper_t::GT:
-        return nonwrapping_range<U>::make_starting_with(interval_bound(std::forward<T>(val), exclusive));
-    case oper_t::GTE:
-        return nonwrapping_range<U>::make_starting_with(interval_bound(std::forward<T>(val), inclusive));
-    case oper_t::LT:
-        return nonwrapping_range<U>::make_ending_with(interval_bound(std::forward<T>(val), exclusive));
-    case oper_t::LTE:
-        return nonwrapping_range<U>::make_ending_with(interval_bound(std::forward<T>(val), inclusive));
-    default:
-        throw std::logic_error(format("to_range: unknown comparison operator {}", op));
-    }
-}
-
-nonwrapping_range<clustering_key_prefix> to_range(oper_t op, const clustering_key_prefix& val) {
-    return to_range<const clustering_key_prefix&>(op, val);
-}
-
-// When cdef == nullptr it finds possible token values instead of column values.
-// When finding token values the table_schema_opt argument has to point to a valid schema,
-// but it isn't used when finding values for column.
-// The schema is needed to find out whether a call to token() function represents
-// the partition token.
-static value_set possible_lhs_values(const column_definition* cdef,
-                                        const expression& expr,
-                                        const query_options& options,
-                                        const schema* table_schema_opt) {
-    const auto type = cdef ? &cdef->type->without_reversed() : long_type.get();
-    return expr::visit(overloaded_functor{
-            [] (const constant& constant_val) {
-                std::optional<bool> bool_val = get_bool_value(constant_val);
-                if (bool_val.has_value()) {
-                    return *bool_val ? unbounded_value_set : empty_value_set;
-                }
-
-                on_internal_error(expr_logger,
-                    "possible_lhs_values: a constant that is not a bool value cannot serve as a restriction by itself");
-            },
-            [&] (const conjunction& conj) {
-                return boost::accumulate(conj.children, unbounded_value_set,
-                        [&] (const value_set& acc, const expression& child) {
-                            return intersection(
-                                    std::move(acc), possible_lhs_values(cdef, child, options, table_schema_opt), type);
-                        });
-            },
-            [&] (const binary_operator& oper) -> value_set {
-                return expr::visit(overloaded_functor{
-                        [&] (const column_value& col) -> value_set {
-                            if (!cdef || cdef != col.col) {
-                                return unbounded_value_set;
-                            }
-                            if (is_compare(oper.op)) {
-                                managed_bytes_opt val = evaluate(oper.rhs, options).to_managed_bytes_opt();
-                                if (!val) {
-                                    return empty_value_set; // All NULL comparisons fail; no column values match.
-                                }
-                                return oper.op == oper_t::EQ ? value_set(value_list{*val})
-                                        : to_range(oper.op, std::move(*val));
-                            } else if (oper.op == oper_t::IN) {
-                                return get_IN_values(oper.rhs, options, type->as_less_comparator(), cdef->name_as_text());
-                            } else if (oper.op == oper_t::CONTAINS || oper.op == oper_t::CONTAINS_KEY) {
-                                managed_bytes_opt val = evaluate(oper.rhs, options).to_managed_bytes_opt();
-                                if (!val) {
-                                    return empty_value_set; // All NULL comparisons fail; no column values match.
-                                }
-                                return value_set(value_list{*val});
-                            }
-                            throw std::logic_error(format("possible_lhs_values: unhandled operator {}", oper));
-                        },
-                        [&] (const subscript& s) -> value_set {
-                            const column_value& col = get_subscripted_column(s);
-
-                            if (!cdef || cdef != col.col) {
-                                return unbounded_value_set;
-                            }
-
-                            managed_bytes_opt sval = evaluate(s.sub, options).to_managed_bytes_opt();
-                            if (!sval) {
-                                return empty_value_set; // NULL can't be a map key
-                            }
-
-                            if (oper.op == oper_t::EQ) {
-                                managed_bytes_opt rval = evaluate(oper.rhs, options).to_managed_bytes_opt();
-                                if (!rval) {
-                                    return empty_value_set; // All NULL comparisons fail; no column values match.
-                                }
-                                managed_bytes_opt elements[] = {sval, rval};
-                                managed_bytes val = tuple_type_impl::build_value_fragmented(elements);
-                                return value_set(value_list{val});
-                            }
-                            throw std::logic_error(format("possible_lhs_values: unhandled operator {}", oper));
-                        },
-                        [&] (const tuple_constructor& tuple) -> value_set {
-                            if (!cdef) {
-                                return unbounded_value_set;
-                            }
-                            const auto found = boost::find_if(
-                                    tuple.elements, [&] (const expression& c) { return expr::as<column_value>(c).col == cdef; });
-                            if (found == tuple.elements.end()) {
-                                return unbounded_value_set;
-                            }
-                            const auto column_index_on_lhs = std::distance(tuple.elements.begin(), found);
-                            if (is_compare(oper.op)) {
-                                // RHS must be a tuple due to upstream checks.
-                                managed_bytes_opt val = get_tuple_elements(evaluate(oper.rhs, options), *type_of(oper.rhs)).at(column_index_on_lhs);
-                                if (!val) {
-                                    return empty_value_set; // All NULL comparisons fail; no column values match.
-                                }
-                                if (oper.op == oper_t::EQ) {
-                                    return value_list{std::move(*val)};
-                                }
-                                if (column_index_on_lhs > 0) {
-                                    // A multi-column comparison restricts only the first column, because
-                                    // comparison is lexicographical.
-                                    return unbounded_value_set;
-                                }
-                                return to_range(oper.op, std::move(*val));
-                            } else if (oper.op == oper_t::IN) {
-                                return get_IN_values(oper.rhs, column_index_on_lhs, options, type->as_less_comparator());
-                            }
-                            return unbounded_value_set;
-                        },
-                        [&] (const function_call& token_fun_call) -> value_set {
-                            if (!is_partition_token_for_schema(token_fun_call, *table_schema_opt)) {
-                                on_internal_error(expr_logger, "possible_lhs_values: function calls are not supported as the LHS of a binary expression");
-                            }
-
-                            if (cdef) {
-                                return unbounded_value_set;
-                            }
-                            const auto val = evaluate(oper.rhs, options).to_managed_bytes_opt();
-                            if (!val) {
-                                return empty_value_set; // All NULL comparisons fail; no token values match.
-                            }
-                            if (oper.op == oper_t::EQ) {
-                                return value_list{*val};
-                            } else if (oper.op == oper_t::GT) {
-                                return nonwrapping_range<managed_bytes>::make_starting_with(interval_bound(std::move(*val), exclusive));
-                            } else if (oper.op == oper_t::GTE) {
-                                return nonwrapping_range<managed_bytes>::make_starting_with(interval_bound(std::move(*val), inclusive));
-                            }
-                            static const managed_bytes MININT = managed_bytes(serialized(std::numeric_limits<int64_t>::min())),
-                                    MAXINT = managed_bytes(serialized(std::numeric_limits<int64_t>::max()));
-                            // Undocumented feature: when the user types `token(...) < MININT`, we interpret
-                            // that as MAXINT for some reason.
-                            const auto adjusted_val = (*val == MININT) ? MAXINT : *val;
-                            if (oper.op == oper_t::LT) {
-                                return nonwrapping_range<managed_bytes>::make_ending_with(interval_bound(std::move(adjusted_val), exclusive));
-                            } else if (oper.op == oper_t::LTE) {
-                                return nonwrapping_range<managed_bytes>::make_ending_with(interval_bound(std::move(adjusted_val), inclusive));
-                            }
-                            throw std::logic_error(format("get_token_interval invalid operator {}", oper.op));
-                        },
-                        [&] (const binary_operator&) -> value_set {
-                            on_internal_error(expr_logger, "possible_lhs_values: nested binary operators are not supported");
-                        },
-                        [&] (const conjunction&) -> value_set {
-                            on_internal_error(expr_logger, "possible_lhs_values: conjunctions are not supported as the LHS of a binary expression");
-                        },
-                        [] (const constant&) -> value_set {
-                            on_internal_error(expr_logger, "possible_lhs_values: constants are not supported as the LHS of a binary expression");
-                        },
-                        [] (const unresolved_identifier&) -> value_set {
-                            on_internal_error(expr_logger, "possible_lhs_values: unresolved identifiers are not supported as the LHS of a binary expression");
-                        },
-                        [] (const column_mutation_attribute&) -> value_set {
-                            on_internal_error(expr_logger, "possible_lhs_values: writetime/ttl are not supported as the LHS of a binary expression");
-                        },
-                        [] (const cast&) -> value_set {
-                            on_internal_error(expr_logger, "possible_lhs_values: typecasts are not supported as the LHS of a binary expression");
-                        },
-                        [] (const field_selection&) -> value_set {
-                            on_internal_error(expr_logger, "possible_lhs_values: field selections are not supported as the LHS of a binary expression");
-                        },
-                        [] (const bind_variable&) -> value_set {
-                            on_internal_error(expr_logger, "possible_lhs_values: bind variables are not supported as the LHS of a binary expression");
-                        },
-                        [] (const untyped_constant&) -> value_set {
-                            on_internal_error(expr_logger, "possible_lhs_values: untyped constants are not supported as the LHS of a binary expression");
-                        },
-                        [] (const collection_constructor&) -> value_set {
-                            on_internal_error(expr_logger, "possible_lhs_values: collection constructors are not supported as the LHS of a binary expression");
-                        },
-                        [] (const usertype_constructor&) -> value_set {
-                            on_internal_error(expr_logger, "possible_lhs_values: user type constructors are not supported as the LHS of a binary expression");
-                        },
-                        [] (const temporary&) -> value_set {
-                            on_internal_error(expr_logger, "possible_lhs_values: temporaries are not supported as the LHS of a binary expression");
-                        },
-                    }, oper.lhs);
-            },
-            [] (const column_value&) -> value_set {
-                on_internal_error(expr_logger, "possible_lhs_values: a column cannot serve as a restriction by itself");
-            },
-            [] (const subscript&) -> value_set {
-                on_internal_error(expr_logger, "possible_lhs_values: a subscript cannot serve as a restriction by itself");
-            },
-            [] (const unresolved_identifier&) -> value_set {
-                on_internal_error(expr_logger, "possible_lhs_values: an unresolved identifier cannot serve as a restriction");
-            },
-            [] (const column_mutation_attribute&) -> value_set {
-                on_internal_error(expr_logger, "possible_lhs_values: the writetime/ttl functions cannot serve as a restriction by itself");
-            },
-            [] (const function_call&) -> value_set {
-                on_internal_error(expr_logger, "possible_lhs_values: a function call cannot serve as a restriction by itself");
-            },
-            [] (const cast&) -> value_set {
-                on_internal_error(expr_logger, "possible_lhs_values: a typecast cannot serve as a restriction by itself");
-            },
-            [] (const field_selection&) -> value_set {
-                on_internal_error(expr_logger, "possible_lhs_values: a field selection cannot serve as a restriction by itself");
-            },
-            [] (const bind_variable&) -> value_set {
-                on_internal_error(expr_logger, "possible_lhs_values: a bind variable cannot serve as a restriction by itself");
-            },
-            [] (const untyped_constant&) -> value_set {
-                on_internal_error(expr_logger, "possible_lhs_values: an untyped constant cannot serve as a restriction by itself");
-            },
-            [] (const tuple_constructor&) -> value_set {
-                on_internal_error(expr_logger, "possible_lhs_values: an tuple constructor cannot serve as a restriction by itself");
-            },
-            [] (const collection_constructor&) -> value_set {
-                on_internal_error(expr_logger, "possible_lhs_values: a collection constructor cannot serve as a restriction by itself");
-            },
-            [] (const usertype_constructor&) -> value_set {
-                on_internal_error(expr_logger, "possible_lhs_values: a user type constructor cannot serve as a restriction by itself");
-            },
-            [] (const temporary&) -> value_set {
-                on_internal_error(expr_logger, "possible_lhs_values: a temporary cannot serve as a restriction by itself");
-            },
-        }, expr);
-}
-
-value_set possible_column_values(const column_definition* col, const expression& e, const query_options& options) {
-    return possible_lhs_values(col, e, options, nullptr);
-}
-
-value_set possible_partition_token_values(const expression& e, const query_options& options, const schema& table_schema) {
-    return possible_lhs_values(nullptr, e, options, &table_schema);
-}
-
-nonwrapping_range<managed_bytes> to_range(const value_set& s) {
-    return std::visit(overloaded_functor{
-            [] (const nonwrapping_range<managed_bytes>& r) { return r; },
-            [] (const value_list& lst) {
-                if (lst.size() != 1) {
-                    throw std::logic_error(format("to_range called on list of size {}", lst.size()));
-                }
-                return nonwrapping_range<managed_bytes>::make_singular(lst[0]);
-            },
-        }, s);
-}
-
-namespace {
-constexpr inline secondary_index::index::supports_expression_v operator&&(secondary_index::index::supports_expression_v v1, secondary_index::index::supports_expression_v v2) {
-    using namespace secondary_index;
-    auto True = index::supports_expression_v::from_bool(true);
-    return v1 == True && v2 == True ? True : index::supports_expression_v::from_bool(false);
-}
-
-secondary_index::index::supports_expression_v is_supported_by_helper(const expression& expr, const secondary_index::index& idx) {
-    using ret_t = secondary_index::index::supports_expression_v;
-    using namespace secondary_index;
-    return expr::visit(overloaded_functor{
-            [&] (const conjunction& conj) -> ret_t {
-                if (conj.children.empty()) {
-                    return index::supports_expression_v::from_bool(true);
-                }
-                auto init = is_supported_by_helper(conj.children[0], idx);
-                return std::accumulate(std::begin(conj.children) + 1, std::end(conj.children), init, 
-                        [&] (ret_t acc, const expression& child) -> ret_t {
-                            return acc && is_supported_by_helper(child, idx);
-                });
-            },
-            [&] (const binary_operator& oper) {
-                return expr::visit(overloaded_functor{
-                        [&] (const column_value& col) {
-                            return idx.supports_expression(*col.col, oper.op);
-                        },
-                        [&] (const tuple_constructor& tuple) {
-                            if (tuple.elements.size() == 1) {
-                                if (auto column = expr::as_if<column_value>(&tuple.elements[0])) {
-                                    return idx.supports_expression(*column->col, oper.op);
-                                }
-                            }
-                            // We don't use index table for multi-column restrictions, as it cannot avoid filtering.
-                            return index::supports_expression_v::from_bool(false);
-                        },
-                        [&] (const function_call&) { return index::supports_expression_v::from_bool(false); },
-                        [&] (const subscript& s) -> ret_t {
-                            const column_value& col = get_subscripted_column(s);
-                            return idx.supports_subscript_expression(*col.col, oper.op);
-                        },
-                        [&] (const binary_operator&) -> ret_t {
-                            on_internal_error(expr_logger, "is_supported_by: nested binary operators are not supported");
-                        },
-                        [&] (const conjunction&) -> ret_t {
-                            on_internal_error(expr_logger, "is_supported_by: conjunctions are not supported as the LHS of a binary expression");
-                        },
-                        [] (const constant&) -> ret_t {
-                            on_internal_error(expr_logger, "is_supported_by: constants are not supported as the LHS of a binary expression");
-                        },
-                        [] (const unresolved_identifier&) -> ret_t {
-                            on_internal_error(expr_logger, "is_supported_by: an unresolved identifier is not supported as the LHS of a binary expression");
-                        },
-                        [&] (const column_mutation_attribute&) -> ret_t {
-                            on_internal_error(expr_logger, "is_supported_by: writetime/ttl are not supported as the LHS of a binary expression");
-                        },
-                        [&] (const cast&) -> ret_t {
-                            on_internal_error(expr_logger, "is_supported_by: typecasts are not supported as the LHS of a binary expression");
-                        },
-                        [&] (const field_selection&) -> ret_t {
-                            on_internal_error(expr_logger, "is_supported_by: field selections are not supported as the LHS of a binary expression");
-                        },
-                        [&] (const bind_variable&) -> ret_t {
-                            on_internal_error(expr_logger, "is_supported_by: bind variables are not supported as the LHS of a binary expression");
-                        },
-                        [&] (const untyped_constant&) -> ret_t {
-                            on_internal_error(expr_logger, "is_supported_by: untyped constants are not supported as the LHS of a binary expression");
-                        },
-                        [&] (const collection_constructor&) -> ret_t {
-                            on_internal_error(expr_logger, "is_supported_by: collection constructors are not supported as the LHS of a binary expression");
-                        },
-                        [&] (const usertype_constructor&) -> ret_t {
-                            on_internal_error(expr_logger, "is_supported_by: user type constructors are not supported as the LHS of a binary expression");
-                        },
-                        [&] (const temporary&) -> ret_t {
-                            on_internal_error(expr_logger, "is_supported_by: temporaries are not supported as the LHS of a binary expression");
-                        },
-                    }, oper.lhs);
-            },
-            [] (const auto& default_case) { return index::supports_expression_v::from_bool(false); }
-        }, expr);
-}
-}
-
-bool is_supported_by(const expression& expr, const secondary_index::index& idx) {
-    auto s = is_supported_by_helper(expr, idx);
-    return s != secondary_index::index::supports_expression_v::from_bool(false);
-}
-
-
-bool has_supporting_index(
-        const expression& expr,
-        const secondary_index::secondary_index_manager& index_manager,
-        allow_local_index allow_local) {
-    const auto indexes = index_manager.list_indexes();
-    const auto support = std::bind(is_supported_by, std::ref(expr), std::placeholders::_1);
-    return allow_local ? boost::algorithm::any_of(indexes, support)
-            : boost::algorithm::any_of(
-                    indexes | filtered([] (const secondary_index::index& i) { return !i.metadata().local(); }),
-                    support);
-}
-
-bool index_supports_some_column(
-        const expression& e,
-        const secondary_index::secondary_index_manager& index_manager,
-        allow_local_index allow_local) {
-    single_column_restrictions_map single_col_restrictions = get_single_column_restrictions_map(e);
-
-    for (auto&& [col, col_restrictions] : single_col_restrictions) {
-        if (has_supporting_index(col_restrictions, index_manager, allow_local)) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
 std::ostream& operator<<(std::ostream& os, const column_value& cv) {
     os << cv.col->name_as_text();
     return os;
 }
 
-std::ostream& operator<<(std::ostream& os, const expression& expr) {
-    expression::printer pr {
-        .expr_to_print = expr,
-        .debug_mode = false
-    };
-
-    return os << pr;
+}
 }
 
-std::ostream& operator<<(std::ostream& os, const expression::printer& pr) {
+template <typename FormatContext>
+auto fmt::formatter<cql3::expr::expression::printer>::format(const cql3::expr::expression::printer& pr, FormatContext& ctx) const
+        -> decltype(ctx.out()) {
+    using namespace cql3::expr;
     // Wraps expression in expression::printer to forward formatting options
     auto to_printer = [&pr] (const expression& expr) -> expression::printer {
         return expression::printer {
@@ -1047,103 +639,105 @@ std::ostream& operator<<(std::ostream& os, const expression::printer& pr) {
         };
     };
 
-    expr::visit(overloaded_functor{
+    auto out = ctx.out();
+    cql3::expr::visit(overloaded_functor{
             [&] (const constant& v) {
                 if (pr.debug_mode) {
-                    os << v.view();
+                    out = fmt::format_to(out, "{}", v.view());
                 } else {
                     if (v.value.is_null()) {
-                        os << "null";
+                        out = fmt::format_to(out, "null");
                     } else {
                         v.value.view().with_value([&](const FragmentedView auto& bytes_view) {
                             data_value deser_val = v.type->deserialize(bytes_view);
-                            os << deser_val.to_parsable_string();
+                            out = fmt::format_to(out, "{}", deser_val.to_parsable_string());
                         });
                     }
                 }
             },
-            [&] (const conjunction& conj) {
-                fmt::print(os, "({})", fmt::join(conj.children | transformed(to_printer), ") AND ("));
+            [&] (const cql3::expr::conjunction& conj) {
+                out = fmt::format_to(out, "({})", fmt::join(conj.children | std::views::transform(to_printer), ") AND ("));
             },
             [&] (const binary_operator& opr) {
                 if (pr.debug_mode) {
-                    os << "(" << to_printer(opr.lhs) << ") " << opr.op << ' ' << to_printer(opr.rhs);
+                    out = fmt::format_to(out, "({}) {} {}", to_printer(opr.lhs), opr.op, to_printer(opr.rhs));
                     if (opr.null_handling == null_handling_style::lwt_nulls) {
-                        os << " [[lwt_nulls]]";
+                        out = fmt::format_to(out, " [[lwt_nulls]]");
                     }
                 } else {
-                    if (opr.op == oper_t::IN && is<collection_constructor>(opr.rhs)) {
+                    if ((opr.op == oper_t::IN || opr.op == oper_t::NOT_IN) && is<collection_constructor>(opr.rhs)) {
                         tuple_constructor rhs_tuple {
                             .elements = as<collection_constructor>(opr.rhs).elements
                         };
-                        os << to_printer(opr.lhs) << ' ' << opr.op << ' ' << to_printer(rhs_tuple);
-                    } else if (opr.op == oper_t::IN && is<constant>(opr.rhs) && as<constant>(opr.rhs).type->without_reversed().is_list()) {
+                        out = fmt::format_to(out, "{} {} {}", to_printer(opr.lhs), opr.op, to_printer(rhs_tuple));
+                    } else if ((opr.op == oper_t::IN || opr.op == oper_t::NOT_IN) && is<constant>(opr.rhs) && as<constant>(opr.rhs).type->without_reversed().is_list()) {
                         tuple_constructor rhs_tuple;
                         const list_type_impl* list_typ = dynamic_cast<const list_type_impl*>(&as<constant>(opr.rhs).type->without_reversed());
                         for (const managed_bytes_opt& elem : get_list_elements(as<constant>(opr.rhs).value)) {
-                            rhs_tuple.elements.push_back(constant(raw_value::make_value(elem), list_typ->get_elements_type()));
+                            rhs_tuple.elements.push_back(constant(cql3::raw_value::make_value(elem), list_typ->get_elements_type()));
                         }
-                        os << to_printer(opr.lhs) << ' ' << opr.op << ' ' << to_printer(rhs_tuple);
+                        out = fmt::format_to(out, "{} {} {}", to_printer(opr.lhs), opr.op, to_printer(rhs_tuple));
                     } else {
-                        os << to_printer(opr.lhs) << ' ' << opr.op << ' ' << to_printer(opr.rhs);
+                        out = fmt::format_to(out, "{} {} {}", to_printer(opr.lhs), opr.op, to_printer(opr.rhs));
                     }
                 }
             },
             [&] (const column_value& col) {
                 if (pr.for_metadata) {
-                    fmt::print(os, "{}", col.col->name_as_text());
+                    out = fmt::format_to(out, "{}", col.col->name_as_text());
                 } else {
-                    fmt::print(os, "{}", col.col->name_as_cql_string());
+                    out = fmt::format_to(out, "{}", col.col->name_as_cql_string());
                 }
             },
             [&] (const subscript& sub) {
-                fmt::print(os, "{}[{}]", to_printer(sub.val), to_printer(sub.sub));
+                out = fmt::format_to(out, "{}[{}]", to_printer(sub.val), to_printer(sub.sub));
             },
             [&] (const unresolved_identifier& ui) {
                 if (pr.debug_mode) {
-                    fmt::print(os, "unresolved({})", *ui.ident);
+                    out = fmt::format_to(out, "unresolved({})", *ui.ident);
                 } else {
-                    fmt::print(os, "{}", cql3::util::maybe_quote(ui.ident->to_string()));
+                    out = fmt::format_to(out, "{}", cql3::util::maybe_quote(ui.ident->to_string()));
                 }
             },
             [&] (const column_mutation_attribute& cma)  {
                 if (!pr.for_metadata) {
-                    fmt::print(os, "{}({})",
+                    out = fmt::format_to(out, "{}({})",
                             cma.kind,
                             to_printer(cma.column));
                 } else {
                     auto kind = fmt::format("{}", cma.kind);
                     std::transform(kind.begin(), kind.end(), kind.begin(), [] (unsigned char c) { return std::tolower(c); });
-                    fmt::print(os, "{}({})", kind, to_printer(cma.column));
+                    out = fmt::format_to(out, "{}({})", kind, to_printer(cma.column));
                 }
             },
             [&] (const function_call& fc)  {
                 if (is_token_function(fc)) {
                     if (!pr.for_metadata) {
-                        fmt::print(os, "token({})", fmt::join(fc.args | transformed(to_printer), ", "));
+                        out = fmt::format_to(out, "token({})", fmt::join(fc.args | std::views::transform(to_printer), ", "));
                     } else {
-                        fmt::print(os, "system.token({})", fmt::join(fc.args | transformed(to_printer), ", "));
+                        out = fmt::format_to(out, "system.token({})", fmt::join(fc.args | std::views::transform(to_printer), ", "));
                     }
                 } else {
                     std::visit(overloaded_functor{
-                        [&] (const functions::function_name& named) {
-                            fmt::print(os, "{}({})", named, fmt::join(fc.args | transformed(to_printer), ", "));
+                        [&] (const cql3::functions::function_name& named) {
+                            out = fmt::format_to(out, "{}({})", named, fmt::join(fc.args | std::views::transform(to_printer), ", "));
                         },
-                        [&] (const shared_ptr<functions::function>& fn) {
+                        [&] (const shared_ptr<cql3::functions::function>& fn) {
                             if (!pr.debug_mode && fn->name() == cql3::functions::aggregate_fcts::first_function_name()) {
                                 // The "first" function is artificial, don't emit it
-                                fmt::print(os, "{}", to_printer(fc.args[0]));
+                                out = fmt::format_to(out, "{}", to_printer(fc.args[0]));
                             } else if (!pr.for_metadata) {
-                                fmt::print(os, "{}({})", fn->name(), fmt::join(fc.args | transformed(to_printer), ", "));
+                                out = fmt::format_to(out, "{}({})", fn->name(), fmt::join(fc.args | std::views::transform(to_printer), ", "));
                             } else {
                                 const std::string_view fn_name = fn->name().name;
                                 if (fn->name().keyspace == "system" && fn_name.starts_with("castas")) {
                                     auto cast_type = fn_name.substr(6);
-                                    fmt::print(os, "cast({} as {})", fmt::join(fc.args | transformed(to_printer) | transformed(fmt::to_string<expression::printer>), ", "),
+                                    out = fmt::format_to(out, "cast({} as {})", fmt::join(fc.args | std::views::transform(to_printer), ", "),
                                          cast_type);
                                 } else {
-                                    auto args = boost::copy_range<std::vector<sstring>>(fc.args | transformed(to_printer) | transformed(fmt::to_string<expression::printer>));
-                                    fmt::print(os, "{}", fn->column_name(args));
+                                    auto args = fc.args | std::views::transform(to_printer) | std::views::transform(fmt::to_string<expression::printer>)
+                                            | std::ranges::to<std::vector<sstring>>();
+                                    out = fmt::format_to(out, "{}", fn->column_name(args));
                                 }
                             }
                         },
@@ -1152,105 +746,109 @@ std::ostream& operator<<(std::ostream& os, const expression::printer& pr) {
             },
             [&] (const cast& c)  {
                 auto type_str = std::visit(overloaded_functor{
-                    [&] (const cql3_type& t) {
+                    [&] (const cql3::cql3_type& t) {
                         return fmt::format("{}", t);
                     },
-                    [&] (const shared_ptr<cql3_type::raw>& t) {
+                    [&] (const shared_ptr<cql3::cql3_type::raw>& t) {
                         return fmt::format("{}", t);
                     }}, c.type);
 
                 switch (c.style) {
                 case cast::cast_style::sql:
-                    fmt::print(os, "({} AS {})", to_printer(c.arg), type_str);
+                    out = fmt::format_to(out, "({} AS {})", to_printer(c.arg), type_str);
                     return;
                 case cast::cast_style::c:
-                    fmt::print(os, "({}) {}", type_str, to_printer(c.arg));
+                    out = fmt::format_to(out, "({}) {}", type_str, to_printer(c.arg));
                     return;
                 }
                 on_internal_error(expr_logger, "unexpected cast_style");
             },
             [&] (const field_selection& fs)  {
                 if (pr.debug_mode) {
-                    fmt::print(os, "({}.{})", to_printer(fs.structure), fs.field);
+                    out = fmt::format_to(out, "({}.{})", to_printer(fs.structure), fs.field);
                 } else {
-                    fmt::print(os, "{}.{}", to_printer(fs.structure), fs.field);
+                    out = fmt::format_to(out, "{}.{}", to_printer(fs.structure), fs.field);
                 }
             },
             [&] (const bind_variable&) {
                 // FIXME: store and present bind variable name
-                fmt::print(os, "?");
+                out = fmt::format_to(out, "?");
             },
             [&] (const untyped_constant& uc) {
                 if (uc.partial_type == untyped_constant::type_class::string) {
-                    fmt::print(os, "'{}'", uc.raw_text);
+                    out = fmt::format_to(out, "'{}'", uc.raw_text);
                 } else {
-                    fmt::print(os, "{}", uc.raw_text);
+                    out = fmt::format_to(out, "{}", uc.raw_text);
                 }
             },
             [&] (const tuple_constructor& tc) {
-                fmt::print(os, "({})", fmt::join(tc.elements | transformed(to_printer), ", "));
+                out = fmt::format_to(out, "({})", fmt::join(tc.elements | std::views::transform(to_printer), ", "));
             },
             [&] (const collection_constructor& cc) {
                 switch (cc.style) {
-                case collection_constructor::style_type::list: {
-                    fmt::print(os, "[{}]", fmt::join(cc.elements | transformed(to_printer), ", "));
+                case collection_constructor::style_type::list_or_vector: {
+                    out = fmt::format_to(out, "[{}]", fmt::join(cc.elements | std::views::transform(to_printer), ", "));
                     return;
                 }
                 case collection_constructor::style_type::set: {
-                    fmt::print(os, "{{{}}}", fmt::join(cc.elements | transformed(to_printer), ", "));
+                    out = fmt::format_to(out, "{{{}}}", fmt::join(cc.elements | std::views::transform(to_printer), ", "));
                     return;
                 }
                 case collection_constructor::style_type::map: {
-                    fmt::print(os, "{{");
+                    out = fmt::format_to(out, "{{");
                     bool first = true;
                     for (auto& e : cc.elements) {
                         if (!first) {
-                            fmt::print(os, ", ");
+                            out = fmt::format_to(out, ", ");
                         }
                         first = false;
-                        auto& tuple = expr::as<tuple_constructor>(e);
+                        auto& tuple = cql3::expr::as<tuple_constructor>(e);
                         if (tuple.elements.size() != 2) {
                             on_internal_error(expr_logger, "map constructor element is not a tuple of arity 2");
                         }
-                        fmt::print(os, "{}:{}", to_printer(tuple.elements[0]), to_printer(tuple.elements[1]));
+                        out = fmt::format_to(out, "{}:{}", to_printer(tuple.elements[0]), to_printer(tuple.elements[1]));
                     }
-                    fmt::print(os, "}}");
+                    out = fmt::format_to(out, "}}");
+                    return;
+                }
+                case collection_constructor::style_type::vector: {
+                    out = fmt::format_to(out, "[{}]", fmt::join(cc.elements | std::views::transform(to_printer), ", "));
                     return;
                 }
                 }
                 on_internal_error(expr_logger, fmt::format("unexpected collection_constructor style {}", static_cast<unsigned>(cc.style)));
             },
             [&] (const usertype_constructor& uc) {
-                fmt::print(os, "{{");
+                out = fmt::format_to(out, "{{");
                 bool first = true;
                 for (auto& [k, v] : uc.elements) {
                     if (!first) {
-                        fmt::print(os, ", ");
+                        out = fmt::format_to(out, ", ");
                     }
                     first = false;
-                    fmt::print(os, "{}:{}", k, to_printer(v));
+                    out = fmt::format_to(out, "{}:{}", k, to_printer(v));
                 }
-                fmt::print(os, "}}");
+                out = fmt::format_to(out, "}}");
             },
             [&] (const temporary& t) {
-                fmt::print(os, "@temporary{}", t.index);
+                out = fmt::format_to(out, "@temporary{}", t.index);
             }
         }, pr.expr_to_print);
-    return os;
+    return out;
 }
+
+template auto
+fmt::formatter<cql3::expr::expression::printer>::format<fmt::format_context>(const cql3::expr::expression::printer&, fmt::format_context& ctx) const
+    -> decltype(ctx.out());
+template auto
+fmt::formatter<cql3::expr::expression::printer>::format<fmt::basic_format_context<std::back_insert_iterator<std::string>, char>>(const cql3::expr::expression::printer&, fmt::basic_format_context<std::back_insert_iterator<std::string>, char>& ctx) const
+    -> decltype(ctx.out());
+
+namespace cql3 {
+namespace expr {
 
 sstring to_string(const expression& expr) {
     return fmt::format("{}", expr);
-}
-
-bool is_on_collection(const binary_operator& b) {
-    if (b.op == oper_t::CONTAINS || b.op == oper_t::CONTAINS_KEY) {
-        return true;
-    }
-    if (auto tuple = expr::as_if<tuple_constructor>(&b.lhs)) {
-        return boost::algorithm::any_of(tuple->elements, [] (const expression& v) { return expr::is<subscript>(v); });
-    }
-    return false;
 }
 
 bool contains_column(const column_definition& column, const expression& e) {
@@ -1277,54 +875,6 @@ bool contains_nonpure_function(const expression& e) {
         }
     );
     return find_res != nullptr;
-}
-
-bool has_eq_restriction_on_column(const column_definition& column, const expression& e) {
-    std::function<bool(const expression&)> column_in_lhs = [&](const expression& e) -> bool {
-        return visit(overloaded_functor {
-            [&](const column_value& cv) {
-                // Use column_defintion::operator== for comparison,
-                // columns with the same name but different schema will not be equal.
-                return *cv.col == column;
-            },
-            [&](const tuple_constructor& tc) {
-                for (const expression& elem : tc.elements) {
-                    if (column_in_lhs(elem)) {
-                        return true;
-                    }
-                }
-
-                return false;
-            },
-            [&](const auto&) {return false;}
-        }, e);
-    };
-
-    // Look for binary operator describing eq relation with this column on lhs
-    const binary_operator* eq_restriction_search_res = find_binop(e, [&](const binary_operator& b) {
-        if (b.op != oper_t::EQ) {
-            return false;
-        }
-
-        if (!column_in_lhs(b.lhs)) {
-            return false;
-        }
-
-        // These conditions are not allowed to occur in the current code,
-        // but they might be allowed in the future.
-        // They are added now to avoid surprises later.
-        //
-        // These conditions detect cases like:
-        // WHERE column1 = column2
-        // WHERE column1 = row_number()
-        if (contains_column(column, b.rhs) || contains_nonpure_function(b.rhs)) {
-            return false;
-        }
-
-        return true;
-    });
-
-    return eq_restriction_search_res != nullptr;
 }
 
 expression replace_column_def(const expression& expr, const column_definition* new_cdef) {
@@ -1434,9 +984,9 @@ expression search_and_replace(const expression& e,
             overloaded_functor{
                 [&] (const conjunction& conj) -> expression {
                     return conjunction{
-                        boost::copy_range<std::vector<expression>>(
-                            conj.children | boost::adaptors::transformed(recurse)
-                        )
+                            conj.children
+                            | std::views::transform(recurse)
+                            | std::ranges::to<std::vector>()
                     };
                 },
                 [&] (const binary_operator& oper) -> expression {
@@ -1447,18 +997,18 @@ expression search_and_replace(const expression& e,
                 },
                 [&] (const tuple_constructor& tc) -> expression {
                     return tuple_constructor{
-                        boost::copy_range<std::vector<expression>>(
-                            tc.elements | boost::adaptors::transformed(recurse)
-                        ),
+                        tc.elements
+                            | std::views::transform(recurse)
+                            | std::ranges::to<std::vector>(),
                         tc.type
                     };
                 },
                 [&] (const collection_constructor& c) -> expression {
                     return collection_constructor{
                         c.style,
-                        boost::copy_range<std::vector<expression>>(
-                            c.elements | boost::adaptors::transformed(recurse)
-                        ),
+                        c.elements
+                            | std::views::transform(recurse)
+                            | std::ranges::to<std::vector>(),
                         c.type
                     };
                 },
@@ -1472,9 +1022,9 @@ expression search_and_replace(const expression& e,
                 [&] (const function_call& fc) -> expression {
                     return function_call{
                         fc.func,
-                        boost::copy_range<std::vector<expression>>(
-                            fc.args | boost::adaptors::transformed(recurse)
-                        )
+                        fc.args
+                            | std::views::transform(recurse)
+                            | std::ranges::to<std::vector>()
                     };
                 },
                 [&] (const cast& c) -> expression {
@@ -1495,97 +1045,6 @@ expression search_and_replace(const expression& e,
                 },
             }, e);
     }
-}
-
-std::ostream& operator<<(std::ostream& s, oper_t op) {
-    switch (op) {
-    case oper_t::EQ:
-        return s << "=";
-    case oper_t::NEQ:
-        return s << "!=";
-    case oper_t::LT:
-        return s << "<";
-    case oper_t::LTE:
-        return s << "<=";
-    case oper_t::GT:
-        return s << ">";
-    case oper_t::GTE:
-        return s << ">=";
-    case oper_t::IN:
-        return s << "IN";
-    case oper_t::CONTAINS:
-        return s << "CONTAINS";
-    case oper_t::CONTAINS_KEY:
-        return s << "CONTAINS KEY";
-    case oper_t::IS_NOT:
-        return s << "IS NOT";
-    case oper_t::LIKE:
-        return s << "LIKE";
-    }
-    __builtin_unreachable();
-}
-
-std::vector<expression> extract_single_column_restrictions_for_column(const expression& expr,
-                                                                      const column_definition& column) {
-    struct visitor {
-        std::vector<expression> restrictions;
-        const column_definition& column;
-        const binary_operator* current_binary_operator;
-
-        void operator()(const constant&) {}
-
-        void operator()(const conjunction& conj) {
-            for (const expression& child : conj.children) {
-                expr::visit(*this, child);
-            }
-        }
-
-        void operator()(const binary_operator& oper) {
-            if (current_binary_operator != nullptr) {
-                on_internal_error(expr_logger,
-                    "extract_single_column_restrictions_for_column: nested binary operators are not supported");
-            }
-
-            current_binary_operator = &oper;
-            expr::visit(*this, oper.lhs);
-            current_binary_operator = nullptr;
-        }
-
-        void operator()(const column_value& cv) {
-            if (*cv.col == column && current_binary_operator != nullptr) {
-                restrictions.emplace_back(*current_binary_operator);
-            }
-        }
-
-        void operator()(const subscript& s) {
-            const column_value& cv = get_subscripted_column(s);
-            if (*cv.col == column && current_binary_operator != nullptr) {
-                restrictions.emplace_back(*current_binary_operator);
-            }
-        }
-
-        void operator()(const unresolved_identifier&) {}
-        void operator()(const column_mutation_attribute&) {}
-        void operator()(const function_call&) {}
-        void operator()(const cast&) {}
-        void operator()(const field_selection&) {}
-        void operator()(const bind_variable&) {}
-        void operator()(const untyped_constant&) {}
-        void operator()(const tuple_constructor&) {}
-        void operator()(const collection_constructor&) {}
-        void operator()(const usertype_constructor&) {}
-        void operator()(const temporary&) {}
-    };
-
-    visitor v {
-        .restrictions = std::vector<expression>(),
-        .column = column,
-        .current_binary_operator = nullptr,
-    };
-
-    expr::visit(v, expr);
-
-    return std::move(v.restrictions);
 }
 
 
@@ -1666,6 +1125,9 @@ cql3::raw_value do_evaluate(const binary_operator& binop, const evaluation_input
         case oper_t::IN:
             binop_result = is_one_of(binop.lhs, binop.rhs, inputs, binop.null_handling);
             break;
+        case oper_t::NOT_IN:
+            binop_result = is_none_of(binop.lhs, binop.rhs, inputs, binop.null_handling);
+            break;
         case oper_t::IS_NOT:
             binop_result = is_not_null(binop.lhs, binop.rhs, inputs);
             break;
@@ -1735,11 +1197,7 @@ cql3::raw_value do_evaluate(const field_selection& field_select, const evaluatio
             // std::optional<FragmentedView> read_field
             auto read_field = read_nth_user_type_field(udt_serialized_bytes, field_select.field_idx);
 
-            if (read_field.has_value()) {
-                return cql3::raw_value::make_value(managed_bytes(*read_field));
-            } else {
-                return cql3::raw_value::make_null();
-            }
+            return cql3::raw_value::make_value(managed_bytes_opt(read_field));
     });
 
     return field_value;
@@ -1929,6 +1387,20 @@ static managed_bytes reserialize_value(View value_bytes,
         return tuple_type_impl::build_value_fragmented(std::move(elements));
     }
 
+    if (type.is_vector()) {
+        const vector_type_impl& vtype = dynamic_cast<const vector_type_impl&>(type);
+        std::vector<managed_bytes> elements = vtype.split_fragmented(value_bytes);
+
+        auto elements_type = vtype.get_elements_type()->without_reversed();
+
+        if (elements_type.bound_value_needs_to_be_reserialized()) {
+            for (size_t i = 0; i < elements.size(); i++) {
+                elements[i] = reserialize_value(managed_bytes_view(elements[i]), elements_type);
+            }
+        }
+
+        return vector_type_impl::build_value_fragmented(std::move(elements), elements_type.value_length_if_fixed());
+    }
     on_internal_error(expr_logger,
         fmt::format("Reserializing type that shouldn't need reserialization: {}", type.name()));
 }
@@ -2027,6 +1499,22 @@ static cql3::raw_value evaluate_list(const collection_constructor& collection,
     return raw_value::make_value(std::move(collection_bytes));
 }
 
+static cql3::raw_value evaluate_vector(const collection_constructor& vector, const evaluation_inputs& inputs) {
+    std::vector<managed_bytes> vector_elements;
+    vector_elements.reserve(vector.elements.size());
+
+    for (const expression& element : vector.elements) {
+        cql3::raw_value elem_val = evaluate(element, inputs);
+        if (elem_val.is_null()) {
+            throw exceptions::invalid_request_exception("null is not supported inside vectors");
+        }
+        vector_elements.emplace_back(std::move(elem_val).to_managed_bytes());
+    }
+
+    managed_bytes vector_bytes = vector_type_impl::build_value_fragmented(std::move(vector_elements), vector.type->value_length_if_fixed());
+    return raw_value::make_value(std::move(vector_bytes));
+}
+
 static cql3::raw_value evaluate_set(const collection_constructor& collection, const evaluation_inputs& inputs) {
     const set_type_impl& stype = dynamic_cast<const set_type_impl&>(collection.type->without_reversed());
     std::set<managed_bytes, serialized_compare> evaluated_elements(stype.get_elements_type()->as_less_comparator());
@@ -2103,7 +1591,7 @@ static cql3::raw_value do_evaluate(const collection_constructor& collection, con
     }
 
     switch (collection.style) {
-        case collection_constructor::style_type::list:
+        case collection_constructor::style_type::list_or_vector:
             return evaluate_list(collection, inputs);
 
         case collection_constructor::style_type::set:
@@ -2111,6 +1599,9 @@ static cql3::raw_value do_evaluate(const collection_constructor& collection, con
 
         case collection_constructor::style_type::map:
             return evaluate_map(collection, inputs);
+
+        case collection_constructor::style_type::vector:
+            return evaluate_vector(collection, inputs);
     }
     std::abort();
 }
@@ -2192,7 +1683,7 @@ static cql3::raw_value do_evaluate(const function_call& fun_call, const evaluati
     try {
         scalar_fun->return_type()->validate(*result);
     } catch (marshal_exception&) {
-        throw runtime_exception(format("Return of function {} ({}) is not a valid value for its declared return type {}",
+        throw runtime_exception(fmt::format("Return of function {} ({}) is not a valid value for its declared return type {}",
                                        *scalar_fun, to_hex(result),
                                        scalar_fun->return_type()->as_cql3_type()
                                        ));
@@ -2241,6 +1732,16 @@ std::vector<managed_bytes_opt> get_tuple_elements(const cql3::raw_value& val, co
     });
 }
 
+std::vector<managed_bytes> get_vector_elements(const cql3::raw_value& val, const abstract_type& type) {
+    ensure_can_get_value_elements(val, "expr::get_vector_elements");
+
+    return val.view().with_value([&](const FragmentedView auto& value_bytes) {
+        const vector_type_impl& vtype = static_cast<const vector_type_impl&>(type.without_reversed());
+        return vtype.split_fragmented(value_bytes);
+    });
+
+}
+
 std::vector<managed_bytes_opt> get_user_type_elements(const cql3::raw_value& val, const abstract_type& type) {
     ensure_can_get_value_elements(val, "expr::get_user_type_elements");
 
@@ -2251,6 +1752,11 @@ std::vector<managed_bytes_opt> get_user_type_elements(const cql3::raw_value& val
 }
 
 static std::vector<managed_bytes_opt> convert_listlike(utils::chunked_vector<managed_bytes_opt>&& elements) {
+    return std::vector<managed_bytes_opt>(std::make_move_iterator(elements.begin()),
+                                          std::make_move_iterator(elements.end()));
+}
+
+static std::vector<managed_bytes_opt> convert_vector(std::vector<managed_bytes>&& elements) {
     return std::vector<managed_bytes_opt>(std::make_move_iterator(elements.begin()),
                                           std::make_move_iterator(elements.end()));
 }
@@ -2270,6 +1776,9 @@ std::vector<managed_bytes_opt> get_elements(const cql3::raw_value& val, const ab
 
         case abstract_type::kind::user:
             return get_user_type_elements(val, type);
+
+        case abstract_type::kind::vector:
+            return convert_vector(get_vector_elements(val, type));
 
         default:
             on_internal_error(expr_logger, fmt::format("expr::get_elements called on bad type: {}", type.name()));
@@ -2435,55 +1944,6 @@ type_of(const expression& e) {
     }, e);
 }
 
-static std::optional<std::reference_wrapper<const column_value>> get_single_column_restriction_column(const expression& e) {
-    if (find_in_expression<unresolved_identifier>(e, [](const auto&) {return true;})) {
-        on_internal_error(expr_logger,
-            format("get_single_column_restriction_column expects a prepared expression, but it's not: {}", e));
-    }
-
-    const column_value* the_only_column = nullptr;
-    bool expression_is_single_column = false;
-
-    for_each_expression<column_value>(e,
-        [&](const column_value& cval) {
-            if (the_only_column == nullptr) {
-                // It's the first column_value we've encountered - set it as the only column
-                the_only_column = &cval;
-                expression_is_single_column = true;
-                return;
-            }
-
-            if (cval.col != the_only_column->col) {
-                // In case any other column is encountered the restriction
-                // restricts more than one column.
-                expression_is_single_column = false;
-            }
-        }
-    );
-
-    if (expression_is_single_column) {
-        return std::cref(*the_only_column);
-    } else {
-        return std::nullopt;
-    }
-}
-
-bool is_single_column_restriction(const expression& e) {
-    return get_single_column_restriction_column(e).has_value();
-}
-
-const column_value& get_the_only_column(const expression& e) {
-    std::optional<std::reference_wrapper<const column_value>> result = get_single_column_restriction_column(e);
-
-    if (!result.has_value()) {
-        on_internal_error(expr_logger,
-            format("get_the_only_column - bad expression: {}", e));
-    }
-
-    return *result;
-}
-
-
 bool schema_pos_column_definition_comparator::operator()(const column_definition *def1, const column_definition *def2) const {
     auto column_pos = [](const column_definition* cdef) -> uint32_t {
         if (cdef->is_primary_key()) {
@@ -2529,28 +1989,6 @@ const column_definition* get_last_column_def(const expression& e) {
     return sorted_defs.back();
 }
 
-single_column_restrictions_map get_single_column_restrictions_map(const expression& e) {
-    single_column_restrictions_map result;
-
-    std::vector<const column_definition*> sorted_defs = get_sorted_column_defs(e);
-    for (const column_definition* cdef : sorted_defs) {
-        expression col_restrictions = conjunction {
-            .children = extract_single_column_restrictions_for_column(e, *cdef)
-        };
-        result.emplace(cdef, std::move(col_restrictions));
-    }
-
-    return result;
-}
-
-bool is_empty_restriction(const expression& e) {
-    bool contains_non_conjunction = recurse_until(e, [&](const expression& e) -> bool {
-        return !is<conjunction>(e);
-    });
-
-    return !contains_non_conjunction;
-}
-
 sstring get_columns_in_commons(const expression& a, const expression& b) {
     std::vector<const column_definition*> ours = get_sorted_column_defs(a);
     std::vector<const column_definition*> theirs = get_sorted_column_defs(b);
@@ -2568,43 +2006,6 @@ sstring get_columns_in_commons(const expression& a, const expression& b) {
         str += c->name_as_text();
     }
     return str;
-}
-
-bytes_opt value_for(const column_definition& cdef, const expression& e, const query_options& options) {
-    value_set possible_vals = possible_column_values(&cdef, e, options);
-    return std::visit(overloaded_functor {
-        [&](const value_list& val_list) -> bytes_opt {
-            if (val_list.empty()) {
-                return std::nullopt;
-            }
-
-            if (val_list.size() != 1) {
-                on_internal_error(expr_logger, format("expr::value_for - multiple possible values for column: {}", e));
-            }
-
-            return to_bytes(val_list.front());
-        },
-        [&](const nonwrapping_range<managed_bytes>&) -> bytes_opt {
-            on_internal_error(expr_logger, format("expr::value_for - possible values are a range: {}", e));
-        }
-    }, possible_vals);
-}
-
-bool contains_multi_column_restriction(const expression& e) {
-    const binary_operator* find_res = find_binop(e, [](const binary_operator& binop) {
-        return is<tuple_constructor>(binop.lhs);
-    });
-    return find_res != nullptr;
-}
-
-bool has_only_eq_binops(const expression& e) {
-    const expr::binary_operator* non_eq_binop = find_in_expression<expr::binary_operator>(e,
-        [](const expr::binary_operator& binop) {
-            return binop.op != expr::oper_t::EQ;
-        }
-    );
-
-    return non_eq_binop == nullptr;
 }
 
 unset_bind_variable_guard::unset_bind_variable_guard(const expr::expression& e) {
@@ -2789,9 +2190,8 @@ verify_no_aggregate_functions(const expression& expr, std::string_view context_f
 
 unsigned
 aggregation_depth(const cql3::expr::expression& e) {
-    static constexpr auto max = static_cast<const unsigned& (*)(const unsigned&, const unsigned&)>(std::max<unsigned>);
     static constexpr auto max_over_range = [] (std::ranges::range auto&& rng) -> unsigned {
-        return boost::accumulate(rng | boost::adaptors::transformed(aggregation_depth), 0u, max);
+        return std::ranges::fold_left(rng | std::views::transform(aggregation_depth), 0u, std::ranges::max);
     };
     return visit(overloaded_functor{
         [] (const conjunction& c) {
@@ -2834,7 +2234,7 @@ aggregation_depth(const cql3::expr::expression& e) {
             return max_over_range(cc.elements);
         },
         [] (const usertype_constructor& uc) {
-            return max_over_range(uc.elements | boost::adaptors::map_values);
+            return max_over_range(uc.elements | std::views::values);
         }
     }, e);
 }
@@ -2922,7 +2322,7 @@ levellize_aggregation_depth(const cql3::expr::expression& e, unsigned desired_de
             return cc;
         },
         [&] (usertype_constructor uc) -> expression {
-            recurse_over_range(uc.elements | boost::adaptors::map_values);
+            recurse_over_range(uc.elements | std::views::values);
             return uc;
         }
     }, e);
@@ -3000,3 +2400,35 @@ split_aggregation(std::span<const expression> aggregation) {
 
 } // namespace expr
 } // namespace cql3
+
+std::string_view fmt::formatter<cql3::expr::oper_t>::to_string(const cql3::expr::oper_t& op) {
+    using cql3::expr::oper_t;
+
+    switch (op) {
+    case oper_t::EQ:
+        return "=";
+    case oper_t::NEQ:
+        return "!=";
+    case oper_t::LT:
+        return "<";
+    case oper_t::LTE:
+        return "<=";
+    case oper_t::GT:
+        return ">";
+    case oper_t::GTE:
+        return ">=";
+    case oper_t::IN:
+        return "IN";
+    case oper_t::NOT_IN:
+        return "NOT IN";
+    case oper_t::CONTAINS:
+        return "CONTAINS";
+    case oper_t::CONTAINS_KEY:
+        return "CONTAINS KEY";
+    case oper_t::IS_NOT:
+        return "IS NOT";
+    case oper_t::LIKE:
+        return "LIKE";
+    }
+    __builtin_unreachable();
+}

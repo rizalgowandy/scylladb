@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -14,11 +14,11 @@
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/units/detail/utility.hpp>
+#include "api/api_init.hh"
 #include "api/api-doc/utils.json.hh"
 #include "utils/histogram.hh"
 #include "utils/estimated_histogram.hh"
 #include <seastar/http/exception.hh>
-#include "api_init.hh"
 #include "seastarx.hh"
 
 namespace api {
@@ -26,7 +26,9 @@ namespace api {
 template<class T>
 std::vector<sstring> container_to_vec(const T& container) {
     std::vector<sstring> res;
-    for (auto i : container) {
+    res.reserve(std::size(container));
+
+    for (const auto& i : container) {
         res.push_back(fmt::to_string(i));
     }
     return res;
@@ -35,27 +37,31 @@ std::vector<sstring> container_to_vec(const T& container) {
 template<class T>
 std::vector<T> map_to_key_value(const std::map<sstring, sstring>& map) {
     std::vector<T> res;
-    for (auto i : map) {
+    res.reserve(map.size());
+
+    for (const auto& [key, value] : map) {
         res.push_back(T());
-        res.back().key = i.first;
-        res.back().value = i.second;
+        res.back().key = key;
+        res.back().value = value;
     }
     return res;
 }
 
 template<class T, class MAP>
 std::vector<T>& map_to_key_value(const MAP& map, std::vector<T>& res) {
-    for (auto i : map) {
+    res.reserve(res.size() + std::size(map));
+
+    for (const auto& [key, value] : map) {
         T val;
-        val.key = fmt::to_string(i.first);
-        val.value = fmt::to_string(i.second);
+        val.key = fmt::to_string(key);
+        val.value = fmt::to_string(value);
         res.push_back(val);
     }
     return res;
 }
 template <typename T, typename S = T>
 T map_sum(T&& dest, const S& src) {
-    for (auto i : src) {
+    for (const auto& i : src) {
         dest[i.first] += i.second;
     }
     return std::move(dest);
@@ -64,6 +70,8 @@ T map_sum(T&& dest, const S& src) {
 template <typename MAP>
 std::vector<sstring> map_keys(const MAP& map) {
     std::vector<sstring> res;
+    res.reserve(std::size(map));
+
     for (const auto& i : map) {
         res.push_back(fmt::to_string(i.first));
     }
@@ -211,11 +219,10 @@ template <class T, class Base = T>
 class req_param {
 public:
     sstring name;
-    sstring param;
     T value;
 
     req_param(const request& req, sstring name, T default_val) : name(name) {
-        param = req.get_query_param(name);
+        sstring param = req.get_query_param(name);
         if (param.empty()) {
             value = default_val;
             return;
@@ -238,7 +245,7 @@ public:
                 value = T{boost::lexical_cast<Base>(param)};
             }
         } catch (boost::bad_lexical_cast&) {
-            throw httpd::bad_param_exception(format("{} ({}): type error - should be {}", name, param, boost::units::detail::demangle(typeid(Base).name())));
+            throw httpd::bad_param_exception(fmt::format("{} ({}): type error - should be {}", name, param, boost::units::detail::demangle(typeid(Base).name())));
         }
     }
 

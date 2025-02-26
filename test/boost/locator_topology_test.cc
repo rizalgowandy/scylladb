@@ -3,21 +3,26 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include <boost/test/unit_test.hpp>
 
+#include <fmt/ranges.h>
+
+#include <functional>
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/util/defer.hh>
 
 #include "locator/types.hh"
 #include "test/lib/scylla_test_case.hh"
+#include "test/lib/test_utils.hh"
 
 #include "locator/host_id.hh"
 #include "locator/topology.hh"
 #include "locator/load_sketch.hh"
-#include "log.hh"
+#include "utils/log.hh"
 
 extern logging::logger testlog;
 
@@ -27,12 +32,11 @@ SEASTAR_THREAD_TEST_CASE(test_add_node) {
     auto id1 = host_id::create_random_id();
     auto ep1 = gms::inet_address("127.0.0.1");
     auto id2 = host_id::create_random_id();
-    auto ep2 = gms::inet_address("127.0.0.2");
     auto id3 = host_id::create_random_id();
-    auto ep3 = gms::inet_address("127.0.0.3");
 
     topology::config cfg = {
         .this_endpoint = ep1,
+        .this_host_id = id1,
         .local_dc_rack = endpoint_dc_rack::default_location,
     };
 
@@ -43,21 +47,18 @@ SEASTAR_THREAD_TEST_CASE(test_add_node) {
         set_abort_on_internal_error(true);
     });
 
-    std::unordered_set<const locator::node*> nodes;
+    std::unordered_set<std::reference_wrapper<const locator::node>> nodes;
 
-    nodes.insert(topo.add_node(id2, ep2, endpoint_dc_rack::default_location, node::state::normal));
-    nodes.insert(topo.add_node(id1, ep1, endpoint_dc_rack::default_location, node::state::normal));
+    nodes.insert(std::cref(topo.add_node(id2, endpoint_dc_rack::default_location, node::state::normal)));
+    nodes.insert(std::cref(topo.add_or_update_endpoint(id1, endpoint_dc_rack::default_location, node::state::normal)));
 
-    BOOST_REQUIRE_THROW(topo.add_node(id1, ep2, endpoint_dc_rack::default_location, node::state::normal), std::runtime_error);
-    BOOST_REQUIRE_THROW(topo.add_node(id2, ep1, endpoint_dc_rack::default_location, node::state::normal), std::runtime_error);
-    BOOST_REQUIRE_THROW(topo.add_node(id2, ep2, endpoint_dc_rack::default_location, node::state::normal), std::runtime_error);
-    BOOST_REQUIRE_THROW(topo.add_node(id2, ep3, endpoint_dc_rack::default_location, node::state::normal), std::runtime_error);
-    BOOST_REQUIRE_THROW(topo.add_node(id3, ep3, endpoint_dc_rack{}, node::state::normal), std::runtime_error);
+    BOOST_REQUIRE_THROW(topo.add_node(id2, endpoint_dc_rack::default_location, node::state::normal), std::runtime_error);
+    BOOST_REQUIRE_THROW(topo.add_node(id3, endpoint_dc_rack{}, node::state::normal), std::runtime_error);
 
-    nodes.insert(topo.add_node(id3, ep3, endpoint_dc_rack::default_location, node::state::normal));
+    nodes.insert(std::cref(topo.add_node(id3, endpoint_dc_rack::default_location, node::state::normal)));
 
-    topo.for_each_node([&] (const locator::node* node) {
-        BOOST_REQUIRE(nodes.erase(node));
+    topo.for_each_node([&] (const locator::node& node) {
+        BOOST_REQUIRE(nodes.erase(std::cref(node)));
     });
     BOOST_REQUIRE(nodes.empty());
 
@@ -70,12 +71,13 @@ SEASTAR_THREAD_TEST_CASE(test_moving) {
 
     topology::config cfg = {
         .this_endpoint = ep1,
+        .this_host_id = id1,
         .local_dc_rack = endpoint_dc_rack::default_location,
     };
 
     auto topo = topology(cfg);
 
-    topo.add_node(id1, ep1, endpoint_dc_rack::default_location, node::state::normal);
+    topo.add_or_update_endpoint(id1, endpoint_dc_rack::default_location, node::state::normal);
 
     BOOST_REQUIRE(topo.this_node()->topology() == &topo);
 
@@ -94,11 +96,10 @@ SEASTAR_THREAD_TEST_CASE(test_update_node) {
     auto id1 = host_id::create_random_id();
     auto ep1 = gms::inet_address("127.0.0.1");
     auto id2 = host_id::create_random_id();
-    auto ep2 = gms::inet_address("127.0.0.2");
-    auto ep3 = gms::inet_address("127.0.0.3");
 
     topology::config cfg = {
         .this_endpoint = ep1,
+        .this_host_id = id1,
         .local_dc_rack = endpoint_dc_rack::default_location,
     };
 
@@ -109,77 +110,52 @@ SEASTAR_THREAD_TEST_CASE(test_update_node) {
         set_abort_on_internal_error(true);
     });
 
-    topo.add_or_update_endpoint(ep1, endpoint_dc_rack::default_location, node::state::normal);
+    topo.add_or_update_endpoint(id1, endpoint_dc_rack::default_location, node::state::normal);
 
-    auto node = topo.this_node();
-    auto mutable_node = const_cast<locator::node*>(node);
+    auto node = const_cast<class node*>(topo.this_node());
 
-    node = topo.update_node(mutable_node, id1, std::nullopt, std::nullopt, std::nullopt);
+    topo.update_node(*node, std::nullopt, std::nullopt, std::nullopt);
+
     BOOST_REQUIRE_EQUAL(topo.find_node(id1), node);
-    mutable_node = const_cast<locator::node*>(node);
 
-    BOOST_REQUIRE_THROW(topo.update_node(mutable_node, host_id::create_null_id(), std::nullopt, std::nullopt, std::nullopt), std::runtime_error);
-    BOOST_REQUIRE_THROW(topo.update_node(mutable_node, id2, std::nullopt, std::nullopt, std::nullopt), std::runtime_error);
+    BOOST_REQUIRE_THROW(topo.update_node(*node, host_id::create_null_id(),  std::nullopt, std::nullopt), std::runtime_error);
+    BOOST_REQUIRE_THROW(topo.update_node(*node, id2, std::nullopt, std::nullopt), std::runtime_error);
     BOOST_REQUIRE_EQUAL(topo.find_node(id1), node);
     BOOST_REQUIRE_EQUAL(topo.find_node(id2), nullptr);
 
-    node = topo.update_node(mutable_node, std::nullopt, ep2, std::nullopt, std::nullopt);
-    mutable_node = const_cast<locator::node*>(node);
-    BOOST_REQUIRE_EQUAL(topo.find_node(ep1), nullptr);
-    BOOST_REQUIRE_EQUAL(topo.find_node(ep2), node);
-
     auto dc_rack1 = endpoint_dc_rack{"DC1", "RACK1"};
-    node = topo.update_node(mutable_node, std::nullopt, std::nullopt, dc_rack1, std::nullopt);
-    mutable_node = const_cast<locator::node*>(node);
+    topo.update_node(*node, std::nullopt, dc_rack1, std::nullopt);
+
     BOOST_REQUIRE(topo.get_location(id1) == dc_rack1);
-    BOOST_REQUIRE(topo.get_location(ep1) == dc_rack1);
 
     auto dc_rack2 = endpoint_dc_rack{"DC2", "RACK2"};
-    node = topo.update_node(mutable_node, std::nullopt, std::nullopt, dc_rack2, std::nullopt);
-    mutable_node = const_cast<locator::node*>(node);
+    topo.update_node(*node, std::nullopt, dc_rack2, std::nullopt);
+
     BOOST_REQUIRE(topo.get_location(id1) == dc_rack2);
-    BOOST_REQUIRE(topo.get_location(ep1) == dc_rack2);
 
     BOOST_REQUIRE_NE(node->get_state(), locator::node::state::being_decommissioned);
-    node = topo.update_node(mutable_node, std::nullopt, std::nullopt, std::nullopt, locator::node::state::being_decommissioned);
-    mutable_node = const_cast<locator::node*>(node);
+    topo.update_node(*node, std::nullopt, std::nullopt, locator::node::state::being_decommissioned);
+
     BOOST_REQUIRE_EQUAL(node->get_state(), locator::node::state::being_decommissioned);
 
     auto dc_rack3 = endpoint_dc_rack{"DC3", "RACK3"};
     // Note: engage state option, but keep node::state value the same
     // to reproduce #13502
-    node = topo.update_node(mutable_node, std::nullopt, ep3, dc_rack3, locator::node::state::being_decommissioned);
-    mutable_node = const_cast<locator::node*>(node);
-    BOOST_REQUIRE_EQUAL(topo.find_node(id1), node);
-    BOOST_REQUIRE_EQUAL(topo.find_node(ep1), nullptr);
-    BOOST_REQUIRE_EQUAL(topo.find_node(ep2), nullptr);
-    BOOST_REQUIRE_EQUAL(topo.find_node(ep3), node);
-    BOOST_REQUIRE(topo.get_location(id1) == dc_rack3);
-    BOOST_REQUIRE(topo.get_location(ep2) == endpoint_dc_rack::default_location);
-    BOOST_REQUIRE(topo.get_location(ep3) == dc_rack3);
-    BOOST_REQUIRE_EQUAL(node->get_state(), locator::node::state::being_decommissioned);
+    topo.update_node(*node, std::nullopt, dc_rack3, locator::node::state::being_decommissioned);
 
-    // In state::left the node will remain indexed only by its host_id
-    node = topo.update_node(mutable_node, std::nullopt, std::nullopt, std::nullopt, locator::node::state::left);
     BOOST_REQUIRE_EQUAL(topo.find_node(id1), node);
-    BOOST_REQUIRE_EQUAL(topo.find_node(ep1), nullptr);
-    BOOST_REQUIRE_EQUAL(topo.find_node(ep2), nullptr);
-    BOOST_REQUIRE_EQUAL(topo.find_node(ep3), nullptr);
     BOOST_REQUIRE(topo.get_location(id1) == dc_rack3);
-    BOOST_REQUIRE(topo.get_location(ep2) == endpoint_dc_rack::default_location);
-    BOOST_REQUIRE(topo.get_location(ep3) == endpoint_dc_rack::default_location);
-    BOOST_REQUIRE_EQUAL(node->get_state(), locator::node::state::left);
+    BOOST_REQUIRE_EQUAL(node->get_state(), locator::node::state::being_decommissioned);
 }
 
 SEASTAR_THREAD_TEST_CASE(test_remove_endpoint) {
-    using dc_endpoints_t = std::unordered_map<sstring, std::unordered_set<inet_address>>;
-    using dc_racks_t = std::unordered_map<sstring, std::unordered_map<sstring, std::unordered_set<inet_address>>>;
+    using dc_endpoints_t = std::unordered_map<sstring, std::unordered_set<locator::host_id>>;
+    using dc_racks_t = std::unordered_map<sstring, std::unordered_map<sstring, std::unordered_set<locator::host_id>>>;
     using dcs_t = std::unordered_set<sstring>;
 
     const auto id1 = host_id::create_random_id();
     const auto ep1 = gms::inet_address("127.0.0.1");
     const auto id2 = host_id::create_random_id();
-    const auto ep2 = gms::inet_address("127.0.0.2");
     const auto dc_rack1 = endpoint_dc_rack {
         .dc = "dc1",
         .rack = "rack1"
@@ -191,27 +167,29 @@ SEASTAR_THREAD_TEST_CASE(test_remove_endpoint) {
 
     topology::config cfg = {
         .this_endpoint = ep1,
+        .this_host_id = id1,
         .local_dc_rack = dc_rack1
     };
 
     auto topo = topology(cfg);
 
-    topo.add_node(id1, ep1, dc_rack1, node::state::normal);
-    topo.add_node(id2, ep2, dc_rack2, node::state::normal);
+    topo.add_or_update_endpoint(id1, dc_rack1, node::state::normal);
+    topo.add_node(id2, dc_rack2, node::state::normal);
 
-    BOOST_REQUIRE_EQUAL(topo.get_datacenter_endpoints(), (dc_endpoints_t{{"dc1", {ep1, ep2}}}));
-    BOOST_REQUIRE_EQUAL(topo.get_datacenter_racks(), (dc_racks_t{{"dc1", {{"rack1", {ep1}}, {"rack2", {ep2}}}}}));
+    BOOST_REQUIRE_EQUAL(topo.get_datacenter_endpoints(), (dc_endpoints_t{{"dc1", {id1, id2}}}));
+    BOOST_REQUIRE_EQUAL(topo.get_datacenter_racks(), (dc_racks_t{{"dc1", {{"rack1", {id1}}, {"rack2", {id2}}}}}));
     BOOST_REQUIRE_EQUAL(topo.get_datacenters(), (dcs_t{"dc1"}));
 
-    topo.remove_endpoint(ep2);
-    BOOST_REQUIRE_EQUAL(topo.get_datacenter_endpoints(), (dc_endpoints_t{{"dc1", {ep1}}}));
-    BOOST_REQUIRE_EQUAL(topo.get_datacenter_racks(), (dc_racks_t{{"dc1", {{"rack1", {ep1}}}}}));
+    topo.remove_endpoint(id2);
+    BOOST_REQUIRE_EQUAL(topo.get_datacenter_endpoints(), (dc_endpoints_t{{"dc1", {id1}}}));
+    BOOST_REQUIRE_EQUAL(topo.get_datacenter_racks(), (dc_racks_t{{"dc1", {{"rack1", {id1}}}}}));
     BOOST_REQUIRE_EQUAL(topo.get_datacenters(), (dcs_t{"dc1"}));
 
-    topo.remove_endpoint(ep1);
-    BOOST_REQUIRE_EQUAL(topo.get_datacenter_endpoints(), (dc_endpoints_t{}));
-    BOOST_REQUIRE_EQUAL(topo.get_datacenter_racks(), (dc_racks_t{}));
-    BOOST_REQUIRE_EQUAL(topo.get_datacenters(), (dcs_t{}));
+    // Local endpoint cannot be removed
+    topo.remove_endpoint(id1);
+    BOOST_REQUIRE_EQUAL(topo.get_datacenter_endpoints(), (dc_endpoints_t{{"dc1", {id1}}}));
+    BOOST_REQUIRE_EQUAL(topo.get_datacenter_racks(), (dc_racks_t{{"dc1", {{"rack1", {id1}}}}}));
+    BOOST_REQUIRE_EQUAL(topo.get_datacenters(), (dcs_t{"dc1"}));
 }
 
 SEASTAR_THREAD_TEST_CASE(test_load_sketch) {
@@ -231,16 +209,15 @@ SEASTAR_THREAD_TEST_CASE(test_load_sketch) {
     shared_token_metadata stm([&sem] () noexcept { return get_units(sem, 1); }, locator::token_metadata::config{
         topology::config{
             .this_endpoint = ip1,
+            .this_host_id = host1,
+            .local_dc_rack = locator::endpoint_dc_rack::default_location
         }
     });
 
     stm.mutate_token_metadata([&] (token_metadata& tm) {
-        tm.update_host_id(host1, ip1);
-        tm.update_host_id(host2, ip2);
-        tm.update_host_id(host3, ip3);
-        tm.update_topology(ip1, locator::endpoint_dc_rack::default_location, std::nullopt, node1_shard_count);
-        tm.update_topology(ip2, locator::endpoint_dc_rack::default_location, std::nullopt, node2_shard_count);
-        tm.update_topology(ip3, locator::endpoint_dc_rack::default_location, std::nullopt, node3_shard_count);
+        tm.update_topology(host1, locator::endpoint_dc_rack::default_location, node::state::normal, node1_shard_count);
+        tm.update_topology(host2, locator::endpoint_dc_rack::default_location, node::state::normal, node2_shard_count);
+        tm.update_topology(host3, locator::endpoint_dc_rack::default_location, node::state::normal, node3_shard_count);
         return make_ready_future<>();
     }).get();
 
@@ -329,4 +306,65 @@ SEASTAR_THREAD_TEST_CASE(test_load_sketch) {
             BOOST_REQUIRE_EQUAL(node3_shards[i], node3_shards[0]);
         }
     }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_left_node_is_kept_outside_dc) {
+    auto id1 = host_id::create_random_id();
+    auto ep1 = gms::inet_address("127.0.0.1");
+    auto id2 = host_id::create_random_id();
+    auto id3 = host_id::create_random_id();
+
+    const auto dc_rack1 = endpoint_dc_rack {
+        .dc = "dc1",
+        .rack = "rack1"
+    };
+
+    topology::config cfg = {
+        .this_endpoint = ep1,
+        .local_dc_rack = dc_rack1
+    };
+
+    auto topo = topology(cfg);
+
+    set_abort_on_internal_error(false);
+    auto reset_on_internal_abort = seastar::defer([] {
+        set_abort_on_internal_error(true);
+    });
+
+    std::unordered_set<std::reference_wrapper<const locator::node>> nodes;
+
+    nodes.insert(std::cref(topo.add_node(id2, dc_rack1, node::state::normal)));
+    nodes.insert(std::cref(topo.add_node(id3, dc_rack1, node::state::left)));
+
+    topo.for_each_node([&] (const locator::node& node) {
+        BOOST_REQUIRE(node.host_id() != id3);
+    });
+
+    {
+        auto *n = topo.find_node(id3);
+        BOOST_REQUIRE(n);
+        BOOST_REQUIRE(n->get_state() == locator::node::state::left);
+    }
+
+    // left nodes are not members.
+    BOOST_REQUIRE(!topo.get_datacenter_endpoints().at(dc_rack1.dc).contains(id3));
+
+    BOOST_REQUIRE(topo.get_datacenter(id3) == dc_rack1.dc);
+    BOOST_REQUIRE(topo.get_rack(id3) == dc_rack1.rack);
+
+    auto topo2 = topo.clone_gently().get();
+    {
+        auto *n = topo2.find_node(id3);
+        BOOST_REQUIRE(n);
+        BOOST_REQUIRE(n->get_state() == locator::node::state::left);
+    }
+
+    // Make the DC empty of nodes
+    topo.remove_node(id1);
+    topo.remove_node(id2);
+    // Left node location is still known
+    BOOST_REQUIRE(topo.get_datacenter(id3) == dc_rack1.dc);
+    BOOST_REQUIRE(topo.get_rack(id3) == dc_rack1.rack);
+
+    topo.clear_gently().get();
 }

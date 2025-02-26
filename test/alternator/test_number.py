@@ -1,6 +1,6 @@
 # Copyright 2020-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for the number type. Numbers in DynamoDB have an unusual definition -
 # they are a floating-point type with 38 decimal digits of precision and
@@ -25,18 +25,20 @@
 # is a number). The tests in this file focus just on the precision and
 # magnitude that the number type can store.
 
+import decimal
+from decimal import Decimal
+
+import boto3.dynamodb.types
 import pytest
 from botocore.exceptions import ClientError
-from decimal import Decimal
-from util import random_string, client_no_transform
+
+from test.alternator.util import random_string, client_no_transform
 
 # Monkey-patch the boto3 library to stop doing its own error-checking on
 # numbers. This works around a bug https://github.com/boto/boto3/issues/2500
 # of incorrect checking of responses, and we also need to get boto3 to not do
 # its own error checking of requests, to allow us to check the server's
 # handling of such errors.
-import boto3.dynamodb.types
-import decimal
 boto3.dynamodb.types.DYNAMODB_CONTEXT = decimal.Context(prec=100)
 
 # Test that numbers of allowed magnitudes - between to 1e-130 and 1e125 -

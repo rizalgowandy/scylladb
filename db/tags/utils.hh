@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -16,7 +16,6 @@
 #include "seastarx.hh"
 
 #include "schema/schema.hh"
-#include "service/client_state.hh"
 #include "service/migration_manager.hh"
 
 namespace db {

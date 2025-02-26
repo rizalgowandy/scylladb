@@ -3,16 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <boost/range/algorithm/heap_algorithm.hpp>
 
 #include "partition_version.hh"
-#include "row_cache.hh"
-#include "partition_snapshot_row_cursor.hh"
+#include "db/row_cache.hh"
+#include "db/partition_snapshot_row_cursor.hh"
+#include "utils/assert.hh"
 #include "utils/coroutine.hh"
 #include "real_dirty_memory_accounter.hh"
+#include "clustering_interval_set.hh"
 
 static void remove_or_mark_as_unique_owner(partition_version* current, mutation_cleaner* cleaner)
 {
@@ -32,7 +34,7 @@ static void remove_or_mark_as_unique_owner(partition_version* current, mutation_
 }
 
 partition_version::partition_version(partition_version&& pv) noexcept
-    : anchorless_list_base_hook(std::move(pv))
+    : anchorless_list_base_hook(std::move(static_cast<anchorless_list_base_hook&>(pv)))
     , _backref(pv._backref)
     , _schema(std::move(pv._schema))
     , _is_being_upgraded(pv._is_being_upgraded)
@@ -342,7 +344,7 @@ partition_entry::~partition_entry() {
         return;
     }
     if (_snapshot) {
-        assert(!_snapshot->is_locked());
+        SCYLLA_ASSERT(!_snapshot->is_locked());
         _snapshot->_version = std::move(_version);
         _snapshot->_version.mark_as_unique_owner();
         _snapshot->_entry = nullptr;
@@ -359,7 +361,7 @@ stop_iteration partition_entry::clear_gently(cache_tracker* tracker) noexcept {
     }
 
     if (_snapshot) {
-        assert(!_snapshot->is_locked());
+        SCYLLA_ASSERT(!_snapshot->is_locked());
         _snapshot->_version = std::move(_version);
         _snapshot->_version.mark_as_unique_owner();
         _snapshot->_entry = nullptr;
@@ -387,7 +389,7 @@ stop_iteration partition_entry::clear_gently(cache_tracker* tracker) noexcept {
 void partition_entry::set_version(partition_version* new_version)
 {
     if (_snapshot) {
-        assert(!_snapshot->is_locked());
+        SCYLLA_ASSERT(!_snapshot->is_locked());
         _snapshot->_version = std::move(_version);
         _snapshot->_entry = nullptr;
     }
@@ -472,7 +474,8 @@ utils::coroutine partition_entry::apply_to_incomplete(const schema& s,
     logalloc::region& reg,
     cache_tracker& tracker,
     partition_snapshot::phase_type phase,
-    real_dirty_memory_accounter& acc)
+    real_dirty_memory_accounter& acc,
+    preemption_source& preempt_src)
 {
     // This flag controls whether this operation may defer. It is more
     // expensive to apply with deferring due to construction of snapshots and
@@ -506,9 +509,11 @@ utils::coroutine partition_entry::apply_to_incomplete(const schema& s,
     // of allocating sections, so we return here to get out of the current allocating section and
     // give the caller a chance to store the coroutine object. The code inside coroutine below
     // runs outside allocating section.
-    return utils::coroutine([&tracker, &s, &alloc, &reg, &acc, can_move, preemptible,
-            cur = partition_snapshot_row_cursor(s, *dst_snp),
-            src_cur = partition_snapshot_row_cursor(s, *src_snp, can_move),
+    auto& src_snp_ref = *src_snp;
+    auto& dst_snp_ref = *dst_snp;
+    return utils::coroutine([&tracker, &s, &alloc, &reg, &acc, can_move, preemptible, &preempt_src,
+            cur = partition_snapshot_row_cursor(s, dst_snp_ref),
+            src_cur = partition_snapshot_row_cursor(s, src_snp_ref, can_move),
             dst_snp = std::move(dst_snp),
             prev_snp = std::move(prev_snp),
             src_snp = std::move(src_snp),
@@ -549,7 +554,7 @@ utils::coroutine partition_entry::apply_to_incomplete(const schema& s,
             do {
                 auto size = src_cur.memory_usage();
                 // Range tombstones in memtables are bounded by dummy entries on both sides.
-                assert(src_cur.range_tombstone_for_row() == src_cur.range_tombstone());
+                SCYLLA_ASSERT(src_cur.range_tombstone_for_row() == src_cur.range_tombstone());
                 if (src_cur.range_tombstone()) {
                     // Apply the tombstone to (lb, src_cur.position())
                     // FIXME: Avoid if before all rows
@@ -561,11 +566,11 @@ utils::coroutine partition_entry::apply_to_incomplete(const schema& s,
                         cur.next();
                     }
                     position_in_partition::less_compare less(s);
-                    assert(less(lb, cur.position()));
+                    SCYLLA_ASSERT(less(lb, cur.position()));
                     while (less(cur.position(), src_cur.position())) {
                         auto res = cur.ensure_entry_in_latest();
                         if (cur.continuous()) {
-                            assert(cur.dummy() || cur.range_tombstone_for_row() == cur.range_tombstone());
+                            SCYLLA_ASSERT(cur.dummy() || cur.range_tombstone_for_row() == cur.range_tombstone());
                             res.row.set_continuous(is_continuous::yes);
                         }
                         res.row.set_range_tombstone(cur.range_tombstone_for_row() + src_cur.range_tombstone());
@@ -597,7 +602,7 @@ utils::coroutine partition_entry::apply_to_incomplete(const schema& s,
                         // only then the lower bound of the range is ensured in the latest version earlier.
                         if (src_cur.range_tombstone()) {
                             if (cur.continuous()) {
-                                assert(cur.dummy() || cur.range_tombstone_for_row() == cur.range_tombstone());
+                                SCYLLA_ASSERT(cur.dummy() || cur.range_tombstone_for_row() == cur.range_tombstone());
                                 e.set_continuous(is_continuous::yes);
                             }
                             e.set_range_tombstone(cur.range_tombstone_for_row() + src_cur.range_tombstone());
@@ -614,7 +619,7 @@ utils::coroutine partition_entry::apply_to_incomplete(const schema& s,
                     dst_snp->unlock();
                     return stop_iteration::yes;
                 }
-            } while (!preemptible || !need_preempt());
+            } while (!preemptible || !preempt_src.should_preempt());
             return stop_iteration::no;
         });
     });
@@ -632,6 +637,15 @@ mutation_partition_v2 partition_entry::squashed_v2(const schema& to, is_evictabl
         merge_versions(to, mp, std::move(older), no_cache_tracker, evictable);
     }
     return mp;
+}
+
+clustering_interval_set partition_entry::squashed_continuity(const schema& s)
+{
+    clustering_interval_set result;
+    for (auto&& v : _version->all_elements()) {
+        result.add(s, v.partition().as_mutation_partition(*v.get_schema()).get_continuity(s));
+    }
+    return result;
 }
 
 mutation_partition partition_entry::squashed(const schema& s, is_evictable evictable)
@@ -663,9 +677,9 @@ partition_snapshot_ptr partition_entry::read(logalloc::region& r,
             // If entry is being updated, we will get reads for non-latest phase, and
             // they must attach to the non-current version.
             partition_version* second = _version->next();
-            assert(second && second->is_referenced());
+            SCYLLA_ASSERT(second && second->is_referenced());
             auto snp = partition_snapshot::container_of(second->_backref).shared_from_this();
-            assert(phase == snp->_phase);
+            SCYLLA_ASSERT(phase == snp->_phase);
             return snp;
         } else { // phase > _snapshot->_phase
             with_allocator(r.allocator(), [&] {
@@ -684,22 +698,23 @@ void partition_snapshot::touch() noexcept {
     // can be touched.
     if (_tracker && at_latest_version()) {
         auto&& rows = version()->partition().clustered_rows();
-        assert(!rows.empty());
+        SCYLLA_ASSERT(!rows.empty());
         rows_entry& last_dummy = *rows.rbegin();
-        assert(last_dummy.is_last_dummy());
+        SCYLLA_ASSERT(last_dummy.is_last_dummy());
         _tracker->touch(last_dummy);
     }
 }
 
-std::ostream& operator<<(std::ostream& out, const partition_entry::printer& p) {
+auto fmt::formatter<partition_entry::printer>::format(const partition_entry::printer& p, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
     auto& e = p._partition_entry;
-    out << "{";
+    auto out = fmt::format_to(ctx.out(), "{{");
     bool first = true;
     if (e._version) {
         const partition_version* v = &*e._version;
         while (v) {
             if (!first) {
-                out << ", ";
+                out = fmt::format_to(out, ", ");
             }
             if (v->is_referenced()) {
                 partition_snapshot* snp = nullptr;
@@ -708,19 +723,19 @@ std::ostream& operator<<(std::ostream& out, const partition_entry::printer& p) {
                 } else {
                     snp = &partition_snapshot::container_of(&v->back_reference());
                 }
-                out << "(*";
+                out = fmt::format_to(out, "(*");
                 if (snp) {
-                    out << " snp=" << snp << ", phase=" << snp->phase();
+                    out = fmt::format_to(out, " snp={}, phase={}", fmt::ptr(snp), snp->phase());
                 }
-                out << ") ";
+                out = fmt::format_to(out, ") ");
             }
-            out << fmt::ptr(v) << ": " << mutation_partition_v2::printer(*v->get_schema(), v->partition());
+            out = fmt::format_to(out, "{}: {}",
+                       fmt::ptr(v), mutation_partition_v2::printer(*v->get_schema(), v->partition()));
             v = v->next();
             first = false;
         }
     }
-    out << "}";
-    return out;
+    return fmt::format_to(out, "}}");
 }
 
 void partition_entry::evict(mutation_cleaner& cleaner) noexcept {
@@ -728,7 +743,7 @@ void partition_entry::evict(mutation_cleaner& cleaner) noexcept {
         return;
     }
     if (_snapshot) {
-        assert(!_snapshot->is_locked());
+        SCYLLA_ASSERT(!_snapshot->is_locked());
         _snapshot->_version = std::move(_version);
         _snapshot->_version.mark_as_unique_owner();
         _snapshot->_entry = nullptr;
@@ -752,14 +767,14 @@ partition_snapshot_ptr::~partition_snapshot_ptr() {
 void partition_snapshot::lock() noexcept {
     // partition_entry::is_locked() assumes that if there is a locked snapshot,
     // it can be found attached directly to it.
-    assert(at_latest_version());
+    SCYLLA_ASSERT(at_latest_version());
     _locked = true;
 }
 
 void partition_snapshot::unlock() noexcept {
     // Locked snapshots must always be latest, is_locked() assumes that.
     // Also, touch() is only effective when this snapshot is latest. 
-    assert(at_latest_version());
+    SCYLLA_ASSERT(at_latest_version());
     _locked = false;
     touch(); // Make the entry evictable again in case it was fully unlinked by eviction attempt.
 }

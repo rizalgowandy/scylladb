@@ -3,12 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "transport/server.hh"
 #include <seastar/core/gate.hh>
-#include "service/migration_listener.hh"
 #include "transport/response.hh"
 #include "gms/gossiper.hh"
 
@@ -156,7 +155,7 @@ void cql_server::event_notifier::on_update_aggregate(const sstring& ks_name, con
     elogger.warn("%s event ignored", __func__);
 }
 
-void cql_server::event_notifier::on_update_tablet_metadata() {}
+void cql_server::event_notifier::on_update_tablet_metadata(const locator::tablet_metadata_change_hint&) {}
 
 void cql_server::event_notifier::on_drop_keyspace(const sstring& ks_name)
 {
@@ -217,6 +216,22 @@ void cql_server::event_notifier::on_drop_aggregate(const sstring& ks_name, const
     elogger.warn("%s event ignored", __func__);
 }
 
+future<> cql_server::event_notifier::on_before_service_level_add(qos::service_level_options, qos::service_level_info sl_info) {
+    co_return;
+}
+
+future<> cql_server::event_notifier::on_after_service_level_remove(qos::service_level_info sl_info) {
+    co_return;
+}
+
+future<> cql_server::event_notifier::on_before_service_level_change(qos::service_level_options slo_before, qos::service_level_options slo_after, qos::service_level_info sl_info) {
+    co_return;
+}
+
+future<> cql_server::event_notifier::on_effective_service_levels_cache_reloaded() {
+    return _server.update_connections_service_level_params();
+}
+
 void cql_server::event_notifier::on_join_cluster(const gms::inet_address& endpoint)
 {
     if (!_server._gossiper.is_cql_ready(endpoint)) {
@@ -237,7 +252,7 @@ void cql_server::event_notifier::send_join_cluster(const gms::inet_address& endp
     }
 }
 
-void cql_server::event_notifier::on_leave_cluster(const gms::inet_address& endpoint)
+void cql_server::event_notifier::on_leave_cluster(const gms::inet_address& endpoint, const locator::host_id& hid)
 {
     for (auto&& conn : _topology_change_listeners) {
         using namespace cql_transport;

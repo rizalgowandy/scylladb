@@ -3,12 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "test/lib/scylla_test_case.hh"
+#include <fmt/ranges.h>
 #include <seastar/testing/thread_test_case.hh>
 #include "test/lib/random_utils.hh"
+#include "test/lib/test_utils.hh"
 
 #include "compound.hh"
 #include "compound_compat.hh"
@@ -324,9 +326,9 @@ SEASTAR_THREAD_TEST_CASE(test_composite_from_exploded) {
 
 SEASTAR_THREAD_TEST_CASE(test_composite_view_explode) {
     auto to_owning_vector = [] (std::vector<bytes_view> bvs) {
-        return boost::copy_range<std::vector<bytes>>(bvs | boost::adaptors::transformed([] (auto bv) {
+        return bvs | std::views::transform([] (auto bv) {
             return bytes(bv.begin(), bv.end());
-        }));
+        }) | std::ranges::to<std::vector<bytes>>();
     };
     {
         BOOST_REQUIRE_EQUAL(to_owning_vector(composite_view(composite(bytes({'\x00', '\x03', 'e', 'l', '1', '\x00'}))).explode()),

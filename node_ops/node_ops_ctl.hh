@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -13,6 +13,7 @@
 #include "locator/host_id.hh"
 #include "node_ops/id.hh"
 #include "schema/schema_fwd.hh"
+#include "locator/host_id.hh"
 
 #include <seastar/core/abort_source.hh>
 
@@ -76,7 +77,10 @@ enum class node_ops_cmd_category {
 
 node_ops_cmd_category categorize_node_ops_cmd(node_ops_cmd cmd) noexcept;
 
-std::ostream& operator<<(std::ostream& out, node_ops_cmd cmd);
+template <>
+struct fmt::formatter<node_ops_cmd> : fmt::formatter<string_view> {
+    auto format(node_ops_cmd, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
 
 // The cmd and ops_uuid are mandatory for each request.
 // The ignore_nodes and leaving_node are optional.
@@ -112,8 +116,6 @@ struct node_ops_cmd_request {
     }
 };
 
-std::ostream& operator<<(std::ostream& out, const node_ops_cmd_request& req);
-
 struct node_ops_cmd_response {
     // Mandatory field, set by all cmds
     bool ok;
@@ -126,9 +128,9 @@ struct node_ops_cmd_response {
 };
 
 class node_ops_ctl {
-    std::unordered_set<gms::inet_address> nodes_unknown_verb;
-    std::unordered_set<gms::inet_address> nodes_down;
-    std::unordered_set<gms::inet_address> nodes_failed;
+    std::unordered_set<locator::host_id> nodes_unknown_verb;
+    std::unordered_set<locator::host_id> nodes_down;
+    std::unordered_set<locator::host_id> nodes_failed;
 
 public:
     const service::storage_service& ss;
@@ -136,8 +138,8 @@ public:
     locator::host_id host_id;   // Host ID of the node operand (i.e. added, replaced, or leaving node)
     gms::inet_address endpoint;      // IP address of the node operand (i.e. added, replaced, or leaving node)
     lw_shared_ptr<const locator::token_metadata> tmptr;
-    std::unordered_set<gms::inet_address> sync_nodes;
-    std::unordered_set<gms::inet_address> ignore_nodes;
+    std::unordered_set<locator::host_id> sync_nodes;
+    std::unordered_set<locator::host_id> ignore_nodes;
     node_ops_cmd_request req;
     std::chrono::seconds heartbeat_interval;
     abort_source as;
@@ -147,8 +149,8 @@ public:
     ~node_ops_ctl();
     const node_ops_id& uuid() const noexcept;
     // may be called multiple times
-    void start(sstring desc_, std::function<bool(gms::inet_address)> sync_to_node = [] (gms::inet_address) { return true; });
-    void refresh_sync_nodes(std::function<bool(gms::inet_address)> sync_to_node = [] (gms::inet_address) { return true; });
+    void start(sstring desc_, std::function<bool(locator::host_id)> sync_to_node = [] (locator::host_id) { return true; });
+    void refresh_sync_nodes(std::function<bool(locator::host_id)> sync_to_node = [] (locator::host_id) { return true; });
     future<> stop() noexcept;
     // Caller should set the required req members before prepare
     future<> prepare(node_ops_cmd cmd) noexcept;
@@ -160,4 +162,9 @@ public:
     future<> abort_on_error(node_ops_cmd cmd, std::exception_ptr ex) noexcept;
     future<> send_to_all(node_ops_cmd cmd);
     future<> heartbeat_updater(node_ops_cmd cmd);
+};
+
+template <>
+struct fmt::formatter<node_ops_cmd_request> : fmt::formatter<string_view> {
+    auto format(const node_ops_cmd_request&, fmt::format_context& ctx) const -> decltype(ctx.out());
 };

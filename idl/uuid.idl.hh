@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "utils/UUID.hh"
@@ -11,6 +11,7 @@
 #include "query_id.hh"
 #include "locator/host_id.hh"
 #include "tasks/types.hh"
+#include "service/session.hh"
 
 namespace utils {
 class UUID final {

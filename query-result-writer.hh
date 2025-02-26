@@ -3,18 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "types/types.hh"
-#include "mutation/atomic_cell.hh"
 #include "query-request.hh"
 #include "query-result.hh"
 #include "utils/digest_algorithm.hh"
 #include "utils/digester.hh"
 #include "full_position.hh"
+#include "mutation/tombstone.hh"
 #include "idl/query.dist.hh"
 #include "idl/query.dist.impl.hh"
 
@@ -136,9 +136,9 @@ public:
             return stop_iteration::no;
         }
         if (!_slice.options.contains<partition_slice::option::allow_short_read>()) {
-            throw std::runtime_error(fmt::format(
-                    "Tombstones processed by unpaged query exceeds limit of {} (configured via query_tombstone_page_limit)",
-                    _tombstone_limit));
+            // The read is unpaged, we cannot interrupt it early without failing it.
+            // Better let it continue.
+            return stop_iteration::no;
         }
         return stop_iteration::yes;
     }
@@ -202,8 +202,8 @@ class range_tombstone_change;
 class mutation_querier {
     const schema& _schema;
     query::result_memory_accounter& _memory_accounter;
-    query::result::partition_writer _pw;
     ser::qr_partition__static_row__cells<bytes_ostream> _static_cells_wr;
+    query::result::partition_writer _pw;
     bool _live_data_in_static_row{};
     uint64_t _live_clustering_rows = 0;
     std::optional<ser::qr_partition__rows<bytes_ostream>> _rows_wr;

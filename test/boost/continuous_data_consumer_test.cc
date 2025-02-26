@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "vint-serialization.hh"
@@ -13,6 +13,7 @@
 #include "utils/buffer_input_stream.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
 #include "test/lib/random_utils.hh"
+#include "schema/schema.hh"
 #include "sstables/processing_result_generator.hh"
 
 #include <boost/test/unit_test.hpp>

@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "batch_statement.hh"
@@ -17,10 +17,8 @@
 #include "cas_request.hh"
 #include "cql3/query_processor.hh"
 #include "service/storage_proxy.hh"
-
-#include <boost/algorithm/cxx11/any_of.hpp>
-#include <boost/algorithm/cxx11/all_of.hpp>
-#include <boost/range/adaptor/uniqued.hpp>
+#include "tracing/trace_state.hh"
+#include "utils/unique_view.hh"
 
 template<typename T = void>
 using coordinator_result = exceptions::coordinator_result<T>;
@@ -49,7 +47,7 @@ batch_statement::batch_statement(int bound_terms, type type_,
     : cql_statement_opt_metadata(timeout_for_type(type_))
     , _bound_terms(bound_terms), _type(type_), _statements(std::move(statements))
     , _attrs(std::move(attrs))
-    , _has_conditions(boost::algorithm::any_of(_statements, [] (auto&& s) { return s.statement->has_conditions(); }))
+    , _has_conditions(std::ranges::any_of(_statements, [] (auto&& s) { return s.statement->has_conditions(); }))
     , _stats(stats)
 {
     validate();
@@ -73,7 +71,7 @@ batch_statement::batch_statement(type type_,
 
 bool batch_statement::depends_on(std::string_view ks_name, std::optional<std::string_view> cf_name) const
 {
-    return boost::algorithm::any_of(_statements, [&ks_name, &cf_name] (auto&& s) { return s.statement->depends_on(ks_name, cf_name); });
+    return std::ranges::any_of(_statements, [&ks_name, &cf_name] (auto&& s) { return s.statement->depends_on(ks_name, cf_name); });
 }
 
 uint32_t batch_statement::get_bound_terms() const
@@ -108,12 +106,12 @@ void batch_statement::validate()
         }
     }
 
-    bool has_counters = boost::algorithm::any_of(_statements, [] (auto&& s) { return s.statement->is_counter(); });
-    bool has_non_counters = !boost::algorithm::all_of(_statements, [] (auto&& s) { return s.statement->is_counter(); });
+    bool has_counters = std::ranges::any_of(_statements, [] (auto&& s) { return s.statement->is_counter(); });
+    bool has_non_counters = !std::ranges::all_of(_statements, [] (auto&& s) { return s.statement->is_counter(); });
     if (timestamp_set && has_counters) {
         throw exceptions::invalid_request_exception("Cannot provide custom timestamp for a BATCH containing counters");
     }
-    if (timestamp_set && boost::algorithm::any_of(_statements, [] (auto&& s) { return s.statement->is_timestamp_set(); })) {
+    if (timestamp_set && std::ranges::any_of(_statements, [] (auto&& s) { return s.statement->is_timestamp_set(); })) {
         throw exceptions::invalid_request_exception("Timestamp must be set either on BATCH or individual statements");
     }
     if (_type == type::COUNTER && has_non_counters) {
@@ -128,12 +126,12 @@ void batch_statement::validate()
 
     if (_has_conditions
             && !_statements.empty()
-            && (boost::distance(_statements
-                            | boost::adaptors::transformed([] (auto&& s) { return s.statement->keyspace(); })
-                            | boost::adaptors::uniqued) != 1
-                || (boost::distance(_statements
-                        | boost::adaptors::transformed([] (auto&& s) { return s.statement->column_family(); })
-                        | boost::adaptors::uniqued) != 1))) {
+            && (std::ranges::distance(_statements
+                            | std::views::transform([] (auto&& s) { return s.statement->keyspace(); })
+                            | utils::views::unique) != 1
+                || (std::ranges::distance(_statements
+                        | std::views::transform([] (auto&& s) { return s.statement->column_family(); })
+                        | utils::views::unique) != 1))) {
         throw exceptions::invalid_request_exception("BATCH with conditions cannot span multiple tables");
     }
     std::optional<bool> raw_counter;
@@ -211,14 +209,14 @@ void batch_statement::verify_batch_size(query_processor& qp, const std::vector<m
             for (auto&& m : mutations) {
                 ks_cf_pairs.insert(m.schema()->ks_name() + "." + m.schema()->cf_name());
             }
-            return format("Batch modifying {:d} partitions in {} is of size {:d} bytes, exceeding specified {} threshold of {:d} by {:d}.",
+            return seastar::format("Batch modifying {:d} partitions in {} is of size {:d} bytes, exceeding specified {} threshold of {:d} by {:d}.",
                     mutations.size(), fmt::join(ks_cf_pairs, ", "), size, type, threshold, size - threshold);
         };
         if (size > fail_threshold) {
-            _logger.error(error("FAIL", fail_threshold).c_str());
+            _logger.error("{}", error("FAIL", fail_threshold).c_str());
             throw exceptions::invalid_request_exception("Batch too large");
         } else {
-            _logger.warn(error("WARN", warn_threshold).c_str());
+            _logger.warn("{}", error("WARN", warn_threshold).c_str());
         }
     }
 }
@@ -398,7 +396,7 @@ void batch_statement::build_cas_result_set_metadata() {
             ::make_shared<cql3::column_identifier>("[applied]", false), boolean_type);
     columns.push_back(applied);
 
-    for (const auto& def : boost::range::join(schema.partition_key_columns(), schema.clustering_key_columns())) {
+    for (const auto& def : schema.primary_key_columns()) {
         _columns_of_cas_result_set.set(def.ordinal_id);
     }
     for (const auto& s : _statements) {
@@ -434,6 +432,10 @@ batch_statement::prepare(data_dictionary::database db, cql_stats& stats) {
             have_multiple_cfs = first_ks.value() != parsed->keyspace() || first_cf.value() != parsed->column_family();
         }
         statements.emplace_back(parsed->prepare(db, meta, stats));
+        auto audit_info = statements.back().statement->get_audit_info();
+        if (audit_info) {
+            audit_info->set_query_string(parsed->get_raw_cql());
+        }
     }
 
     auto&& prep_attrs = _attrs->prepare(db, "[batch]", "[batch]");
@@ -445,9 +447,13 @@ batch_statement::prepare(data_dictionary::database db, cql_stats& stats) {
     if (!have_multiple_cfs && batch_statement_.get_statements().size() > 0) {
         partition_key_bind_indices = meta.get_partition_key_bind_indexes(*batch_statement_.get_statements()[0].statement->s);
     }
-    return std::make_unique<prepared_statement>(make_shared<cql3::statements::batch_statement>(std::move(batch_statement_)),
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<cql3::statements::batch_statement>(std::move(batch_statement_)),
                                                      meta.get_variable_specifications(),
                                                      std::move(partition_key_bind_indices));
+}
+
+audit::statement_category batch_statement::category() const {
+    return audit::statement_category::DML;
 }
 
 }

@@ -3,8 +3,9 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
+#include "utils/assert.hh"
 #include "tracker.hh"
 #include <seastar/core/coroutine.hh>
 
@@ -37,7 +38,7 @@ bool follower_progress::is_stray_reject(const append_reply::rejected& rejected) 
         // In PROBE state we send a single append request `req` with `req.prev_log_idx == next_idx - 1`.
         // When the follower generates a rejected response `r`, it sets `r.non_matching_idx = req.prev_log_idx`.
         // Thus the reject either satisfies `rejected.non_matching_idx == next_idx - 1` or is stray.
-        if (rejected.non_matching_idx != index_t(next_idx - 1)) {
+        if (rejected.non_matching_idx != next_idx - index_t(1)) {
             return true;
         }
         break;
@@ -45,7 +46,7 @@ bool follower_progress::is_stray_reject(const append_reply::rejected& rejected) 
         // any reject during snapshot transfer is stray one
         return true;
     default:
-        assert(false);
+        SCYLLA_ASSERT(false);
     }
     return false;
 }
@@ -86,7 +87,7 @@ bool follower_progress::can_send_to() {
         // before starting to sync the log.
         return false;
     }
-    assert(false);
+    SCYLLA_ASSERT(false);
     return false;
 }
 
@@ -256,36 +257,38 @@ vote_result votes::tally_votes() const {
     return _current.tally_votes();
 }
 
-std::ostream& operator<<(std::ostream& os, const election_tracker& v) {
-    os << "responded: " << v._responded.size() << ", ";
-    os << "granted: " << v._granted;
-    return os;
-}
-
-
-std::ostream& operator<<(std::ostream& os, const votes& v) {
-    os << "current: " << v._current << std::endl;
-    if (v._previous) {
-        os << "previous: " << v._previous.value() << std::endl;
-    }
-    return os;
-}
-
-std::ostream& operator<<(std::ostream& os, const vote_result& v) {
-    static const char *n;
-    switch (v) {
-    case vote_result::UNKNOWN:
-        n = "UNKNOWN";
-        break;
-    case vote_result::WON:
-        n = "WON";
-        break;
-    case vote_result::LOST:
-        n = "LOST";
-        break;
-    }
-    os << n;
-    return os;
-}
-
 } // end of namespace raft
+
+auto fmt::formatter<raft::election_tracker>::format(const raft::election_tracker& v, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    return fmt::format_to(ctx.out(), "responded: {}, granted: {}",
+                          v._responded.size(), v._granted);
+}
+
+auto fmt::formatter<raft::votes>::format(const raft::votes& v, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    auto out = ctx.out();
+    out = fmt::format_to(out, "current: {}\n", v._current);
+    if (v._previous) {
+        out = fmt::format_to(out, "previous: {}\n", v._previous.value());
+    }
+    return out;
+}
+
+auto fmt::formatter<raft::vote_result>::format(const raft::vote_result& v, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    std::string_view name;
+    using enum raft::vote_result;
+    switch (v) {
+    case UNKNOWN:
+        name = "UNKNOWN";
+        break;
+    case WON:
+        name = "WON";
+        break;
+    case LOST:
+        name = "LOST";
+        break;
+    }
+    return formatter<string_view>::format(name, ctx);
+}

@@ -3,12 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include <seastar/core/with_timeout.hh>
 #include <seastar/util/closeable.hh>
 #include "db/virtual_table.hh"
-#include "db/system_keyspace.hh"
 #include "schema/schema.hh"
 
 #include "test/lib/mutation_source_test.hh"

@@ -3,14 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
-
-#include <seastar/core/future.hh>
-#include <seastar/util/noncopyable_function.hh>
-#include <seastar/core/file.hh>
 
 #include "schema/schema_fwd.hh"
 #include "sstables/shared_sstable.hh"
@@ -21,6 +17,7 @@
 
 struct mutation_source_metadata;
 class compaction_backlog_tracker;
+extern logging::logger compaction_strategy_logger;
 
 using namespace compaction;
 
@@ -30,7 +27,7 @@ class compaction_strategy_impl;
 class sstable;
 class sstable_set;
 struct compaction_descriptor;
-struct resharding_descriptor;
+class storage;
 
 class compaction_strategy {
     ::shared_ptr<compaction_strategy_impl> _compaction_strategy_impl;
@@ -73,6 +70,10 @@ public:
             return "LeveledCompactionStrategy";
         case compaction_strategy_type::time_window:
             return "TimeWindowCompactionStrategy";
+        case compaction_strategy_type::in_memory:
+            return "InMemoryCompactionStrategy";
+        case compaction_strategy_type::incremental:
+            return "IncrementalCompactionStrategy";
         default:
             throw std::runtime_error("Invalid Compaction Strategy");
         }
@@ -89,6 +90,10 @@ public:
             return compaction_strategy_type::leveled;
         } else if (short_name == "TimeWindowCompactionStrategy") {
             return compaction_strategy_type::time_window;
+        } else if (short_name == "InMemoryCompactionStrategy") {
+            return compaction_strategy_type::in_memory;
+        } else if (short_name == "IncrementalCompactionStrategy") {
+            return compaction_strategy_type::incremental;
         } else {
             throw exceptions::configuration_exception(format("Unable to find compaction strategy class '{}'", name));
         }
@@ -122,11 +127,13 @@ public:
     //
     // The caller should also pass a maximum number of SSTables which is the maximum amount of
     // SSTables that can be added into a single job.
-    compaction_descriptor get_reshaping_job(std::vector<shared_sstable> input, schema_ptr schema, reshape_mode mode) const;
+    compaction_descriptor get_reshaping_job(std::vector<shared_sstable> input, schema_ptr schema, reshape_config cfg) const;
 
 };
 
 // Creates a compaction_strategy object from one of the strategies available.
 compaction_strategy make_compaction_strategy(compaction_strategy_type strategy, const std::map<sstring, sstring>& options);
+
+future<reshape_config> make_reshape_config(const sstables::storage& storage, reshape_mode mode);
 
 }

@@ -6,10 +6,12 @@
 #
 # Copyright (C) 2020-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
 set -euo pipefail
+
+trap 'echo "error $? in $0 line $LINENO"' ERR
 
 # The following is the default list of submodules to refresh. To only refresh
 # some of them, pass the list of modules to refresh as arguments. For example,

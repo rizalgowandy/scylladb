@@ -1,6 +1,3 @@
-.. |UBUNTU_SCYLLADB_LIST| replace:: scylla-5.4.list
-.. |CENTOS_SCYLLADB_REPO| replace:: scylla-5.4.repo
-
 .. The |RHEL_EPEL| variable needs to be adjuster per release, depending on support for RHEL.
 .. 5.2 supports Rocky/RHEL 8 only
 .. 5.4 supports Rocky/RHEL 8 and 9
@@ -49,7 +46,7 @@ Install ScyllaDB
 
             .. code-block:: console
     
-               sudo gpg --homedir /tmp --no-default-keyring --keyring /etc/apt/keyrings/scylladb.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys d0a112e067426ab2
+               sudo gpg --homedir /tmp --no-default-keyring --keyring /etc/apt/keyrings/scylladb.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys a43e06657bac99e3
 
             .. code-block:: console
                :substitutions:
@@ -64,7 +61,7 @@ Install ScyllaDB
                sudo apt-get update
                sudo apt-get install -y scylla 
 
-            Running the command installs the latest official version of ScyllaDB Open Source.
+            Running the command installs the latest official version of ScyllaDB.
             To install a specific patch version, list all the available patch versions:
           
             .. code-block:: console
@@ -75,7 +72,7 @@ Install ScyllaDB
 
             .. code-block:: console
     
-               apt-get install scylla{,-server,-jmx,-tools,-tools-core,-kernel-conf,-node-exporter,-conf,-python3}=<your patch version>
+               apt-get install scylla{,-server,-tools,-tools-core,-kernel-conf,-node-exporter,-conf,-python3}=<your patch version>
           
             The following example shows installing ScyllaDB 5.2.3.
 
@@ -91,7 +88,7 @@ Install ScyllaDB
             .. code-block:: console
                :class: hide-copy-button
     
-               apt-get install scylla{,-server,-jmx,-tools,-tools-core,-kernel-conf,-node-exporter,-conf,-python3}=5.2.3-0.20230608.ea08d409f155-1
+               apt-get install scylla{,-server,-tools,-tools-core,-kernel-conf,-node-exporter,-conf,-python3}=5.2.3-0.20230608.ea08d409f155-1
 
 
         #. (Ubuntu only) Set Java 11.
@@ -156,60 +153,15 @@ Install ScyllaDB
     
                sudo yum install scylla-5.2.3
 
-
-Configure and Run ScyllaDB
+(Optional) Install scylla-jmx
 -------------------------------
 
-#. Configure the following parameters in the ``/etc/scylla/scylla.yaml`` configuration file.
-
-   * ``cluster_name`` - The name of the cluster. All the nodes in the cluster must have the same 
-     cluster name configured.
-   * ``seeds`` - The IP address of the first node. Other nodes will use it as the first contact 
-     point to discover the cluster topology when joining the cluster.
-   * ``listen_address`` - The IP address that ScyllaDB uses to connect to other nodes in the cluster.
-   * ``rpc_address`` - The IP address of the interface for client connections (Thrift, CQL).
-
-#. Run the ``scylla_setup`` script to tune the system settings and determine the optimal configuration.
-
-   .. code-block:: console
-    
-      sudo scylla_setup
-
-   * The script invokes a set of :ref:`scripts <system-configuration-scripts>` to configure several operating system settings; for example, it sets 
-     RAID0 and XFS filesystem. 
-   * The script runs a short (up to a few minutes) benchmark on your storage and generates the ``/etc/scylla.d/io.conf`` 
-     configuration file. When the file is ready, you can start ScyllaDB. ScyllaDB will not run without XFS 
-     or ``io.conf`` file.
-   * You can bypass this check by running ScyllaDB in :doc:`developer mode </getting-started/installation-common/dev-mod>`. 
-     We recommend against enabling developer mode in production environments to ensure ScyllaDB's maximum performance.
-
-#. Run ScyllaDB as a service (if not already running).
-
-   .. code-block:: console
-    
-      sudo systemctl start scylla-server
+    scylla-jmx is an optional package and is not installed by default.
+    If you need JMX server, see :doc:`Install scylla-jmx Package </getting-started/installation-common/install-jmx>`.
 
 
-Now you can start using ScyllaDB. Here are some tools you may find useful.
 
-Run nodetool:
-   
-.. code-block:: console
-     
-     nodetool status
-
-Run cqlsh:
-
-.. code-block:: console
-     
-     cqlsh
-
-Run cassandra-stress:
-
-.. code-block:: console
-     
-     cassandra-stress write -mode cql3 native 
-
+.. include:: /getting-started/_common/setup-after-install.rst
 
 Next Steps
 ------------

@@ -5,13 +5,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include "schema/schema_fwd.hh"
-#include <ostream>
+#include <fmt/core.h>
 
 namespace streaming {
 
@@ -34,7 +34,10 @@ public:
         , files(_files)
         , total_size(_total_size) {
     }
-    friend std::ostream& operator<<(std::ostream& os, const stream_summary& r);
 };
 
 } // namespace streaming
+
+template <> struct fmt::formatter<streaming::stream_summary> : fmt::formatter<string_view> {
+    auto format(const streaming::stream_summary&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

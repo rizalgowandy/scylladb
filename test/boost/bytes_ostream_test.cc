@@ -3,12 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #define BOOST_TEST_MODULE core
 
-#include <boost/range/algorithm/for_each.hpp>
+#include "utils/assert.hh"
 
 #include <seastar/util/variant_utils.hh>
 
@@ -27,9 +27,9 @@ void append_sequence(bytes_ostream& buf, int count) {
 
 void assert_sequence(bytes_ostream& buf, int count) {
     auto in = ser::as_input_stream(buf.linearize());
-    assert(buf.size() == count * sizeof(int));
+    SCYLLA_ASSERT(buf.size() == count * sizeof(int));
     for (int i = 0; i < count; i++) {
-        auto val = ser::deserialize(in, boost::type<int>());
+        auto val = ser::deserialize(in, std::type_identity<int>());
         BOOST_REQUIRE_EQUAL(val, i);
     }
 }
@@ -124,7 +124,7 @@ BOOST_AUTO_TEST_CASE(test_view) {
     BOOST_REQUIRE(buf.is_linearized());
 
     auto in = ser::as_input_stream(buf.view());
-    BOOST_REQUIRE_EQUAL(1, ser::deserialize(in, boost::type<int>()));
+    BOOST_REQUIRE_EQUAL(1, ser::deserialize(in, std::type_identity<int>()));
 }
 
 BOOST_AUTO_TEST_CASE(test_writing_blobs) {
@@ -163,7 +163,7 @@ BOOST_AUTO_TEST_CASE(test_fragment_iteration) {
 
     // If this fails, we will only have one fragment, and the test will be weak.
     // Bump up the 'count' if this is triggered.
-    assert(!buf2.is_linearized());
+    SCYLLA_ASSERT(!buf2.is_linearized());
 
     assert_sequence(buf2, count);
 }
@@ -204,8 +204,8 @@ BOOST_AUTO_TEST_CASE(test_retraction_to_the_same_chunk) {
     BOOST_REQUIRE(buf.size() == sizeof(int) * 2);
 
     auto in = ser::as_input_stream(buf.view());
-    BOOST_REQUIRE_EQUAL(ser::deserialize(in, boost::type<int>()), 1);
-    BOOST_REQUIRE_EQUAL(ser::deserialize(in, boost::type<int>()), 2);
+    BOOST_REQUIRE_EQUAL(ser::deserialize(in, std::type_identity<int>()), 1);
+    BOOST_REQUIRE_EQUAL(ser::deserialize(in, std::type_identity<int>()), 2);
     BOOST_REQUIRE(in.size() == 0);
 }
 
@@ -221,8 +221,8 @@ BOOST_AUTO_TEST_CASE(test_no_op_retraction) {
     BOOST_REQUIRE(buf.size() == sizeof(int) * 2);
 
     auto in = ser::as_input_stream(buf.view());
-    BOOST_REQUIRE_EQUAL(ser::deserialize(in, boost::type<int>()), 1);
-    BOOST_REQUIRE_EQUAL(ser::deserialize(in, boost::type<int>()), 2);
+    BOOST_REQUIRE_EQUAL(ser::deserialize(in, std::type_identity<int>()), 1);
+    BOOST_REQUIRE_EQUAL(ser::deserialize(in, std::type_identity<int>()), 2);
     BOOST_REQUIRE(in.size() == 0);
 }
 
@@ -238,7 +238,7 @@ BOOST_AUTO_TEST_CASE(test_retraction_discarding_chunks) {
     BOOST_REQUIRE(buf.size() == sizeof(int));
 
     auto in = ser::as_input_stream(buf.view());
-    BOOST_REQUIRE_EQUAL(ser::deserialize(in, boost::type<int>()), 1);
+    BOOST_REQUIRE_EQUAL(ser::deserialize(in, std::type_identity<int>()), 1);
     BOOST_REQUIRE(in.size() == 0);
 }
 
@@ -251,8 +251,8 @@ BOOST_AUTO_TEST_CASE(test_writing_placeholders) {
     ser::serialize(ph_stream, 1);
 
     auto in = ser::as_input_stream(buf.view());
-    BOOST_REQUIRE_EQUAL(ser::deserialize(in, boost::type<int>()), 1);
-    BOOST_REQUIRE_EQUAL(ser::deserialize(in, boost::type<int>()), 2);
+    BOOST_REQUIRE_EQUAL(ser::deserialize(in, std::type_identity<int>()), 1);
+    BOOST_REQUIRE_EQUAL(ser::deserialize(in, std::type_identity<int>()), 2);
     BOOST_REQUIRE(in.size() == 0);
 }
 

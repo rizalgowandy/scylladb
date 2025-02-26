@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include <seastar/core/coroutine.hh>
@@ -11,8 +11,6 @@
 #include "cql3/statements/prepared_statement.hh"
 #include "cql3/query_processor.hh"
 #include "cql3/functions/functions.hh"
-
-#include "boost/range/adaptor/map.hpp"
 
 #include "service/migration_manager.hh"
 #include "service/storage_proxy.hh"
@@ -43,14 +41,16 @@ future<> drop_type_statement::check_access(query_processor& qp, const service::c
     return state.has_keyspace_access(keyspace(), auth::permission::DROP);
 }
 
-void drop_type_statement::validate_while_executing(query_processor& qp) const {
+// function returns false when there is no type or keyspace found and flag _if_exists is set;
+// generate exception if anything is wrong, and returns true when we have a type to delete.
+bool drop_type_statement::validate_while_executing(query_processor& qp) const {
     try {
         auto&& ks = qp.db().find_keyspace(keyspace());
         auto&& all_types = ks.metadata()->user_types().get_all_types();
         auto old = all_types.find(_name.get_user_type_name());
         if (old == all_types.end()) {
             if (_if_exists) {
-                return;
+                return false;
             } else {
                 throw exceptions::invalid_request_exception(format("No user type named {} exists.", _name.to_cql_string()));
             }
@@ -88,7 +88,7 @@ void drop_type_statement::validate_while_executing(query_processor& qp) const {
         auto&& keyspace = type->_keyspace;
         auto&& name = type->_name;
 
-        for (auto&& ut : all_types | boost::adaptors::map_values) {
+        for (auto&& ut : all_types | std::views::values) {
             if (ut->_keyspace == keyspace && ut->_name == name) {
                 continue;
             }
@@ -98,7 +98,7 @@ void drop_type_statement::validate_while_executing(query_processor& qp) const {
             }
         }
 
-        for (auto&& cfm : ks.metadata()->cf_meta_data() | boost::adaptors::map_values) {
+        for (auto&& cfm : ks.metadata()->cf_meta_data() | std::views::values) {
             for (auto&& col : cfm->all_columns()) {
                 if (col.type->references_user_type(keyspace, name)) {
                     throw exceptions::invalid_request_exception(format("Cannot drop user type {}.{} as it is still used by table {}.{}", keyspace, type->get_name_as_string(), cfm->ks_name(), cfm->cf_name()));
@@ -106,11 +106,15 @@ void drop_type_statement::validate_while_executing(query_processor& qp) const {
             }
         }
 
-        if (auto&& fun_name = functions::functions::used_by_user_function(_name)) {
+        if (auto&& fun_name = functions::instance().used_by_user_function(_name)) {
             throw exceptions::invalid_request_exception(format("Cannot drop user type {}.{} as it is still used by function {}", keyspace, type->get_name_as_string(), *fun_name));
         }
+        return true;
     } catch (data_dictionary::no_such_keyspace& e) {
-        throw exceptions::invalid_request_exception(format("Cannot drop type in unknown keyspace {}", keyspace()));
+        if (!_if_exists) {
+            throw exceptions::invalid_request_exception(format("Cannot drop type in unknown keyspace {}", keyspace()));
+        }
+        return false;
     }
 }
 
@@ -121,22 +125,19 @@ const sstring& drop_type_statement::keyspace() const
 }
 
 future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>>
-drop_type_statement::prepare_schema_mutations(query_processor& qp, api::timestamp_type ts) const {
-    validate_while_executing(qp);
-
-    data_dictionary::database db = qp.db();
-
-    // Keyspace exists or we wouldn't have validated otherwise
-    auto&& ks = db.find_keyspace(keyspace());
-
-    const auto& all_types = ks.metadata()->user_types().get_all_types();
-    auto to_drop = all_types.find(_name.get_user_type_name());
-
+drop_type_statement::prepare_schema_mutations(query_processor& qp, const query_options&, api::timestamp_type ts) const {
     ::shared_ptr<cql_transport::event::schema_change> ret;
     std::vector<mutation> m;
 
-    // Can happen with if_exists
-    if (to_drop != all_types.end()) {
+    if (validate_while_executing(qp)) {
+        data_dictionary::database db = qp.db();
+
+        // Keyspace exists or we wouldn't have validated otherwise
+        auto&& ks = db.find_keyspace(keyspace());
+
+        const auto& all_types = ks.metadata()->user_types().get_all_types();
+        auto to_drop = all_types.find(_name.get_user_type_name());
+
         m = co_await service::prepare_type_drop_announcement(qp.proxy(), to_drop->second, ts);
 
         using namespace cql_transport;
@@ -146,13 +147,12 @@ drop_type_statement::prepare_schema_mutations(query_processor& qp, api::timestam
                 keyspace(),
                 _name.get_string_type_name());
     }
-
     co_return std::make_tuple(std::move(ret), std::move(m), std::vector<sstring>());
 }
 
 std::unique_ptr<cql3::statements::prepared_statement>
 drop_type_statement::prepare(data_dictionary::database db, cql_stats& stats) {
-    return std::make_unique<prepared_statement>(make_shared<drop_type_statement>(*this));
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<drop_type_statement>(*this));
 }
 
 }

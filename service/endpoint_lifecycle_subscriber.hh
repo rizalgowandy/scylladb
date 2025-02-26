@@ -5,12 +5,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include "gms/inet_address.hh"
+#include "locator/host_id.hh"
 #include "utils/atomic_vector.hh"
 
 namespace service {
@@ -39,9 +40,10 @@ public:
     /**
      * Called when a new node leave the cluster (decommission or removeToken).
      *
-     * @param endpoint the endpoint that is leaving.
+     * @param endpoint the IP of the endpoint that is leaving.
+     * @param host_id the host ID of the endpoint that is leaving.
      */
-    virtual void on_leave_cluster(const gms::inet_address& endpoint) = 0;
+    virtual void on_leave_cluster(const gms::inet_address& endpoint, const locator::host_id& host_id) = 0;
 
     /**
      * Called when a node is marked UP.
@@ -66,7 +68,7 @@ public:
     future<> unregister_subscriber(endpoint_lifecycle_subscriber* subscriber) noexcept;
 
     future<> notify_down(gms::inet_address endpoint);
-    future<> notify_left(gms::inet_address endpoint);
+    future<> notify_left(gms::inet_address endpoint, locator::host_id host_id);
     future<> notify_up(gms::inet_address endpoint);
     future<> notify_joined(gms::inet_address endpoint);
 };

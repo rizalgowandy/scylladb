@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -29,14 +29,10 @@ public:
         return ::with_linearized(_bytes, func);
     }
 
-    std::vector<bytes_view> explode(const schema& s) const {
-        return with_linearized([&] (bytes_view v) {
-            return composite_view(v, s.partition_key_size() > 1).explode();
-        });
-    }
-
     partition_key to_partition_key(const schema& s) const {
-        return partition_key::from_exploded_view(explode(s));
+        return with_linearized([&] (bytes_view v) {
+            return partition_key::from_exploded_view(composite_view(v, s.partition_key_size() > 1).explode());
+        });
     }
 
     bool operator==(const key_view& k) const = default;

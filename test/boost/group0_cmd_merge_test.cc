@@ -3,12 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include "test/lib/scylla_test_case.hh"
+#include <fmt/ranges.h>
+
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include "test/lib/cql_test_env.hh"
 
+#include "db/config.hh"
+#include "db/system_keyspace.hh"
 #include "service/migration_manager.hh"
 #include "service/raft/raft_group_registry.hh"
 #include "service/raft/group0_state_machine.hh"
@@ -19,6 +24,8 @@
 #include "idl/group0_state_machine.dist.impl.hh"
 #include "utils/error_injection.hh"
 #include "test/lib/expr_test_utils.hh"
+
+BOOST_AUTO_TEST_SUITE(group0_cmd_merge_test)
 
 const auto OLD_TIMEUUID = utils::UUID_gen::get_time_UUID(std::chrono::system_clock::time_point::min());
 
@@ -87,7 +94,7 @@ SEASTAR_TEST_CASE(test_group0_cmd_merge) {
         };
         std::vector<canonical_mutation> cms;
         size_t size = 0;
-        auto muts = service::prepare_keyspace_drop_announcement(env.local_db(), "ks", api::new_timestamp()).get0();
+        auto muts = service::prepare_keyspace_drop_announcement(env.local_db(), "ks", api::new_timestamp()).get();
         // Maximum mutation size is 1/3 of commitlog segment size which we set
         // to 1M. Make one command a little bit larger than third of the max size.
         while (size < 150*1024) {
@@ -100,7 +107,7 @@ SEASTAR_TEST_CASE(test_group0_cmd_merge) {
         raft::command cmd;
         ser::serialize(cmd, group0_cmd);
         auto merges = mm.canonical_mutation_merge_count;
-        utils::get_local_injector().enable("fsm::poll_output/pause");
+        utils::get_local_injector().enable("poll_fsm_output/pause");
         auto f = when_all(
                    group0.add_entry(cmd, raft::wait_type::applied, nullptr),
                    group0.add_entry(cmd, raft::wait_type::applied, nullptr),
@@ -108,7 +115,7 @@ SEASTAR_TEST_CASE(test_group0_cmd_merge) {
         // Sleep is needed for all the entries added above to hit the log
         seastar::sleep(std::chrono::milliseconds(100)).get();
         // After unpause all entries added above will be committed and applied together
-        utils::get_local_injector().disable("fsm::poll_output/pause");
+        utils::get_local_injector().disable("poll_fsm_output/pause");
         f.get(); // Wait for apply to complete
         // Thete should be two calls to migration manager since two out of
         // three command should be merged.
@@ -116,3 +123,5 @@ SEASTAR_TEST_CASE(test_group0_cmd_merge) {
     }, cfg);
 #endif
 }
+
+BOOST_AUTO_TEST_SUITE_END()

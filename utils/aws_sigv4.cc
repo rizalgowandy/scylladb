@@ -3,12 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <gnutls/crypto.h>
 #include "utils/aws_sigv4.hh"
 #include "utils/hashers.hh"
+#include "bytes.hh"
 #include "db_clock.hh"
 
 using namespace std::chrono_literals;
@@ -88,7 +89,7 @@ std::string get_signature(std::string_view access_key_id, std::string_view secre
         check_expiry(amz_date);
         if (datestamp != *orig_datestamp) {
             throw std::runtime_error(
-                    format("X-Amz-Date date does not match the provided datestamp. Expected {}, got {}",
+                    fmt::format("X-Amz-Date date does not match the provided datestamp. Expected {}, got {}",
                             *orig_datestamp, datestamp));
         }
     }

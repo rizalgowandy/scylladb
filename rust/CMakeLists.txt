@@ -2,14 +2,21 @@ find_program(CARGO cargo
   REQUIRED)
 
 function(add_rust_library name)
-  # use for profiles defined in Cargo.toml
-  set(mode $<LOWER_CASE:$<CONFIG>>)
+  # used for profiles defined in Cargo.toml
+  if(CMAKE_CONFIGURATION_TYPES)
+    foreach(config ${CMAKE_CONFIGURATION_TYPES})
+      string(APPEND build_mode
+        "$<$<CONFIG:${config}>:${scylla_build_mode_${config}}>")
+    endforeach()
+  else()
+    set(build_mode ${scylla_build_mode_${CMAKE_BUILD_TYPE}})
+  endif()
+  set(profile "rust-${build_mode}")
   set(target_dir ${CMAKE_CURRENT_BINARY_DIR})
-  set(profile "rust-${mode}")
   set(library ${target_dir}/lib${name}.a)
   add_custom_command(
     OUTPUT ${library}
-    COMMAND ${CMAKE_COMMAND} -E env CARGO_BUILD_DEP_INFO_BASEDIR=. ${CARGO} build --locked --target-dir=${target_dir} --profile=rust-${mode}
+    COMMAND ${CMAKE_COMMAND} -E env CARGO_BUILD_DEP_INFO_BASEDIR=. ${CARGO} build --locked --target-dir=${target_dir} --profile=${profile}
     COMMAND ${CMAKE_COMMAND} -E copy ${target_dir}/${profile}/lib${name}.a ${library}
     DEPENDS Cargo.lock
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -62,7 +69,7 @@ generate_cxxbridge(wasmtime_bindings
 set_target_properties(Rust::rust_combined PROPERTIES
   INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_BINARY_DIR}")
 
-add_library(wasmtime_bindings)
+add_library(wasmtime_bindings STATIC)
 target_sources(wasmtime_bindings
   PRIVATE
     ${cxx_header}
@@ -80,7 +87,7 @@ generate_cxxbridge(inc
   OUTPUT_DIR "${binding_gen_build_dir}"
   SOURCES inc_sources)
 
-add_library(inc)
+add_library(inc STATIC)
 target_sources(inc
   PRIVATE
     ${cxx_header}

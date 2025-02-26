@@ -5,12 +5,11 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 #pragma once
 
 #include <deque>
-#include <unordered_set>
 #include <seastar/util/lazy.hh>
 #include <seastar/core/weak_ptr.hh>
 #include <seastar/core/checked_ptr.hh>
@@ -36,7 +35,7 @@ namespace tracing {
 
 extern logging::logger trace_state_logger;
 
-using prepared_checked_weak_ptr = seastar::checked_ptr<seastar::weak_ptr<cql3::statements::prepared_statement>>;
+using prepared_checked_weak_ptr = seastar::checked_ptr<seastar::weak_ptr<const cql3::statements::prepared_statement>>;
 
 class trace_state final {
 public:
@@ -299,7 +298,7 @@ private:
      *
      * @param val the set of batchlog endpoints
      */
-    void set_batchlog_endpoints(const inet_address_vector_replica_set& val);
+    void set_batchlog_endpoints(const host_id_vector_replica_set& val);
 
     /**
      * Stores a consistency level of a query being traced.
@@ -363,7 +362,7 @@ private:
      *
      * @param val the query string
      */
-    void add_query(sstring_view val);
+    void add_query(std::string_view val);
 
     /**
      * Store a custom session parameter.
@@ -373,7 +372,7 @@ private:
      * @param key the parameter key
      * @param val the parameter value
      */
-    void add_session_param(sstring_view key, sstring_view val);
+    void add_session_param(std::string_view key, std::string_view val);
 
     /**
      * Store a user provided timestamp.
@@ -429,7 +428,7 @@ private:
      * @param param_name_prefix prefix of the parameter key in the map, e.g. "param" or "param[1]"
      */
     void build_parameters_map_for_one_prepared(const prepared_checked_weak_ptr& prepared_ptr,
-            std::optional<std::vector<sstring_view>>& names_opt,
+            std::optional<std::vector<std::string_view>>& names_opt,
             cql3::raw_value_view_vector_with_unset& values, const sstring& param_name_prefix);
 
     /**
@@ -483,11 +482,11 @@ private:
     friend void set_page_size(const trace_state_ptr& p, int32_t val);
     friend void set_request_size(const trace_state_ptr& p, size_t s) noexcept;
     friend void set_response_size(const trace_state_ptr& p, size_t s) noexcept;
-    friend void set_batchlog_endpoints(const trace_state_ptr& p, const inet_address_vector_replica_set& val);
+    friend void set_batchlog_endpoints(const trace_state_ptr& p, const host_id_vector_replica_set& val);
     friend void set_consistency_level(const trace_state_ptr& p, db::consistency_level val);
     friend void set_optional_serial_consistency_level(const trace_state_ptr& p, const std::optional<db::consistency_level>&val);
-    friend void add_query(const trace_state_ptr& p, sstring_view val);
-    friend void add_session_param(const trace_state_ptr& p, sstring_view key, sstring_view val);
+    friend void add_query(const trace_state_ptr& p, std::string_view val);
+    friend void add_session_param(const trace_state_ptr& p, std::string_view key, std::string_view val);
     friend void set_user_timestamp(const trace_state_ptr& p, api::timestamp_type val);
     friend void add_prepared_statement(const trace_state_ptr& p, prepared_checked_weak_ptr& prepared);
     friend void set_username(const trace_state_ptr& p, const std::optional<auth::authenticated_user>& user);
@@ -604,7 +603,7 @@ inline void set_response_size(const trace_state_ptr& p, size_t s) noexcept {
     }
 }
 
-inline void set_batchlog_endpoints(const trace_state_ptr& p, const inet_address_vector_replica_set& val) {
+inline void set_batchlog_endpoints(const trace_state_ptr& p, const host_id_vector_replica_set& val) {
     if (p) {
         p->set_batchlog_endpoints(val);
     }
@@ -622,13 +621,13 @@ inline void set_optional_serial_consistency_level(const trace_state_ptr& p, cons
     }
 }
 
-inline void add_query(const trace_state_ptr& p, sstring_view val) {
+inline void add_query(const trace_state_ptr& p, std::string_view val) {
     if (p) {
         p->add_query(std::move(val));
     }
 }
 
-inline void add_session_param(const trace_state_ptr& p, sstring_view key, sstring_view val) {
+inline void add_session_param(const trace_state_ptr& p, std::string_view key, std::string_view val) {
     if (p) {
         p->add_session_param(std::move(key), std::move(val));
     }

@@ -5,7 +5,7 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
 import argparse
@@ -13,8 +13,11 @@ import os
 import subprocess
 import tarfile
 import pathlib
+import shutil
 import sys
 import tempfile
+import magic
+from tempfile import mkstemp
 
 
 RELOC_PREFIX='scylla'
@@ -52,6 +55,14 @@ def ldd(executable):
             pass
         else:
             libraries[elements[0]] = os.path.realpath(elements[2])
+            hmacfile = elements[2].replace('/lib64/', '/lib64/.') + '.hmac'
+            if os.path.exists(hmacfile):
+                arcname = os.path.basename(hmacfile)
+                libraries[arcname] = os.path.realpath(hmacfile)
+            fc_hmacfile = elements[2].replace('/lib64/', '/lib64/fipscheck/') + '.hmac'
+            if os.path.exists(fc_hmacfile):
+                arcname = 'fipscheck/' + os.path.basename(fc_hmacfile)
+                libraries[arcname] = os.path.realpath(fc_hmacfile)
     return libraries
 
 def filter_dist(info):
@@ -64,6 +75,49 @@ SCYLLA_DIR='scylla-package'
 def reloc_add(ar, name, arcname=None):
     ar.add(name, arcname="{}/{}".format(SCYLLA_DIR, arcname if arcname else name))
 
+def fipshmac(f):
+    DIRECTORY='build'
+    bn = os.path.basename(f)
+    subprocess.run(['fipshmac', '-d', DIRECTORY, f], check=True)
+    return f'{DIRECTORY}/{bn}.hmac'
+
+def fix_hmac(ar, binpath, targetpath, patched_binary):
+    bn = os.path.basename(binpath)
+    dn = os.path.dirname(binpath)
+    targetpath_bn = os.path.basename(targetpath)
+    targetpath_dn = os.path.dirname(targetpath)
+    hmac = f'{dn}/.{bn}.hmac'
+    if os.path.exists(hmac):
+        hmac = fipshmac(patched_binary)
+        hmac_arcname = f'{targetpath_dn}/.{targetpath_bn}.hmac'
+        ar.reloc_add(hmac, arcname=hmac_arcname)
+    fc_hmac = f'{dn}/fipscheck/{bn}.hmac'
+    if os.path.exists(fc_hmac):
+        fc_hmac = fipshmac(patched_binary)
+        fc_hmac_arcname = f'{targetpath_dn}/fipscheck/{targetpath_bn}.hmac'
+        ar.reloc_add(fc_hmac, arcname=fc_hmac_arcname)
+
+def fix_binary(ar, path):
+    # it's a pity patchelf have to patch an actual binary.
+    patched_elf = mkstemp()[1]
+    shutil.copy2(path, patched_elf)
+
+    subprocess.check_call(['patchelf',
+                           '--remove-rpath',
+                           patched_elf])
+    return patched_elf
+
+def fix_executable(ar, binpath, targetpath):
+    patched_binary = fix_binary(ar, binpath)
+    ar.reloc_add(patched_binary, arcname=targetpath)
+    os.remove(patched_binary)
+
+def fix_sharedlib(ar, binpath, targetpath):
+    patched_binary = fix_binary(ar, binpath)
+    ar.reloc_add(patched_binary, arcname=targetpath)
+    fix_hmac(ar, binpath, targetpath, patched_binary)
+    os.remove(patched_binary)
+
 ap = argparse.ArgumentParser(description='Create a relocatable scylla package.')
 ap.add_argument('dest',
                 help='Destination file (tar format)')
@@ -71,6 +125,8 @@ ap.add_argument('--build-dir', default='build/release',
                 help='Build dir ("build/debug" or "build/release") to use')
 ap.add_argument('--node-exporter-dir', default='build/node_exporter',
                 help='the directory where node_exporter is located')
+ap.add_argument('--debian-dir', default='build/debian/debian',
+                help='the directory where debian packaging is located')
 ap.add_argument('--stripped', action='store_true',
                 help='use stripped binaries')
 ap.add_argument('--print-libexec', action='store_true',
@@ -108,6 +164,8 @@ for exe in executables:
 
 # manually add libthread_db for debugging thread
 libs.update({'libthread_db.so.1': os.path.realpath('/lib64/libthread_db.so')})
+# manually add p11-kit-trust.so since it will dynamically load
+libs.update({'pkcs11/p11-kit-trust.so': '/lib64/pkcs11/p11-kit-trust.so'})
 
 ld_so = libs['ld.so']
 
@@ -129,18 +187,26 @@ with tempfile.NamedTemporaryFile('w+t') as version_file:
     version_file.flush()
     ar.add(version_file.name, arcname='.relocatable_package_version')
 
+with tempfile.TemporaryDirectory() as tmpdir:
+    os.symlink('./pkcs11/p11-kit-trust.so', f'{tmpdir}/libnssckbi.so')
+    ar.reloc_add(f'{tmpdir}/libnssckbi.so', arcname='libreloc/libnssckbi.so')
+
 for exe in executables_scylla:
     basename = os.path.basename(exe)
     if not args.stripped:
-        ar.reloc_add(exe, arcname=f'libexec/{basename}')
+        fix_executable(ar, exe, f'libexec/{basename}')
     else:
-        ar.reloc_add(f'{exe}.stripped', arcname=f'libexec/{basename}')
+        fix_executable(ar, f'{exe}.stripped', f'libexec/{basename}')
 for exe in executables_distrocmd:
     basename = os.path.basename(exe)
-    ar.reloc_add(exe, arcname=f'libexec/{basename}')
+    fix_executable(ar, exe, f'libexec/{basename}')
 
 for lib, libfile in libs.items():
-    ar.reloc_add(libfile, arcname='libreloc/' + lib)
+    m = magic.detect_from_filename(libfile)
+    if m and (m.mime_type.startswith('application/x-sharedlib') or m.mime_type.startswith('application/x-pie-executable')):
+        fix_sharedlib(ar, libfile, f'libreloc/{lib}')
+    else:
+        ar.reloc_add(libfile, arcname=lib, recursive=False)
 if have_gnutls:
     gnutls_config_nolink = os.path.realpath('/etc/crypto-policies/back-ends/gnutls.config')
     ar.reloc_add(gnutls_config_nolink, arcname='libreloc/gnutls.config')
@@ -169,7 +235,8 @@ ar.reloc_add('swagger-ui')
 ar.reloc_add('api')
 ar.reloc_add('tools/scyllatop')
 ar.reloc_add('scylla-gdb.py')
-ar.reloc_add('build/debian/debian', arcname='debian')
+ar.reloc_add('bin/nodetool')
+ar.reloc_add(args.debian_dir, arcname='debian')
 node_exporter_dir = args.node_exporter_dir
 if args.stripped:
     ar.reloc_add(f'{node_exporter_dir}', arcname='node_exporter')

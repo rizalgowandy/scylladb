@@ -3,11 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "alternator/server.hh"
-#include "log.hh"
+#include "gms/application_state.hh"
+#include "utils/log.hh"
+#include <fmt/ranges.h>
 #include <seastar/http/function_handlers.hh>
 #include <seastar/http/short_streams.hh>
 #include <seastar/core/coroutine.hh>
@@ -16,10 +18,15 @@
 #include <seastar/util/short_streams.hh>
 #include "seastarx.hh"
 #include "error.hh"
+#include "service/client_state.hh"
 #include "service/qos/service_level_controller.hh"
+#include "utils/assert.hh"
+#include "timeout_config.hh"
 #include "utils/rjson.hh"
 #include "auth.hh"
 #include <cctype>
+#include <string_view>
+#include <utility>
 #include "service/storage_proxy.hh"
 #include "gms/gossiper.hh"
 #include "utils/overloaded_functor.hh"
@@ -32,8 +39,6 @@ using request = http::request;
 using reply = http::reply;
 
 namespace alternator {
-
-static constexpr auto TARGET = "X-Amz-Target";
 
 inline std::vector<std::string_view> split(std::string_view text, char separator) {
     std::vector<std::string_view> tokens;
@@ -117,7 +122,7 @@ public:
                  }
                  return make_ready_future<std::unique_ptr<reply>>(std::move(rep));
              }
-             auto res = resf.get0();
+             auto res = resf.get();
              std::visit(overloaded_functor {
                  [&] (const json::json_return_type& json_return_value) {
                      slogger.trace("api_handler success case");
@@ -207,11 +212,36 @@ protected:
         // using _gossiper().get_live_members(). But getting
         // just the list of live nodes in this DC needs more elaborate code:
         auto& topology = _proxy.get_token_metadata_ptr()->get_topology();
-        sstring local_dc = topology.get_datacenter();
-        std::unordered_set<gms::inet_address> local_dc_nodes = topology.get_datacenter_endpoints().at(local_dc);
-        for (auto& ip : local_dc_nodes) {
-            if (_gossiper.is_alive(ip)) {
-                rjson::push_back(results, rjson::from_string(ip.to_sstring()));
+        // /localnodes lists nodes in a single DC. By default the DC of this
+        // server is used, but it can be overridden by a "dc" query option.
+        // If the DC does not exist, we return an empty list - not an error.
+        sstring query_dc = req->get_query_param("dc");
+        sstring local_dc = query_dc.empty() ? topology.get_datacenter() : query_dc;
+        std::unordered_set<locator::host_id> local_dc_nodes;
+        const auto& endpoints = topology.get_datacenter_endpoints();
+        auto dc_it = endpoints.find(local_dc);
+        if (dc_it != endpoints.end()) {
+            local_dc_nodes = dc_it->second;
+        }
+        // By default, /localnodes lists the nodes of all racks in the given
+        // DC, unless a single rack is selected by the "rack" query option.
+        // If the rack does not exist, we return an empty list - not an error.
+        sstring query_rack = req->get_query_param("rack");
+        for (auto& id : local_dc_nodes) {
+            auto ip = _gossiper.get_address_map().get(id);
+            if (!query_rack.empty()) {
+                auto rack = _gossiper.get_application_state_value(ip, gms::application_state::RACK);
+                if (rack != query_rack) {
+                    continue;
+                }
+            }
+            // Note that it's not enough for the node to be is_alive() - a
+            // node joining the cluster is also "alive" but not responsive to
+            // requests. We alive *and* normal. See #19694, #21538.
+            if (_gossiper.is_alive(ip) && _gossiper.is_normal(ip)) {
+                // Use the gossiped broadcast_rpc_address if available instead
+                // of the internal IP address "ip". See discussion in #18711.
+                rjson::push_back(results, rjson::from_string(_gossiper.get_rpc_address(ip)));
             }
         }
         rep->set_status(reply::status_type::ok);
@@ -254,7 +284,7 @@ future<std::string> server::verify_signature(const request& req, const chunked_c
     std::string_view authorization_header = authorization_it->second;
     auto pos = authorization_header.find_first_of(' ');
     if (pos == std::string_view::npos || authorization_header.substr(0, pos) != "AWS4-HMAC-SHA256") {
-        throw api_error::invalid_signature(format("Authorization header must use AWS4-HMAC-SHA256 algorithm: {}", authorization_header));
+        throw api_error::invalid_signature(fmt::format("Authorization header must use AWS4-HMAC-SHA256 algorithm: {}", authorization_header));
     }
     authorization_header.remove_prefix(pos+1);
     std::string credential;
@@ -289,7 +319,7 @@ future<std::string> server::verify_signature(const request& req, const chunked_c
 
     std::vector<std::string_view> credential_split = split(credential, '/');
     if (credential_split.size() != 5) {
-        throw api_error::validation(format("Incorrect credential information format: {}", credential));
+        throw api_error::validation(fmt::format("Incorrect credential information format: {}", credential));
     }
     std::string user(credential_split[0]);
     std::string datestamp(credential_split[1]);
@@ -310,8 +340,8 @@ future<std::string> server::verify_signature(const request& req, const chunked_c
         }
     }
 
-    auto cache_getter = [&proxy = _proxy] (std::string username) {
-        return get_key_from_roles(proxy, std::move(username));
+    auto cache_getter = [&proxy = _proxy, &as = _auth_service] (std::string username) {
+        return get_key_from_roles(proxy, as, std::move(username));
     };
     return _key_cache.get_ptr(user, cache_getter).then([this, &req, &content,
                                                     user = std::move(user),
@@ -366,7 +396,7 @@ static std::string_view truncated_content_view(const chunked_content& content, s
     }
 }
 
-static tracing::trace_state_ptr maybe_trace_query(service::client_state& client_state, std::string_view username, sstring_view op, const chunked_content& query) {
+static tracing::trace_state_ptr maybe_trace_query(service::client_state& client_state, std::string_view username, std::string_view op, const chunked_content& query) {
     tracing::trace_state_ptr trace_state;
     tracing::tracing& tracing_instance = tracing::tracing::get_local_tracing_instance();
     if (tracing_instance.trace_next_query() || tracing_instance.slow_query_tracing_enabled()) {
@@ -374,7 +404,7 @@ static tracing::trace_state_ptr maybe_trace_query(service::client_state& client_
         std::string buf;
         tracing::add_session_param(trace_state, "alternator_op", op);
         tracing::add_query(trace_state, truncated_content_view(query, buf));
-        tracing::begin(trace_state, format("Alternator {}", op), client_state.get_client_address());
+        tracing::begin(trace_state, seastar::format("Alternator {}", op), client_state.get_client_address());
         if (!username.empty()) {
             tracing::set_username(trace_state, auth::authenticated_user(username));
         }
@@ -384,10 +414,10 @@ static tracing::trace_state_ptr maybe_trace_query(service::client_state& client_
 
 future<executor::request_return_type> server::handle_api_request(std::unique_ptr<request> req) {
     _executor._stats.total_operations++;
-    sstring target = req->get_header(TARGET);
-    std::vector<std::string_view> split_target = split(target, '.');
-    //NOTICE(sarna): Target consists of Dynamo API version followed by a dot '.' and operation type (e.g. CreateTable)
-    std::string op = split_target.empty() ? std::string() : std::string(split_target.back());
+    sstring target = req->get_header("X-Amz-Target");
+    // target is DynamoDB API version followed by a dot '.' and operation type (e.g. CreateTable)
+    auto dot = target.find('.');
+    std::string_view op = (dot == sstring::npos) ? std::string_view() : std::string_view(target).substr(dot+1);
     // JSON parsing can allocate up to roughly 2x the size of the raw
     // document, + a couple of bytes for maintenance.
     // TODO: consider the case where req->content_length is missing. Maybe
@@ -399,7 +429,7 @@ future<executor::request_return_type> server::handle_api_request(std::unique_ptr
         ++_executor._stats.requests_blocked_memory;
     }
     auto units = co_await std::move(units_fut);
-    assert(req->content_stream);
+    SCYLLA_ASSERT(req->content_stream);
     chunked_content content = co_await util::read_entire_stream(*req->content_stream);
     auto username = co_await verify_signature(*req, content);
 
@@ -410,7 +440,7 @@ future<executor::request_return_type> server::handle_api_request(std::unique_ptr
     auto callback_it = _callbacks.find(op);
     if (callback_it == _callbacks.end()) {
         _executor._stats.unsupported_operations++;
-        co_return api_error::unknown_operation(format("Unsupported operation {}", op));
+        co_return api_error::unknown_operation(fmt::format("Unsupported operation {}", op));
     }
     if (_pending_requests.get_count() >= _max_concurrent_requests) {
         _executor._stats.requests_shed++;
@@ -418,18 +448,25 @@ future<executor::request_return_type> server::handle_api_request(std::unique_ptr
     }
     _pending_requests.enter();
     auto leave = defer([this] () noexcept { _pending_requests.leave(); });
-    //FIXME: Client state can provide more context, e.g. client's endpoint address
-    // We use unique_ptr because client_state cannot be moved or copied
-    executor::client_state client_state = username.empty()
-        ? service::client_state{service::client_state::internal_tag()}
-        : service::client_state{service::client_state::internal_tag(), _auth_service, _sl_controller, username};
+    executor::client_state client_state(service::client_state::external_tag(),
+        _auth_service, &_sl_controller, _timeout_config.current_values(), req->get_client_address());
+    if (!username.empty()) {
+        client_state.set_login(auth::authenticated_user(username));
+    }
     co_await client_state.maybe_update_per_service_level_params();
 
     tracing::trace_state_ptr trace_state = maybe_trace_query(client_state, username, op, content);
     tracing::trace(trace_state, "{}", op);
-    rjson::value json_request = co_await _json_parser.parse(std::move(content));
-    co_return co_await callback_it->second(_executor, client_state, trace_state,
-            make_service_permit(std::move(units)), std::move(json_request), std::move(req));
+
+    auto user = client_state.user();
+    auto f = [this, content = std::move(content), &callback = callback_it->second,
+            client_state = std::move(client_state), trace_state = std::move(trace_state),
+            units = std::move(units), req = std::move(req)] () mutable -> future<executor::request_return_type> {
+                rjson::value json_request = co_await _json_parser.parse(std::move(content));
+                co_return co_await callback(_executor, client_state, trace_state,
+                    make_service_permit(std::move(units)), std::move(json_request), std::move(req));
+    };
+    co_return co_await _sl_controller.with_user_service_level(user, std::ref(f));
 }
 
 void server::set_routes(routes& r) {
@@ -469,6 +506,7 @@ server::server(executor& exec, service::storage_proxy& proxy, gms::gossiper& gos
         , _enforce_authorization(false)
         , _enabled_servers{}
         , _pending_requests{}
+        , _timeout_config(_proxy.data_dictionary().get_config())
       , _callbacks{
         {"CreateTable", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req) {
             return e.create_table(client_state, std::move(trace_state), std::move(permit), std::move(json_request));
@@ -546,9 +584,9 @@ server::server(executor& exec, service::storage_proxy& proxy, gms::gossiper& gos
 }
 
 future<> server::init(net::inet_address addr, std::optional<uint16_t> port, std::optional<uint16_t> https_port, std::optional<tls::credentials_builder> creds,
-        bool enforce_authorization, semaphore* memory_limiter, utils::updateable_value<uint32_t> max_concurrent_requests) {
+        utils::updateable_value<bool> enforce_authorization, semaphore* memory_limiter, utils::updateable_value<uint32_t> max_concurrent_requests) {
     _memory_limiter = memory_limiter;
-    _enforce_authorization = enforce_authorization;
+    _enforce_authorization = std::move(enforce_authorization);
     _max_concurrent_requests = std::move(max_concurrent_requests);
     if (!port && !https_port) {
         return make_exception_future<>(std::runtime_error("Either regular port or TLS port"
@@ -568,14 +606,24 @@ future<> server::init(net::inet_address addr, std::optional<uint16_t> port, std:
             set_routes(_https_server._routes);
             _https_server.set_content_length_limit(server::content_length_limit);
             _https_server.set_content_streaming(true);
-            auto server_creds = creds->build_reloadable_server_credentials([](const std::unordered_set<sstring>& files, std::exception_ptr ep) {
-                if (ep) {
-                    slogger.warn("Exception loading {}: {}", files, ep);
-                } else {
-                    slogger.info("Reloaded {}", files);
-                }
-            }).get0();
-            _https_server.listen(socket_address{addr, *https_port}, std::move(server_creds)).get();
+
+            if (this_shard_id() == 0) {
+                _credentials = creds->build_reloadable_server_credentials([this](const tls::credentials_builder& b, const std::unordered_set<sstring>& files, std::exception_ptr ep) -> future<> {
+                    if (ep) {
+                        slogger.warn("Exception loading {}: {}", files, ep);
+                    } else {
+                        co_await container().invoke_on_others([&b](server& s) {
+                            if (s._credentials) {
+                                b.rebuild(*s._credentials);
+                            }
+                        });
+                        slogger.info("Reloaded {}", files);
+                    }
+                }).get();
+            } else {
+                _credentials = creds->build_server_credentials();
+            }
+            _https_server.listen(socket_address{addr, *https_port}, _credentials).get();
             _enabled_servers.push_back(std::ref(_https_server));
         }
     });
@@ -633,7 +681,7 @@ future<> server::json_parser::stop() {
 
 const char* api_error::what() const noexcept {
     if (_what_string.empty()) {
-        _what_string = format("{} {}: {}", static_cast<int>(_http_code), _type, _msg);
+        _what_string = fmt::format("{} {}: {}", std::to_underlying(_http_code), _type, _msg);
     }
     return _what_string.c_str();
 }

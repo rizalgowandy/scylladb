@@ -3,11 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "bytes.hh"
-#include <seastar/core/print.hh>
+#include <fmt/ostream.h>
+#include <seastar/core/format.hh>
 
 static inline int8_t hex_to_int(unsigned char c) {
     switch (c) {
@@ -32,7 +33,7 @@ static inline int8_t hex_to_int(unsigned char c) {
     }
 }
 
-bytes from_hex(sstring_view s) {
+bytes from_hex(std::string_view s) {
     if (s.length() % 2 == 1) {
         throw std::invalid_argument("An hex string representing bytes must have an even length");
     }
@@ -42,7 +43,7 @@ bytes from_hex(sstring_view s) {
         auto half_byte1 = hex_to_int(s[i * 2]);
         auto half_byte2 = hex_to_int(s[i * 2 + 1]);
         if (half_byte1 == -1 || half_byte2 == -1) {
-            throw std::invalid_argument(format("Non-hex characters in {}", s));
+            throw std::invalid_argument(fmt::format("Non-hex characters in {}", s));
         }
         out[i] = (half_byte1 << 4) | half_byte2;
     }
@@ -61,19 +62,6 @@ sstring to_hex(const bytes_opt& b) {
     return !b ? "null" : to_hex(*b);
 }
 
-std::ostream& operator<<(std::ostream& os, const bytes& b) {
-    fmt::print(os, "{}", b);
-    return os;
-}
-
-std::ostream& operator<<(std::ostream& os, const bytes_opt& b) {
-    if (b) {
-        fmt::print(os, "{}", *b);
-        return os;
-    }
-    return os << "null";
-}
-
 namespace std {
 
 std::ostream& operator<<(std::ostream& os, const bytes_view& b) {
@@ -81,9 +69,4 @@ std::ostream& operator<<(std::ostream& os, const bytes_view& b) {
     return os;
 }
 
-}
-
-std::ostream& operator<<(std::ostream& os, const fmt_hex& b) {
-    fmt::print(os, "{}", b);
-    return os;
 }

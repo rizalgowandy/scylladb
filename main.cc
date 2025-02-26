@@ -3,17 +3,26 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <algorithm>
 #include <functional>
 #include <yaml-cpp/yaml.h>
+#include <fmt/ranges.h>
 
 #include <seastar/util/closeable.hh>
 #include <seastar/core/abort_source.hh>
 #include "gms/inet_address.hh"
+#include "auth/allow_all_authenticator.hh"
+#include "auth/allow_all_authorizer.hh"
+#include "auth/maintenance_socket_role_manager.hh"
+#include <seastar/core/future.hh>
+#include <seastar/core/signal.hh>
+#include <seastar/core/timer.hh>
+#include "service/qos/raft_service_level_distributed_data_accessor.hh"
 #include "tasks/task_manager.hh"
+#include "utils/assert.hh"
 #include "utils/build_id.hh"
 #include "supervisor.hh"
 #include "replica/database.hh"
@@ -40,9 +49,10 @@
 #include "db/hints/manager.hh"
 #include "db/commitlog/commitlog_replayer.hh"
 #include "db/view/view_builder.hh"
+#include "utils/class_registrator.hh"
 #include "utils/error_injection.hh"
 #include "utils/runtime.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "utils/directories.hh"
 #include "debug.hh"
 #include "auth/common.hh"
@@ -52,10 +62,12 @@
 #include "repair/row_level.hh"
 #include <cstdio>
 #include <seastar/core/file.hh>
+#include <unistd.h>
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/prctl.h>
 #include "tracing/tracing.hh"
+#include "audit/audit.hh"
 #include <seastar/core/prometheus.hh>
 #include "message/messaging_service.hh"
 #include "db/sstables-format-selector.hh"
@@ -64,6 +76,7 @@
 #include <seastar/net/dns.hh>
 #include <seastar/core/io_queue.hh>
 #include <seastar/core/abort_on_ebadf.hh>
+#include <csignal>
 
 #include "db/view/view_update_generator.hh"
 #include "service/cache_hitrate_calculator.hh"
@@ -74,7 +87,6 @@
 #include "sstables_loader.hh"
 #include "cql3/cql_config.hh"
 #include "transport/controller.hh"
-#include "thrift/controller.hh"
 #include "service/memory_limiter.hh"
 #include "service/endpoint_lifecycle_subscriber.hh"
 #include "db/schema_tables.hh"
@@ -88,23 +100,31 @@
 #include "db/paxos_grace_seconds_extension.hh"
 #include "service/qos/standard_service_level_distributed_data_accessor.hh"
 #include "service/storage_proxy.hh"
-#include "service/forward_service.hh"
+#include "service/mapreduce_service.hh"
 #include "alternator/controller.hh"
 #include "alternator/ttl.hh"
 #include "tools/entry_point.hh"
 #include "test/perf/entry_point.hh"
 #include "db/per_partition_rate_limit_extension.hh"
-#include "lang/wasm_instance_cache.hh"
-#include "lang/wasm_alien_thread_runner.hh"
+#include "lang/manager.hh"
 #include "sstables/sstables_manager.hh"
 #include "db/virtual_tables.hh"
 
-#include "service/raft/raft_address_map.hh"
 #include "service/raft/raft_group_registry.hh"
 #include "service/raft/raft_group0_client.hh"
 #include "service/raft/raft_group0.hh"
+#include "gms/gossip_address_map.hh"
+#include "utils/alien_worker.hh"
+#include "utils/advanced_rpc_compressor.hh"
+#include "utils/shared_dict.hh"
+#include "message/dictionary_service.hh"
+#include "utils/disk_space_monitor.hh"
 
-#include <boost/algorithm/string/join.hpp>
+
+#define P11_KIT_FUTURE_UNSTABLE_API
+extern "C" {
+#include <p11-kit/p11-kit.h>
+}
 
 namespace fs = std::filesystem;
 
@@ -113,6 +133,8 @@ seastar::metrics::metric_groups app_metrics;
 using namespace std::chrono_literals;
 
 namespace bpo = boost::program_options;
+
+logging::logger diaglog("diagnostics");
 
 // Must live in a seastar::thread
 class stop_signal {
@@ -134,13 +156,13 @@ private:
 public:
     stop_signal() {
         _abort_sources.start().get();
-        engine().handle_signal(SIGINT, [this] { signaled(); });
-        engine().handle_signal(SIGTERM, [this] { signaled(); });
+        handle_signal(SIGINT, [this] { signaled(); });
+        handle_signal(SIGTERM, [this] { signaled(); });
     }
     ~stop_signal() {
         // There's no way to unregister a handler yet, so register a no-op handler instead.
-        engine().handle_signal(SIGINT, [] {});
-        engine().handle_signal(SIGTERM, [] {});
+        handle_signal(SIGINT, [] {});
+        handle_signal(SIGTERM, [] {});
         _broadcasts_to_abort_sources_done.get();
         _abort_sources.stop().get();
     }
@@ -166,17 +188,12 @@ struct convert<::object_storage_endpoint_param> {
         ep.endpoint = node["name"].as<std::string>();
         ep.config.port = node["port"].as<unsigned>();
         ep.config.use_https = node["https"].as<bool>(false);
-        if (node["aws_region"]) {
-            ep.config.aws.emplace();
-            ep.config.aws->region = node["aws_region"].as<std::string>();
-            ep.config.aws->access_key_id = node["aws_access_key_id"].as<std::string>();
-            ep.config.aws->secret_access_key = node["aws_secret_access_key"].as<std::string>();
-            ep.config.aws->session_token = node["aws_session_token"].as<std::string>("");
-        }
+        ep.config.region = node["aws_region"] ? node["aws_region"].as<std::string>() : std::getenv("AWS_DEFAULT_REGION");
+        ep.config.role_arn = node["iam_role_arn"] ? node["iam_role_arn"].as<std::string>() : "";
         return true;
     }
 };
-}
+} // namespace YAML
 
 static future<> read_object_storage_config(db::config& db_cfg) {
     sstring cfg_name;
@@ -230,21 +247,22 @@ read_config(bpo::variables_map& opts, db::config& cfg) {
     } else {
         file = db::config::get_conf_sub("scylla.yaml").string();
     }
-    return check_direct_io_support(file).then([file, &cfg] {
-        return cfg.read_from_file(file, [](auto & opt, auto & msg, auto status) {
+    try {
+        co_await check_direct_io_support(file);
+        co_await cfg.read_from_file(file, [](auto & opt, auto & msg, auto status) {
             auto level = log_level::warn;
             if (auto value = status.value_or(db::config::value_status::Invalid);
                 value != db::config::value_status::Invalid && value != db::config::value_status::Deprecated) {
                 level = log_level::error;
             }
             startlog.log(level, "{} : {}", msg, opt);
-        }).then([&cfg] {
-            return read_object_storage_config(cfg);
         });
-    }).handle_exception([file](auto ep) {
+        co_await read_object_storage_config(cfg);
+    } catch (...) {
+        auto ep = std::current_exception();
         startlog.error("Could not read configuration file {}: {}", file, ep);
-        return make_exception_future<>(ep);
-    });
+        std::rethrow_exception(ep);
+    }
 }
 
 #ifdef SCYLLA_ENABLE_ERROR_INJECTION
@@ -253,7 +271,7 @@ enable_initial_error_injections(const db::config& cfg) {
     return smp::invoke_on_all([&cfg] {
         auto& injector = utils::get_local_injector();
         for (const auto& inj : cfg.error_injections_at_startup()) {
-            injector.enable(inj.name, inj.one_shot);
+            injector.enable(inj.name, inj.one_shot, inj.parameters);
         }
     });
 }
@@ -272,7 +290,7 @@ public:
     // Installs the signal handler. Must call stop() (and wait for it) before destruction.
     sighup_handler(bpo::variables_map& opts, db::config& cfg) : _opts(opts), _cfg(cfg) {
         startlog.info("installing SIGHUP handler");
-        engine().handle_signal(SIGHUP, [this] { reread_config(); });
+        handle_signal(SIGHUP, [this] { reread_config(); });
     }
 private:
     void reread_config() {
@@ -313,11 +331,63 @@ public:
     // to complete. After this is waited for, the object can be destroyed.
     future<> stop() {
         // No way to unregister yet
-        engine().handle_signal(SIGHUP, [] {});
+        handle_signal(SIGHUP, [] {});
         _pending = false;
         _stopping = true;
         _cond.broadcast();
         return std::move(_done);
+    }
+};
+
+class sigquit_handler {
+    bool _stopping = false;
+    bool _pending = false;
+    condition_variable _cond;
+    future<> _done;
+
+    sharded<replica::database>& _db;
+
+    future<> execution_loop() {
+        while (!_stopping) {
+            co_await _cond.wait([this] { return _pending || _stopping; });
+
+            if (_stopping) {
+                break;
+            }
+            _pending = false;
+
+            try {
+                co_await _db.invoke_on_all([] (replica::database& db) -> future<> {
+                    diaglog.info("Diagnostics dump requested via SIGQUIT:\n{}", memory::generate_memory_diagnostics_report());
+
+                    co_await db.foreach_reader_concurrency_semaphore([] (reader_concurrency_semaphore& semaphore) {
+                        diaglog.info("Diagnostics dump requested via SIGQUIT:\n{}", semaphore.dump_diagnostics());
+                        return make_ready_future<>();
+                    });
+                });
+            } catch (...) {
+                diaglog.error("Failed to dump diagnostics: {}", std::current_exception());
+            }
+        }
+    }
+
+public:
+    explicit sigquit_handler(sharded<replica::database>& db)
+        : _done(execution_loop())
+        , _db(db)
+    {
+        handle_signal(SIGQUIT, [this] {
+            _pending = true;
+            _cond.broadcast();
+        });
+    }
+
+    ~sigquit_handler() {
+        handle_signal(SIGQUIT, [] {});
+        _pending = false;
+        _stopping = true;
+        _cond.broadcast();
+        _done.get();
     }
 };
 
@@ -404,9 +474,9 @@ verify_seastar_io_scheduler(const boost::program_options::variables_map& opts, b
 
         sstring devmode_msg = msg + "To ignore this, see the developer-mode configuration option.";
         if (developer_mode) {
-            startlog.warn(msg.c_str());
+            startlog.warn("{}", msg.c_str());
         } else {
-            startlog.error(devmode_msg.c_str());
+            startlog.error("{}", devmode_msg.c_str());
             throw std::runtime_error("Bad I/O Scheduler configuration");
         }
     };
@@ -444,13 +514,14 @@ public:
 // "[key1: value1_1 value1_2 ..., key2: value2_1 value 2_2 ..., (positional) value3, ...]"
 std::string format_parsed_options(const std::vector<bpo::option>& opts) {
     return fmt::format("[{}]",
-        boost::algorithm::join(opts | boost::adaptors::transformed([] (const bpo::option& opt) {
+        fmt::join(opts | std::views::transform([] (const bpo::option& opt) {
             if (opt.value.empty()) {
                 return opt.string_key;
             }
 
-            return (opt.string_key.empty() ?  "(positional) " : fmt::format("{}: ", opt.string_key)) +
-                        boost::algorithm::join(opt.value, " ");
+            return fmt::format("{}{}",
+                opt.string_key.empty() ?  "(positional) " : fmt::format("{}: ", opt.string_key),
+                fmt::join(opt.value, " "));
         }), ", ")
     );
 }
@@ -466,6 +537,7 @@ void print_starting_message(int ac, char** av, const bpo::parsed_options& opts) 
         }
         fmt::print("\"\n");
     }
+    fmt::print("pid: {}\n", getpid());
 
     fmt::print("parsed command line options: {}\n", format_parsed_options(opts.options));
 }
@@ -505,7 +577,7 @@ static auto defer_verbose_shutdown(const char* what, Func&& func) {
 
                 // Call _exit() rather than exit() to exit immediately
                 // without calling exit handlers, avoiding
-                // boost::intrusive::detail::destructor_impl assert failure
+                // boost::intrusive::detail::destructor_impl SCYLLA_ASSERT failure
                 // from ~segment_pool exit handler.
                 _exit(255);
             }
@@ -529,6 +601,11 @@ sharded<locator::snitch_ptr> *the_snitch;
 sharded<service::storage_proxy> *the_storage_proxy;
 }
 
+// This is used by perf-alternator to allow running scylla together with the tool
+// in a single process. So that it's easier to measure internals. It's not added
+// to main_func_type to not complicate common flow as no other tool needs such logic.
+std::function<void(lw_shared_ptr<db::config>)> after_init_func;
+
 static locator::host_id initialize_local_info_thread(sharded<db::system_keyspace>& sys_ks,
         sharded<locator::snitch_ptr>& snitch,
         const gms::inet_address& listen_address,
@@ -536,7 +613,7 @@ static locator::host_id initialize_local_info_thread(sharded<db::system_keyspace
         gms::inet_address broadcast_address,
         gms::inet_address broadcast_rpc_address)
 {
-    auto linfo = sys_ks.local().load_local_info().get0();
+    auto linfo = sys_ks.local().load_local_info().get();
     if (linfo.cluster_name.empty()) {
         linfo.cluster_name = cfg.cluster_name();
     } else if (linfo.cluster_name != cfg.cluster_name()) {
@@ -548,8 +625,19 @@ static locator::host_id initialize_local_info_thread(sharded<db::system_keyspace
     }
 
     linfo.listen_address = listen_address;
+    const auto host_id = linfo.host_id;
     sys_ks.local().save_local_info(std::move(linfo), snitch.local()->get_location(), broadcast_address, broadcast_rpc_address).get();
-    return linfo.host_id;
+    return host_id;
+}
+
+extern "C" void __attribute__((weak)) __llvm_profile_dump();
+
+[[gnu::noinline]]
+void dump_performance_profiles() {
+    if (__llvm_profile_dump) {
+        startlog.info("Calling __llvm_profile_dump()");
+        __llvm_profile_dump();
+    }
 }
 
 static int scylla_main(int ac, char** av) {
@@ -565,7 +653,7 @@ static int scylla_main(int ac, char** av) {
   try {
     runtime::init_uptime();
     std::setvbuf(stdout, nullptr, _IOLBF, 1000);
-    app_template::config app_cfg;
+    app_template::seastar_options app_cfg;
     app_cfg.name = "Scylla";
     app_cfg.description =
 R"(scylla - NoSQL data store using the seastar framework
@@ -580,17 +668,38 @@ For more information about individual tools, run: scylla {tool_name} --help
 
 To start the scylla server proper, simply invoke as: scylla server (or just scylla).
 )";
-    app_cfg.default_task_quota = 500us;
 #ifdef DEBUG
     // Increase the task quota to improve work:poll ratio in slow debug mode.
-    app_cfg.default_task_quota = 5ms;
+    app_cfg.reactor_opts.task_quota_ms.set_default_value(5);
+#else
+    app_cfg.reactor_opts.task_quota_ms.set_default_value(0.5);
 #endif
     app_cfg.auto_handle_sigint_sigterm = false;
-    app_cfg.max_networking_aio_io_control_blocks = 50000;
+    app_cfg.reactor_opts.max_networking_io_control_blocks.set_default_value(50000);
+    {
+        const auto candidates = app_cfg.reactor_opts.reactor_backend.get_candidate_names();
+
+        // We don't want ScyllaDB to run with the io_uring backend.
+        // So select the default reactor backend explicitly here.
+        if (std::ranges::contains(candidates, "linux-aio")) {
+            app_cfg.reactor_opts.reactor_backend.select_default_candidate("linux-aio");
+        } else {
+            app_cfg.reactor_opts.reactor_backend.select_default_candidate("epoll");
+        }
+
+        // Leave some reserve IOCBs for scylla-nodetool and other native tool apps.
+        if (std::ranges::contains(candidates, "io_uring")) {
+            app_cfg.reactor_opts.reserve_io_control_blocks.set_default_value(10);
+        } else {
+            startlog.warn("Need to leave extra IOCBs in reserve for tools because the io_uring reactor backend is not available."
+                    " Tools will fall-back to the epoll reactor backend, which requires more IOCBs to function.");
+            app_cfg.reactor_opts.reserve_io_control_blocks.set_default_value(1024);
+        }
+    }
     // We need to have the entire app config to run the app, but we need to
     // run the app to read the config file with UDF specific options so that
     // we know whether we need to reserve additional memory for UDFs.
-    app_cfg.reserve_additional_memory_per_shard = db::config::wasm_udf_reserved_memory;
+    app_cfg.smp_opts.reserve_additional_memory_per_shard = db::config::wasm_udf_reserved_memory;
     app_template app(std::move(app_cfg));
 
     auto ext = std::make_shared<db::extensions>();
@@ -609,7 +718,8 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
     init("list-tools", bpo::bool_switch(), "list included tools and exit");
 
     bpo::options_description deprecated_options("Deprecated options - ignored");
-    cfg->add_deprecated_options(deprecated_options.add_options());
+    auto deprecated_options_easy_init = deprecated_options.add_options();
+    cfg->add_deprecated_options(deprecated_options_easy_init);
     app.get_options_description().add(deprecated_options);
 
     // TODO : default, always read?
@@ -620,13 +730,24 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
 
     // If --version is requested, print it out and exit immediately to avoid
     // Seastar-specific warnings that may occur when running the app
-    auto parsed_opts = bpo::command_line_parser(ac, av).options(app.get_options_description()).allow_unregistered().run();
-    print_starting_message(ac, av, parsed_opts);
+    if (!isatty(fileno(stdin))) {
+        auto parsed_opts = bpo::command_line_parser(ac, av).options(app.get_options_description()).allow_unregistered().run();
+        print_starting_message(ac, av, parsed_opts);
+    }
+
+    // We have to override p11-kit config path before p11-kit initialization.
+    // And the initialization will invoke on seastar initialization, so it has to
+    // be before app.run()
+    auto scylla_path = fs::read_symlink(fs::path("/proc/self/exe"));
+    auto p11_modules = scylla_path.parent_path().parent_path().append("share/p11-kit/modules");
+    auto p11_modules_str = p11_modules.string<char>();
+    ::p11_kit_override_system_files(NULL, NULL, p11_modules_str.c_str(), NULL, NULL);
 
     sharded<locator::shared_token_metadata> token_metadata;
     sharded<locator::effective_replication_map_factory> erm_factory;
     sharded<service::migration_notifier> mm_notifier;
     sharded<service::endpoint_lifecycle_notifier> lifecycle_notifier;
+    std::optional<utils::disk_space_monitor> disk_space_monitor_shard0;
     sharded<compaction_manager> cm;
     sharded<sstables::storage_manager> sstm;
     distributed<replica::database> db;
@@ -636,7 +757,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
     sharded<service::storage_service> ss;
     sharded<service::migration_manager> mm;
     sharded<tasks::task_manager> task_manager;
-    api::http_context ctx(db, load_meter);
+    api::http_context ctx(db);
     httpd::http_server_control prometheus_server;
     std::optional<utils::directories> dirs = {};
     sharded<gms::feature_service> feature_service;
@@ -650,9 +771,19 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
     sharded<repair_service> repair;
     sharded<sstables_loader> sst_loader;
     sharded<streaming::stream_manager> stream_manager;
-    sharded<service::forward_service> forward_service;
+    sharded<service::mapreduce_service> mapreduce_service;
     sharded<gms::gossiper> gossiper;
     sharded<locator::snitch_ptr> snitch;
+
+    // This worker wasn't designed to be used from multiple threads.
+    // If you are attempting to do that, make sure you know what you are doing.
+    // (It uses a std::mutex-based queue under the hood, so it may cause
+    // performance problems under contention).
+    //
+    // Note: we are creating this thread before app.run so that it doesn't
+    // inherit Seastar's CPU affinity masks. We want this thread to be free
+    // to migrate between CPUs; we think that's what makes the most sense.
+    auto rpc_dict_training_worker = utils::alien_worker(startlog, 19);
 
     return app.run(ac, av, [&] () -> future<int> {
 
@@ -679,10 +810,10 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
         tcp_syncookies_sanity();
         tcp_timestamps_sanity();
 
-        return seastar::async([&app, cfg, ext, &cm, &sstm, &db, &qp, &bm, &proxy, &forward_service, &mm, &mm_notifier, &ctx, &opts, &dirs,
+        return seastar::async([&app, cfg, ext, &disk_space_monitor_shard0, &cm, &sstm, &db, &qp, &bm, &proxy, &mapreduce_service, &mm, &mm_notifier, &ctx, &opts, &dirs,
                 &prometheus_server, &cf_cache_hitrate_calculator, &load_meter, &feature_service, &gossiper, &snitch,
                 &token_metadata, &erm_factory, &snapshot_ctl, &messaging, &sst_dir_semaphore, &raft_gr, &service_memory_limiter,
-                &repair, &sst_loader, &ss, &lifecycle_notifier, &stream_manager, &task_manager] {
+                &repair, &sst_loader, &ss, &lifecycle_notifier, &stream_manager, &task_manager, &rpc_dict_training_worker] {
           try {
               if (opts.contains("relabel-config-file") && !opts["relabel-config-file"].as<sstring>().empty()) {
                   // calling update_relabel_config_from_file can cause an exception that would stop startup
@@ -702,7 +833,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
 #endif
             auto notify_set = configurable::init_all(opts, *cfg, *ext, service_set(
                 db, ss, mm, proxy, feature_service, messaging, qp, bm
-            )).get0();
+            )).get();
 
             auto stop_configurables = defer_verbose_shutdown("configurables", [&] {
                 notify_set.notify_all(configurable::system_state::stopped).get();
@@ -757,11 +888,15 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                     throw bad_configuration_error();
                 }
             }
-            const bool raft_topology_change_enabled = cfg->consistent_cluster_management() &&
-                cfg->check_experimental(db::experimental_features_t::feature::CONSISTENT_TOPOLOGY_CHANGES);
+
+            auto unused_features = cfg->experimental_features() | std::views::filter([] (auto& f) {
+                return f == db::experimental_features_t::feature::UNUSED;
+            });
+            if (!unused_features.empty()) {
+                startlog.warn("Ignoring unused features found in config: {}", unused_features);
+            }
 
             gms::feature_config fcfg = gms::feature_config_from_db_config(*cfg);
-            fcfg.use_raft_cluster_features = raft_topology_change_enabled;
 
             debug::the_feature_service = &feature_service;
             feature_service.start(fcfg).get();
@@ -776,7 +911,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             schema::set_default_partitioner(cfg->partitioner(), cfg->murmur3_partitioner_ignore_msb_bits());
             auto make_sched_group = [&] (sstring name, sstring short_name, unsigned shares) {
                 if (cfg->cpu_scheduler()) {
-                    return seastar::create_scheduling_group(name, short_name, shares).get0();
+                    return seastar::create_scheduling_group(name, short_name, shares).get();
                 } else {
                     return seastar::scheduling_group();
                 }
@@ -810,11 +945,19 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 throw bad_configuration_error();
             }
 
+            // We want to ensure a node is zero-token if and only if join_ring=false, so all the logic can rely on it.
+            if (cfg->join_ring() && cfg->num_tokens() == 0 && cfg->initial_token().empty()) {
+                startlog.error(
+                        "Bad configuration: cannot join the ring with zero tokens. If you do not want the node "
+                        "to join the ring, use join-ring=false");
+                throw bad_configuration_error();
+            }
+
             auto preferred = cfg->listen_interface_prefer_ipv6() ? std::make_optional(net::inet_address::family::INET6) : std::nullopt;
             auto family = cfg->enable_ipv6_dns_lookup() || preferred ? std::nullopt : std::make_optional(net::inet_address::family::INET);
 
-            auto broadcast_addr = utils::resolve(cfg->broadcast_address || cfg->listen_address, family, preferred).get0();
-            auto broadcast_rpc_addr = utils::resolve(cfg->broadcast_rpc_address || cfg->rpc_address, family, preferred).get0();
+            auto broadcast_addr = utils::resolve(cfg->broadcast_address || cfg->listen_address, family, preferred).get();
+            auto broadcast_rpc_addr = utils::resolve(cfg->broadcast_rpc_address || cfg->rpc_address, family, preferred).get();
 
             ctx.api_dir = cfg->api_ui_dir();
             if (!ctx.api_dir.empty() && ctx.api_dir.back() != '/') {
@@ -828,7 +971,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             }
             const auto hinted_handoff_enabled = cfg->hinted_handoff_enabled();
 
-            auto api_addr = utils::resolve(cfg->api_address || cfg->rpc_address, family, preferred).get0();
+            auto api_addr = utils::resolve(cfg->api_address || cfg->rpc_address, family, preferred).get();
             supervisor::notify("starting API server");
             ctx.http_server.start("API").get();
             auto stop_http_server = defer_verbose_shutdown("API server", [&ctx] {
@@ -844,11 +987,12 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                     prometheus_server.stop().get();
                 });
 
-                auto ip = utils::resolve(cfg->prometheus_address || cfg->listen_address, family, preferred).get0();
+                auto ip = utils::resolve(cfg->prometheus_address || cfg->listen_address, family, preferred).get();
 
                 prometheus::config pctx;
                 pctx.metric_help = "Scylla server statistics";
                 pctx.prefix = cfg->prometheus_prefix();
+                pctx.allow_protobuf = cfg->prometheus_allow_protobuf();
                 prometheus::start(prometheus_server, pctx).get();
                 with_scheduling_group(maintenance_scheduling_group, [&] {
                   return prometheus_server.listen(socket_address{ip, cfg->prometheus_port()}).handle_exception([&ip, &cfg] (auto ep) {
@@ -874,7 +1018,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             debug::the_snitch = &snitch;
             snitch_config snitch_cfg;
             snitch_cfg.name = cfg->endpoint_snitch();
-            snitch_cfg.listen_address = utils::resolve(cfg->listen_address, family).get0();
+            snitch_cfg.listen_address = utils::resolve(cfg->listen_address, family).get();
             snitch_cfg.broadcast_address = broadcast_addr;
             snitch.start(snitch_cfg).get();
             auto stop_snitch = defer_verbose_shutdown("snitch", [&snitch] {
@@ -883,6 +1027,11 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             snitch.invoke_on_all(&locator::snitch_ptr::start).get();
             // #293 - do not stop anything (unless snitch.on_all(start) fails)
             stop_snitch->cancel();
+
+            api::set_server_snitch(ctx, snitch).get();
+            auto stop_snitch_api = defer_verbose_shutdown("snitch API", [&ctx] {
+                api::unset_server_snitch(ctx).get();
+            });
 
             if (auto opt_public_address = snitch.local()->get_public_address()) {
                 // Use the Public IP as broadcast_address to other nodes
@@ -916,6 +1065,11 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 tm_cfg.topo_cfg.disable_proximity_sorting = true;
             }
             token_metadata.start([] () noexcept { return db::schema_tables::hold_merge_lock(); }, tm_cfg).get();
+            token_metadata.invoke_on_all([&] (auto& stm) {
+                stm.set_stall_detector_threshold(
+                        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                std::chrono::duration<double>(cfg->topology_barrier_stall_detector_threshold_seconds())));
+            }).get();
             // storage_proxy holds a reference on it and is not yet stopped.
             // what's worse is that the calltrace
             //   storage_proxy::do_query 
@@ -953,11 +1107,21 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
 
             supervisor::notify("creating and verifying directories");
             utils::directories::set dir_set;
-            dir_set.add(cfg->data_file_directories());
             dir_set.add(cfg->commitlog_directory());
             dir_set.add(cfg->schema_commitlog_directory());
             dirs.emplace(cfg->developer_mode());
             dirs->create_and_verify(std::move(dir_set)).get();
+
+            // The data directories are handled separately to prevent memory
+            // fragmentation in the dentry/inode cache. The top-level
+            // directories are verified first, and then the contents are
+            // verified in such a way that the files that will be closed
+            // immediately are located separately from those that will remain
+            // open for a longer duration in the dentry/inode cache.
+            utils::directories::set data_dir_set;
+            data_dir_set.add(cfg->data_file_directories());
+            dirs->create_and_verify(data_dir_set, utils::directories::recursive::no).get();
+            utils::directories::verify_owner_and_mode_of_data_dir(data_dir_set).get();
 
             auto hints_dir_initializer = db::hints::directory_initializer::make(*dirs, cfg->hints_directory()).get();
             auto view_hints_dir_initializer = db::hints::directory_initializer::make(*dirs, cfg->view_hints_directory()).get();
@@ -969,12 +1133,24 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             auto get_tm_cfg = sharded_parameter([&] {
                 return tasks::task_manager::config {
                     .task_ttl = cfg->task_ttl_seconds,
+                    .user_task_ttl = cfg->user_task_ttl_seconds,
                 };
             });
             task_manager.start(std::move(get_tm_cfg), std::ref(stop_signal.as_sharded_abort_source())).get();
             auto stop_task_manager = defer_verbose_shutdown("task_manager", [&task_manager] {
                 task_manager.stop().get();
             });
+
+            api::set_server_task_manager(ctx, task_manager, cfg, gossiper).get();
+            auto stop_tm_api = defer_verbose_shutdown("task manager API", [&ctx] {
+                api::unset_server_task_manager(ctx).get();
+            });
+#ifndef SCYLLA_BUILD_MODE_RELEASE
+            api::set_server_task_manager_test(ctx, task_manager).get();
+            auto stop_tm_test_api = defer_verbose_shutdown("task manager API", [&ctx] {
+                api::unset_server_task_manager_test(ctx).get();
+            });
+#endif
 
             // Note: changed from using a move here, because we want the config object intact.
             replica::database_config dbcfg;
@@ -986,7 +1162,41 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             dbcfg.memtable_to_cache_scheduling_group = make_sched_group("memtable_to_cache", "mt2c", 200);
             dbcfg.gossip_scheduling_group = make_sched_group("gossip", "gms", 1000);
             dbcfg.commitlog_scheduling_group = make_sched_group("commitlog", "clog", 1000);
+            dbcfg.schema_commitlog_scheduling_group = make_sched_group("schema_commitlog", "sclg", 1000);
             dbcfg.available_memory = memory::stats().total_memory();
+
+            // Make sure to initialize the scheduling group keys at a point where we are sure
+            // that nobody will be creating scheduling groups (e.g. service levels controller can do that).
+            // Creating a scheduling group and scheduling group key concurrently
+            // doesn't work properly. See: https://github.com/scylladb/seastar/issues/2231
+            scheduling_group_key_config maintenance_cql_sg_stats_cfg =
+            make_scheduling_group_key_config<cql_transport::cql_sg_stats>(maintenance_socket_enabled::yes);
+            auto maintenance_cql_sg_stats_key = scheduling_group_key_create(maintenance_cql_sg_stats_cfg).get();
+            scheduling_group_key_config cql_sg_stats_cfg = make_scheduling_group_key_config<cql_transport::cql_sg_stats>(maintenance_socket_enabled::no);
+            cql_sg_stats_cfg.rename = [] (void* ptr) {
+                reinterpret_cast<cql_transport::cql_sg_stats*>(ptr)->rename_metrics();
+            };
+            auto cql_sg_stats_key = scheduling_group_key_create(cql_sg_stats_cfg).get();
+
+            supervisor::notify("starting disk space monitor");
+            auto dsm_cfg = utils::disk_space_monitor::config{
+                .sched_group = dbcfg.streaming_scheduling_group,
+                .normal_polling_interval = cfg->disk_space_monitor_normal_polling_interval_in_seconds,
+                .high_polling_interval = cfg->disk_space_monitor_high_polling_interval_in_seconds,
+                .polling_interval_threshold = cfg->disk_space_monitor_polling_interval_threshold,
+            };
+            if (data_dir_set.get_paths().empty()) {
+                throw std::runtime_error("data_dir_set must be non-empty");
+            }
+            fs::path data_dir = *data_dir_set.get_paths().begin();
+            if (data_dir_set.get_paths().size() > 1) {
+                startlog.warn("Multiple data directories aren't supported. Will monitor only {}", data_dir);
+            }
+            disk_space_monitor_shard0.emplace(stop_signal.as_local_abort_source(), data_dir, dsm_cfg);
+            disk_space_monitor_shard0->start().get();
+            auto stop_dsm = defer_verbose_shutdown("disk space monitor", [&disk_space_monitor_shard0] {
+                disk_space_monitor_shard0->stop().get();
+            });
 
             supervisor::notify("starting compaction_manager");
             // get_cm_cfg is called on each shard when starting a sharded<compaction_manager>
@@ -998,6 +1208,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                     .available_memory = dbcfg.available_memory,
                     .static_shares = cfg->compaction_static_shares,
                     .throughput_mb_per_sec = cfg->compaction_throughput_mb_per_sec,
+                    .flush_all_tables_before_major = cfg->compaction_flush_all_tables_before_major_seconds() * 1s,
                 };
             });
             cm.start(std::move(get_cm_cfg), std::ref(stop_signal.as_sharded_abort_source()), std::ref(task_manager)).get();
@@ -1012,20 +1223,45 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 sstm.stop().get();
             });
 
-            std::optional<wasm::startup_context> wasm_ctx;
+            static sharded<auth::service> auth_service;
+            static sharded<auth::service> maintenance_auth_service;
+            static sharded<qos::service_level_controller> sl_controller;
+            debug::the_sl_controller = &sl_controller;
+
+            //starting service level controller
+            qos::service_level_options default_service_level_configuration;
+            default_service_level_configuration.shares = 1000;
+            sl_controller.start(std::ref(auth_service), std::ref(token_metadata), std::ref(stop_signal.as_sharded_abort_source()), default_service_level_configuration, dbcfg.statement_scheduling_group).get();
+            sl_controller.invoke_on_all(&qos::service_level_controller::start).get();
+            auto stop_sl_controller = defer_verbose_shutdown("service level controller", [] {
+                sl_controller.stop().get();
+            });
+
+            lang::manager::config lang_config;
+            lang_config.lua.max_bytes = cfg->user_defined_function_allocation_limit_bytes();
+            lang_config.lua.max_contiguous = cfg->user_defined_function_contiguous_allocation_limit_bytes();
+            lang_config.lua.timeout = std::chrono::milliseconds(cfg->user_defined_function_time_limit_ms());
             if (cfg->enable_user_defined_functions() && cfg->check_experimental(db::experimental_features_t::feature::UDF)) {
-                wasm_ctx.emplace(*cfg, dbcfg);
+                lang_config.wasm = lang::manager::wasm_config {
+                    .udf_memory_limit = cfg->wasm_udf_memory_limit(),
+                    .cache_size = dbcfg.available_memory * cfg->wasm_cache_memory_fraction(),
+                    .cache_instance_size = cfg->wasm_cache_instance_size_limit(),
+                    .cache_timer_period = std::chrono::milliseconds(cfg->wasm_cache_timeout_in_ms()),
+                    .yield_fuel = cfg->wasm_udf_yield_fuel(),
+                    .total_fuel = cfg->wasm_udf_total_fuel(),
+                };
             }
 
-            static sharded<wasm::manager> wasm;
-            wasm.start(std::ref(wasm_ctx)).get();
+            static sharded<lang::manager> langman;
+            langman.start(lang_config).get();
             // don't stop for real until query_processor stops
-            auto stop_wasm = defer_verbose_shutdown("wasm", [] { wasm.invoke_on_all(&wasm::manager::stop).get(); });
+            auto stop_lang_man = defer_verbose_shutdown("lang manager", [] { langman.invoke_on_all(&lang::manager::stop).get(); });
+            langman.invoke_on_all(&lang::manager::start).get();
 
             supervisor::notify("starting database");
             debug::the_database = &db;
             db.start(std::ref(*cfg), dbcfg, std::ref(mm_notifier), std::ref(feature_service), std::ref(token_metadata),
-                    std::ref(cm), std::ref(sstm), std::ref(wasm), std::ref(sst_dir_semaphore), utils::cross_shard_barrier()).get();
+                    std::ref(cm), std::ref(sstm), std::ref(langman), std::ref(sst_dir_semaphore), std::ref(stop_signal.as_sharded_abort_source()), utils::cross_shard_barrier()).get();
             auto stop_database_and_sstables = defer_verbose_shutdown("database", [&db] {
                 // #293 - do not stop anything - not even db (for real)
                 //return db.stop();
@@ -1037,7 +1273,9 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             // because it obtains the list of pre-existing segments for replay, which must
             // not include reserve segments created by active commitlogs.
             db.local().init_commitlog().get();
-            db.invoke_on_all(&replica::database::start).get();
+            db.invoke_on_all(&replica::database::start, std::ref(sl_controller)).get();
+
+            ::sigquit_handler sigquit_handler(db);
 
 // FIXME: The stall detector uses glibc backtrace function to
 // collect backtraces, this causes ASAN failures on ARM.
@@ -1060,11 +1298,11 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             smp_service_group_config storage_proxy_smp_service_group_config;
             // Assuming less than 1kB per queued request, this limits storage_proxy submit_to() queues to 5MB or less
             storage_proxy_smp_service_group_config.max_nonlocal_requests = 5000;
-            spcfg.read_smp_service_group = create_smp_service_group(storage_proxy_smp_service_group_config).get0();
-            spcfg.write_smp_service_group = create_smp_service_group(storage_proxy_smp_service_group_config).get0();
-            spcfg.write_mv_smp_service_group = create_smp_service_group(storage_proxy_smp_service_group_config).get0();
-            spcfg.hints_write_smp_service_group = create_smp_service_group(storage_proxy_smp_service_group_config).get0();
-            spcfg.write_ack_smp_service_group = create_smp_service_group(storage_proxy_smp_service_group_config).get0();
+            spcfg.read_smp_service_group = create_smp_service_group(storage_proxy_smp_service_group_config).get();
+            spcfg.write_smp_service_group = create_smp_service_group(storage_proxy_smp_service_group_config).get();
+            spcfg.write_mv_smp_service_group = create_smp_service_group(storage_proxy_smp_service_group_config).get();
+            spcfg.hints_write_smp_service_group = create_smp_service_group(storage_proxy_smp_service_group_config).get();
+            spcfg.write_ack_smp_service_group = create_smp_service_group(storage_proxy_smp_service_group_config).get();
             static db::view::node_update_backlog node_backlog(smp::count, 10ms);
             scheduling_group_key_config storage_proxy_stats_cfg =
                     make_scheduling_group_key_config<service::storage_proxy_stats::stats>();
@@ -1078,7 +1316,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 reinterpret_cast<service::storage_proxy_stats::stats*>(ptr)->register_split_metrics_local();
             };
             proxy.start(std::ref(db), spcfg, std::ref(node_backlog),
-                    scheduling_group_key_create(storage_proxy_stats_cfg).get0(),
+                    scheduling_group_key_create(storage_proxy_stats_cfg).get(),
                     std::ref(feature_service), std::ref(token_metadata), std::ref(erm_factory)).get();
 
             // #293 - do not stop anything
@@ -1102,14 +1340,13 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                                                      std::chrono::duration_cast<std::chrono::milliseconds>(cql3::prepared_statements_cache::entry_expiry));
             auth_prep_cache_config.refresh = std::chrono::milliseconds(cfg->permissions_update_interval_in_ms());
 
-            qp.start(std::ref(proxy), std::move(local_data_dict), std::ref(mm_notifier), qp_mcfg, std::ref(cql_config), std::move(auth_prep_cache_config), std::ref(wasm)).get();
+            qp.start(std::ref(proxy), std::move(local_data_dict), std::ref(mm_notifier), qp_mcfg, std::ref(cql_config), std::move(auth_prep_cache_config), std::ref(langman)).get();
 
             supervisor::notify("starting lifecycle notifier");
             lifecycle_notifier.start().get();
-            // storage_service references this notifier and is not stopped yet
-            // auto stop_lifecycle_notifier = defer_verbose_shutdown("lifecycle notifier", [ &lifecycle_notifier ] {
-            //     lifecycle_notifier.stop().get();
-            // });
+            auto stop_lifecycle_notifier = defer_verbose_shutdown("lifecycle notifier", [ &lifecycle_notifier ] {
+                lifecycle_notifier.stop().get();
+            });
 
             supervisor::notify("creating tracing");
             sharded<tracing::tracing>& tracing = tracing::tracing::tracing_instance();
@@ -1117,6 +1354,9 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             auto destroy_tracing = defer_verbose_shutdown("tracing instance", [&tracing] {
                 tracing.stop().get();
             });
+            audit::audit::create_audit(*cfg, token_metadata).handle_exception([&] (auto&& e) {
+                startlog.error("audit creation failed: {}", e);
+            }).get();
 
             with_scheduling_group(maintenance_scheduling_group, [&] {
                 return ctx.http_server.listen(socket_address{api_addr, cfg->api_port()});
@@ -1124,28 +1364,22 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             startlog.info("Scylla API server listening on {}:{} ...", api_addr, cfg->api_port());
 
             api::set_server_config(ctx, *cfg).get();
-
-            static sharded<auth::service> auth_service;
-            static sharded<qos::service_level_controller> sl_controller;
-            debug::the_sl_controller = &sl_controller;
-
-            //starting service level controller
-            qos::service_level_options default_service_level_configuration;
-            sl_controller.start(std::ref(auth_service), default_service_level_configuration).get();
-            sl_controller.invoke_on_all(&qos::service_level_controller::start).get();
-            auto stop_sl_controller = defer_verbose_shutdown("service level controller", [] {
-                sl_controller.stop().get();
+            auto stop_config_api = defer_verbose_shutdown("config API", [&ctx] {
+                api::unset_server_config(ctx).get();
             });
-
-            //This starts the update loop - but no real update happens until the data accessor is not initialized.
-            sl_controller.local().update_from_distributed_data(std::chrono::seconds(10));
 
             static sharded<db::system_distributed_keyspace> sys_dist_ks;
             static sharded<db::system_keyspace> sys_ks;
             static sharded<db::view::view_update_generator> view_update_generator;
+            static sharded<db::view::view_builder> view_builder;
             static sharded<cdc::generation_service> cdc_generation_service;
 
             db::sstables_format_selector sst_format_selector(db);
+
+            api::set_format_selector(ctx, sst_format_selector).get();
+            auto stop_format_seletor_api = defer_verbose_shutdown("sstables format selector API", [&ctx] {
+                api::unset_format_selector(ctx).get();
+            });
 
             supervisor::notify("starting system keyspace");
             sys_ks.start(std::ref(qp), std::ref(db)).get();
@@ -1160,6 +1394,9 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             // described here: https://github.com/scylladb/scylla/issues/1014
             supervisor::notify("loading system sstables");
             replica::distributed_loader::init_system_keyspace(sys_ks, erm_factory, db).get();
+
+            utils::get_local_injector().inject("stop_after_init_of_system_ks",
+                [] { std::raise(SIGSTOP); });
 
             // 1. Here we notify dependent services that system tables have been loaded,
             //    and they in turn can load the necessary data from them;
@@ -1178,6 +1415,9 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
 
             db.local().init_schema_commitlog();
 
+            utils::get_local_injector().inject("stop_after_init_of_schema_commitlog",
+                [] { std::raise(SIGSTOP); });
+
             // Mark all the system tables writable and assign the proper commitlog to them.
             sys_ks.invoke_on_all(&db::system_keyspace::mark_writable).get();
 
@@ -1186,7 +1426,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
               auto paths = sch_cl->get_segments_to_replay().get();
               if (!paths.empty()) {
                   supervisor::notify("replaying schema commit log");
-                  auto rp = db::commitlog_replayer::create_replayer(db, sys_ks).get0();
+                  auto rp = db::commitlog_replayer::create_replayer(db, sys_ks).get();
                   rp.recover(paths, db::schema_tables::COMMITLOG_FILENAME_PREFIX).get();
                   supervisor::notify("replaying schema commit log - flushing memtables");
                   // The schema commitlog lives only on the null shard.
@@ -1201,19 +1441,44 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
               }
             }
 
+            static sharded<gms::gossip_address_map> gossip_address_map;
+            supervisor::notify("starting gossip address map");
+            gossip_address_map.start().get();
+            auto stop_gossip_address_map = defer_verbose_shutdown("gossip_address_map", [] {
+                gossip_address_map.stop().get();
+            });
+
             sys_ks.local().build_bootstrap_info().get();
 
-            const auto listen_address = utils::resolve(cfg->listen_address, family).get0();
+            const auto listen_address = utils::resolve(cfg->listen_address, family).get();
             const auto host_id = initialize_local_info_thread(sys_ks, snitch, listen_address, *cfg, broadcast_addr, broadcast_rpc_addr);
 
-          shared_token_metadata::mutate_on_all_shards(token_metadata, [host_id, endpoint = broadcast_addr] (locator::token_metadata& tm) {
+          shared_token_metadata::mutate_on_all_shards(token_metadata, [host_id] (locator::token_metadata& tm) {
               // Makes local host id available in topology cfg as soon as possible.
               // Raft topology discard the endpoint-to-id map, so the local id can
               // still be found in the config.
               tm.get_topology().set_host_id_cfg(host_id);
-              tm.get_topology().add_or_update_endpoint(endpoint, host_id);
               return make_ready_future<>();
           }).get();
+
+            utils::dict_sampler dict_sampler;
+            auto arct_cfg = [&] {
+                return utils::advanced_rpc_compressor::tracker::config{
+                    .zstd_min_msg_size = cfg->internode_compression_zstd_min_message_size,
+                    .zstd_max_msg_size = cfg->internode_compression_zstd_max_message_size,
+                    .zstd_quota_fraction = cfg->internode_compression_zstd_max_cpu_fraction,
+                    .zstd_quota_refresh_ms = cfg->internode_compression_zstd_cpu_quota_refresh_period_ms,
+                    .zstd_longterm_quota_fraction = cfg->internode_compression_zstd_max_longterm_cpu_fraction,
+                    .zstd_longterm_quota_refresh_ms = cfg->internode_compression_zstd_longterm_cpu_quota_refresh_period_ms,
+                    .algo_config = cfg->internode_compression_algorithms,
+                    .register_metrics = cfg->internode_compression_enable_advanced(),
+                    .checksumming = cfg->internode_compression_checksumming,
+                };
+            };
+            static sharded<utils::walltime_compressor_tracker> compressor_tracker;
+            compressor_tracker.start(arct_cfg).get();
+            auto stop_compressor_tracker = defer_verbose_shutdown("compressor_tracker", [] { compressor_tracker.stop().get(); });
+            compressor_tracker.local().attach_to_dict_sampler(&dict_sampler);
 
             netw::messaging_service::config mscfg;
 
@@ -1225,8 +1490,9 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             mscfg.listen_on_broadcast_address = cfg->listen_on_broadcast_address();
             mscfg.rpc_memory_limit = std::max<size_t>(0.08 * memory::stats().total_memory(), mscfg.rpc_memory_limit);
             if (snitch.local()->prefer_local()) {
-                mscfg.preferred_ips = sys_ks.local().get_preferred_ips().get0();
+                mscfg.preferred_ips = sys_ks.local().get_preferred_ips().get();
             }
+            mscfg.maintenance_mode = maintenance_mode_enabled{cfg->maintenance_mode()};
 
             const auto& seo = cfg->server_encryption_options();
             auto encrypt = utils::get_or_default(seo, "internode_encryption", "none");
@@ -1246,6 +1512,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             } else if (compress_what == "dc") {
                 mscfg.compress = netw::messaging_service::compress_what::dc;
             }
+            mscfg.enable_advanced_rpc_compression = cfg->internode_compression_enable_advanced();
 
             if (encrypt == "all") {
                 mscfg.encrypt = netw::messaging_service::encrypt_what::all;
@@ -1253,6 +1520,8 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 mscfg.encrypt = netw::messaging_service::encrypt_what::dc;
             } else if (encrypt == "rack") {
                 mscfg.encrypt = netw::messaging_service::encrypt_what::rack;
+            } else if (encrypt == "transitional") {
+                mscfg.encrypt = netw::messaging_service::encrypt_what::transitional;
             }
 
             if (!cfg->inter_dc_tcp_nodelay()) {
@@ -1260,7 +1529,10 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             }
 
             netw::messaging_service::scheduling_config scfg;
-            scfg.statement_tenants = { {dbcfg.statement_scheduling_group, "$user"}, {default_scheduling_group(), "$system"} };
+            scfg.statement_tenants = {
+                    {default_scheduling_group(), "$system"},
+                    {dbcfg.streaming_scheduling_group, "$maintenance", false}
+            };
             scfg.streaming = dbcfg.streaming_scheduling_group;
             scfg.gossip = dbcfg.gossip_scheduling_group;
 
@@ -1268,13 +1540,15 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             debug::the_messaging_service = &messaging;
 
             std::shared_ptr<seastar::tls::credentials_builder> creds;
-            if (mscfg.encrypt != netw::messaging_service::encrypt_what::none) {
+            if (mscfg.encrypt != netw::messaging_service::encrypt_what::none 
+                || (cfg->ssl_storage_port() != 0 && seo.contains("certificate"))
+            ) {
                 creds = std::make_shared<seastar::tls::credentials_builder>();
-                utils::configure_tls_creds_builder(*creds, cfg->server_encryption_options()).get();
+                utils::configure_tls_creds_builder(*creds, seo).get();
             }
 
             // Delay listening messaging_service until gossip message handlers are registered
-            messaging.start(mscfg, scfg, creds).get();
+            messaging.start(mscfg, scfg, creds, std::ref(feature_service), std::ref(gossip_address_map), std::ref(compressor_tracker), std::ref(sl_controller)).get();
             auto stop_ms = defer_verbose_shutdown("messaging service", [&messaging] {
                 messaging.invoke_on_all(&netw::messaging_service::stop).get();
             });
@@ -1284,40 +1558,77 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             // before start_listen is called.
             messaging.invoke_on_all(&netw::messaging_service::start).get();
 
+            api::set_server_messaging_service(ctx, messaging).get();
+            auto stop_messaging_api = defer_verbose_shutdown("messaging service API", [&ctx] {
+                api::unset_server_messaging_service(ctx).get();
+            });
+
+            // Task manager's messaging handlers need to be set like this because of dependency chain:
+            // messaging -(needs)-> sys_ks -> db -> cm -> task_manager.
+            task_manager.invoke_on_all([&] (auto& tm) {
+                tm.set_host_id(host_id);
+                tm.init_ms_handlers(messaging.local());
+            }).get();
+            auto uninit_tm_ms_handlers = defer([&task_manager] () {
+                task_manager.invoke_on_all([] (auto& tm) {
+                    return tm.uninit_ms_handlers();
+                }).get();
+            });
+
             supervisor::notify("starting gossiper");
-            gms::gossip_config gcfg;
-            gcfg.gossip_scheduling_group = dbcfg.gossip_scheduling_group;
-            gcfg.seeds = get_seeds_from_db_config(*cfg, broadcast_addr);
-            gcfg.cluster_name = cfg->cluster_name();
-            gcfg.partitioner = cfg->partitioner();
-            gcfg.ring_delay_ms = cfg->ring_delay_ms();
-            gcfg.shadow_round_ms = cfg->shadow_round_ms();
-            gcfg.shutdown_announce_ms = cfg->shutdown_announce_in_ms();
-            gcfg.skip_wait_for_gossip_to_settle = cfg->skip_wait_for_gossip_to_settle();
-            if (gcfg.cluster_name.empty()) {
-                gcfg.cluster_name = "Test Cluster";
+            auto cluster_name = cfg->cluster_name();
+            if (cluster_name.empty()) {
+                cluster_name = "Test Cluster";
                 startlog.warn("Using default cluster name is not recommended. Using a unique cluster name will reduce the chance of adding nodes to the wrong cluster by mistake");
             }
-            gcfg.group0_id = sys_ks.local().get_raft_group0_id().get();
+            auto group0_id = sys_ks.local().get_raft_group0_id().get();
+
+            // Fail on a gossiper seeds lookup error only if the node is not bootstrapped.
+            const bool fail_on_lookup_error = !sys_ks.local().bootstrap_complete();
+
+            auto gossiper_seeds = get_seeds_from_db_config(*cfg, broadcast_addr, fail_on_lookup_error);
+
+            auto get_gossiper_cfg = sharded_parameter([&] {
+                gms::gossip_config gcfg;
+                gcfg.gossip_scheduling_group = dbcfg.gossip_scheduling_group;
+                gcfg.seeds = gossiper_seeds;
+                gcfg.cluster_name = cluster_name;
+                gcfg.partitioner = cfg->partitioner();
+                gcfg.ring_delay_ms = cfg->ring_delay_ms();
+                gcfg.shadow_round_ms = cfg->shadow_round_ms();
+                gcfg.shutdown_announce_ms = cfg->shutdown_announce_in_ms();
+                gcfg.skip_wait_for_gossip_to_settle = cfg->skip_wait_for_gossip_to_settle();
+                gcfg.group0_id = group0_id;
+                gcfg.host_id = host_id;
+                gcfg.failure_detector_timeout_ms = cfg->failure_detector_timeout_in_ms;
+                gcfg.force_gossip_generation = cfg->force_gossip_generation;
+                return gcfg;
+            });
 
             debug::the_gossiper = &gossiper;
-            gossiper.start(std::ref(stop_signal.as_sharded_abort_source()), std::ref(token_metadata), std::ref(messaging), std::ref(*cfg), std::ref(gcfg)).get();
+            gossiper.start(std::ref(stop_signal.as_sharded_abort_source()), std::ref(token_metadata), std::ref(messaging), std::move(get_gossiper_cfg), std::ref(gossip_address_map)).get();
             auto stop_gossiper = defer_verbose_shutdown("gossiper", [&gossiper] {
                 // call stop on each instance, but leave the sharded<> pointers alive
                 gossiper.invoke_on_all(&gms::gossiper::stop).get();
             });
             gossiper.invoke_on_all(&gms::gossiper::start).get();
 
-            static sharded<service::raft_address_map> raft_address_map;
-            supervisor::notify("starting Raft address map");
-            raft_address_map.start().get();
-            auto stop_address_map = defer_verbose_shutdown("raft_address_map", [] {
-                raft_address_map.stop().get();
+            api::set_server_token_metadata(ctx, token_metadata, gossiper).get();
+            auto stop_tokens_api = defer_verbose_shutdown("token metadata API", [&ctx] {
+                api::unset_server_token_metadata(ctx).get();
+            });
+
+            utils::get_local_injector().inject("stop_after_starting_gossiper",
+                [] { std::raise(SIGSTOP); });
+
+            api::set_server_gossip(ctx, gossiper).get();
+            auto stop_gossip_api = defer_verbose_shutdown("gossiper API", [&ctx] {
+                api::unset_server_gossip(ctx).get();
             });
 
             static sharded<service::direct_fd_pinger> fd_pinger;
             supervisor::notify("starting direct failure detector pinger service");
-            fd_pinger.start(std::ref(messaging), std::ref(raft_address_map)).get();
+            fd_pinger.start(std::ref(messaging)).get();
 
             auto stop_fd_pinger = defer_verbose_shutdown("fd_pinger", [] {
                 fd_pinger.stop().get();
@@ -1328,46 +1639,35 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             supervisor::notify("starting direct failure detector service");
             fd.start(
                 std::ref(fd_pinger), std::ref(fd_clock),
-                service::direct_fd_clock::base::duration{std::chrono::milliseconds{100}}.count()).get();
+                service::direct_fd_clock::base::duration{std::chrono::milliseconds{100}}.count(),
+                service::direct_fd_clock::base::duration{std::chrono::milliseconds{cfg->direct_failure_detector_ping_timeout_in_ms()}}.count()).get();
 
             auto stop_fd = defer_verbose_shutdown("direct_failure_detector", [] {
                 fd.stop().get();
             });
 
-            raft_gr.start(cfg->consistent_cluster_management(), raft::server_id{host_id.id},
-                std::ref(raft_address_map), std::ref(messaging), std::ref(gossiper), std::ref(fd)).get();
+            raft_gr.start(raft::server_id{host_id.id}, std::ref(messaging), std::ref(fd)).get();
 
             // group0 client exists only on shard 0.
             // The client has to be created before `stop_raft` since during
             // destruction it has to exist until raft_gr.stop() completes.
-            service::raft_group0_client group0_client{raft_gr.local(), sys_ks.local()};
+            service::raft_group0_client group0_client{raft_gr.local(), sys_ks.local(), token_metadata.local(), maintenance_mode_enabled{cfg->maintenance_mode()}};
 
             service::raft_group0 group0_service{
                     stop_signal.as_local_abort_source(), raft_gr.local(), messaging,
-                    gossiper.local(), feature_service.local(), sys_ks.local(), group0_client};
+                    gossiper.local(), feature_service.local(), sys_ks.local(), group0_client, dbcfg.gossip_scheduling_group};
 
+            service::tablet_allocator::config tacfg;
             distributed<service::tablet_allocator> tablet_allocator;
-            if (cfg->check_experimental(db::experimental_features_t::feature::TABLETS) &&
-                !cfg->check_experimental(db::experimental_features_t::feature::CONSISTENT_TOPOLOGY_CHANGES)) {
-                    startlog.error("Bad configuration: The consistent-topology-changes feature has to be enabled if tablets feature is enabled");
-                    throw bad_configuration_error();
-            }
-            tablet_allocator.start(std::ref(mm_notifier), std::ref(db)).get();
+            tablet_allocator.start(tacfg, std::ref(mm_notifier), std::ref(db)).get();
             auto stop_tablet_allocator = defer_verbose_shutdown("tablet allocator", [&tablet_allocator] {
                 tablet_allocator.stop().get();
             });
 
-            // FIXME -- this can happen next to token_metadata start, but it needs "storage_service"
-            // API register, so it comes that late for now
-            api::set_server_token_metadata(ctx, token_metadata).get();
-            auto stop_tokens_api = defer_verbose_shutdown("token metadata API", [&ctx] {
-                api::unset_server_token_metadata(ctx).get();
-            });
-
-            supervisor::notify("starting forward service");
-            forward_service.start(std::ref(messaging), std::ref(proxy), std::ref(db), std::ref(token_metadata), std::ref(stop_signal.as_sharded_abort_source())).get();
-            auto stop_forward_service_handlers = defer_verbose_shutdown("forward service", [&forward_service] {
-                forward_service.stop().get();
+            supervisor::notify("starting mapreduce service");
+            mapreduce_service.start(std::ref(messaging), std::ref(proxy), std::ref(db), std::ref(token_metadata), std::ref(stop_signal.as_sharded_abort_source())).get();
+            auto stop_mapreduce_service_handlers = defer_verbose_shutdown("mapreduce service", [&mapreduce_service] {
+                mapreduce_service.stop().get();
             });
 
             supervisor::notify("starting migration manager");
@@ -1377,6 +1677,9 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 mm.stop().get();
             });
 
+            utils::get_local_injector().inject("stop_after_starting_migration_manager",
+                [] { std::raise(SIGSTOP); });
+
             // XXX: stop_raft has to happen before query_processor and migration_manager
             // is stopped, since some groups keep using the query
             // processor until are stopped inside stop_raft.
@@ -1384,12 +1687,52 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 raft_gr.stop().get();
             });
 
-            supervisor::notify("initializing query processor remote part");
-            // TODO: do this together with proxy.start_remote(...)
-            qp.invoke_on_all(&cql3::query_processor::start_remote, std::ref(mm), std::ref(forward_service), std::ref(group0_client)).get();
-            auto stop_qp_remote = defer_verbose_shutdown("query processor remote part", [&qp] {
-                qp.invoke_on_all(&cql3::query_processor::stop_remote).get();
+            sharded<service::topology_state_machine> tsm;
+            tsm.start().get();
+            auto stop_tsm = defer_verbose_shutdown("topology_state_machine", [&tsm] {
+                tsm.stop().get();
             });
+            auto notify_topology = [&tsm] (auto) {
+                tsm.local().event.broadcast();
+            };
+            auto tablets_per_shard_goal_observer = cfg->tablets_per_shard_goal.observe(notify_topology);
+            auto tablets_initial_scale_factor_observer = cfg->tablets_initial_scale_factor.observe(notify_topology);
+
+            auto compression_dict_updated_callback = [] () -> future<> {
+                auto dict = co_await sys_ks.local().query_dict();
+                co_await utils::announce_dict_to_shards(compressor_tracker, std::move(dict));
+            };
+
+            sys_dist_ks.start(std::ref(qp), std::ref(mm), std::ref(proxy)).get();
+            auto stop_sdks = defer_verbose_shutdown("system distributed keyspace", [] {
+                sys_dist_ks.invoke_on_all(&db::system_distributed_keyspace::stop).get();
+            });
+
+            supervisor::notify("starting view update generator");
+            view_update_generator.start(std::ref(db), std::ref(proxy), std::ref(stop_signal.as_sharded_abort_source())).get();
+            auto stop_view_update_generator = defer_verbose_shutdown("view update generator", [] {
+                view_update_generator.stop().get();
+            });
+
+            supervisor::notify("starting the view builder");
+            view_builder.start(std::ref(db), std::ref(sys_ks), std::ref(sys_dist_ks), std::ref(mm_notifier), std::ref(view_update_generator), std::ref(group0_client), std::ref(qp)).get();
+            auto stop_view_builder = defer_verbose_shutdown("view builder", [cfg] {
+                view_builder.stop().get();
+            });
+
+            supervisor::notify("starting repair service");
+            auto max_memory_repair = memory::stats().total_memory() * 0.1;
+            repair.start(std::ref(tsm), std::ref(gossiper), std::ref(messaging), std::ref(db), std::ref(proxy), std::ref(bm), std::ref(sys_ks), std::ref(view_builder), std::ref(task_manager), std::ref(mm), max_memory_repair).get();
+            auto stop_repair_service = defer_verbose_shutdown("repair service", [&repair] {
+                repair.stop().get();
+            });
+            repair.invoke_on_all(&repair_service::start).get();
+            api::set_server_repair(ctx, repair, gossip_address_map).get();
+            auto stop_repair_api = defer_verbose_shutdown("repair API", [&ctx] {
+                api::unset_server_repair(ctx).get();
+            });
+
+            utils::get_local_injector().inject("stop_after_starting_repair", [] { std::raise(SIGSTOP); });
 
             supervisor::notify("initializing storage service");
             debug::the_storage_service = &ss;
@@ -1398,7 +1741,10 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 std::ref(feature_service), std::ref(mm), std::ref(token_metadata), std::ref(erm_factory),
                 std::ref(messaging), std::ref(repair),
                 std::ref(stream_manager), std::ref(lifecycle_notifier), std::ref(bm), std::ref(snitch),
-                std::ref(tablet_allocator), std::ref(cdc_generation_service), std::ref(qp)).get();
+                std::ref(tablet_allocator), std::ref(cdc_generation_service), std::ref(view_builder), std::ref(qp), std::ref(sl_controller),
+                std::ref(tsm), std::ref(task_manager), std::ref(gossip_address_map),
+                compression_dict_updated_callback
+            ).get();
 
             auto stop_storage_service = defer_verbose_shutdown("storage_service", [&] {
                 ss.stop().get();
@@ -1407,6 +1753,14 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             api::set_server_storage_service(ctx, ss, group0_client).get();
             auto stop_ss_api = defer_verbose_shutdown("storage service API", [&ctx] {
                 api::unset_server_storage_service(ctx).get();
+            });
+
+            supervisor::notify("initializing query processor remote part");
+            // TODO: do this together with proxy.start_remote(...)
+            qp.invoke_on_all(&cql3::query_processor::start_remote, std::ref(mm), std::ref(mapreduce_service),
+                             std::ref(ss), std::ref(group0_client)).get();
+            auto stop_qp_remote = defer_verbose_shutdown("query processor remote part", [&qp] {
+                qp.invoke_on_all(&cql3::query_processor::stop_remote).get();
             });
 
             supervisor::notify("initializing virtual tables");
@@ -1425,19 +1779,14 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 sst_format_listener.stop().get();
             });
 
-            if (raft_gr.local().is_enabled()) {
-                supervisor::notify("starting Raft Group Registry service");
-                raft_gr.invoke_on_all(&service::raft_group_registry::start).get();
-            } else {
-                if (cfg->check_experimental(db::experimental_features_t::feature::BROADCAST_TABLES)) {
-                    startlog.error("Bad configuration: RAFT feature has to be enabled if BROADCAST_TABLES is enabled");
-                    throw bad_configuration_error();
-                }
-                if (cfg->check_experimental(db::experimental_features_t::feature::TABLETS)) {
-                    startlog.error("Bad configuration: consistent_cluster_management feature has to be enabled if tablets feature is enabled");
-                    throw bad_configuration_error();
-                }
-            }
+            supervisor::notify("starting Raft Group Registry service");
+            raft_gr.invoke_on_all(&service::raft_group_registry::start).get();
+
+            api::set_server_raft(ctx, raft_gr).get();
+            auto stop_raft_api = defer_verbose_shutdown("Raft API", [&ctx] {
+                api::unset_server_raft(ctx).get();
+            });
+
             group0_client.init().get();
 
             // schema migration, if needed, is also done on shard 0
@@ -1446,7 +1795,10 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             db::schema_tables::recalculate_schema_version(sys_ks, proxy, feature_service.local()).get();
 
             // making compaction manager api available, after system keyspace has already been established.
-            api::set_server_compaction_manager(ctx).get();
+            api::set_server_compaction_manager(ctx, cm).get();
+            auto stop_cm_api = defer_verbose_shutdown("compaction manager API", [&ctx] {
+                api::unset_server_compaction_manager(ctx).get();
+            });
 
             cm.invoke_on_all([&](compaction_manager& cm) {
                 auto cl = db.local().commitlog();
@@ -1467,24 +1819,36 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             }).get();
 
             supervisor::notify("loading tablet metadata");
-            ss.local().load_tablet_metadata().get();
+            try {
+                ss.local().load_tablet_metadata({}).get();
+            } catch (...) {
+                if (!cfg->maintenance_mode()) {
+                    throw;
+                }
+                startlog.error("Failed to load tablet metadata (ignoring due to maintenance mode): {}", std::current_exception());
+            }
+
+            // We do not support tablet re-sharding yet, see https://github.com/scylladb/scylladb/issues/16739.
+            // To avoid undefined behaviour due to violated assumptions, that
+            // each tablet has a valid shard replica, we check this assumption here, and refuse startup if violated.
+            if (!locator::check_tablet_replica_shards(ss.local().get_token_metadata_ptr()->tablets(), host_id).get()) {
+                throw std::runtime_error("Detected a tablet with invalid replica shard, reducing shard count with tablet-enabled tables is not yet supported. Replace the node instead.");
+            }
 
             supervisor::notify("loading non-system sstables");
             replica::distributed_loader::init_non_system_keyspaces(db, proxy, sys_ks).get();
 
-            supervisor::notify("starting view update generator");
-            view_update_generator.start(std::ref(db), std::ref(proxy), std::ref(stop_signal.as_sharded_abort_source())).get();
-            auto stop_view_update_generator = defer_verbose_shutdown("view update generator", [] {
-                view_update_generator.stop().get();
-            });
-
             supervisor::notify("starting commit log");
             auto cl = db.local().commitlog();
+
+            utils::get_local_injector().inject("stop_after_starting_commitlog",
+                [] { std::raise(SIGSTOP); });
+
             if (cl != nullptr) {
                 auto paths = cl->get_segments_to_replay().get();
                 if (!paths.empty()) {
                     supervisor::notify("replaying commit log");
-                    auto rp = db::commitlog_replayer::create_replayer(db, sys_ks).get0();
+                    auto rp = db::commitlog_replayer::create_replayer(db, sys_ks).get();
                     rp.recover(paths, db::commitlog::descriptor::FILENAME_PREFIX).get();
                     supervisor::notify("replaying commit log - flushing memtables");
                     db.invoke_on_all(&replica::database::flush_all_memtables).get();
@@ -1498,6 +1862,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             // This ensures we can't mis-mash older records with a newer crashed run.
             // I.e: never keep replay_positions alive across a restart cycle.
             sys_ks.local().drop_truncation_rp_records().get();
+            sys_ks.local().drop_all_commitlog_cleanup_records().get();
 
             db.invoke_on_all([] (replica::database& db) {
                 db.get_tables_metadata().for_each_table([] (table_id, lw_shared_ptr<replica::table> table) {
@@ -1506,26 +1871,21 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 });
             }).get();
 
-            api::set_server_gossip(ctx, gossiper).get();
-            api::set_server_snitch(ctx, snitch).get();
-            auto stop_snitch_api = defer_verbose_shutdown("snitch API", [&ctx] {
-                api::unset_server_snitch(ctx).get();
-            });
-            api::set_server_load_sstable(ctx, sys_ks).get();
+            api::set_server_column_family(ctx, sys_ks).get();
             auto stop_cf_api = defer_verbose_shutdown("column family API", [&ctx] {
-                api::unset_server_load_sstable(ctx).get();
+                api::unset_server_column_family(ctx).get();
             });
             static seastar::sharded<memory_threshold_guard> mtg;
             mtg.start(cfg->large_memory_allocation_warning_threshold()).get();
             supervisor::notify("initializing storage proxy RPC verbs");
-            proxy.invoke_on_all(&service::storage_proxy::start_remote, std::ref(messaging), std::ref(gossiper), std::ref(mm), std::ref(sys_ks)).get();
+            proxy.invoke_on_all(&service::storage_proxy::start_remote, std::ref(messaging), std::ref(gossiper), std::ref(mm), std::ref(sys_ks), std::ref(group0_client), std::ref(tsm)).get();
             auto stop_proxy_handlers = defer_verbose_shutdown("storage proxy RPC verbs", [&proxy] {
                 proxy.invoke_on_all(&service::storage_proxy::stop_remote).get();
             });
 
             debug::the_stream_manager = &stream_manager;
             supervisor::notify("starting streaming service");
-            stream_manager.start(std::ref(*cfg), std::ref(db), std::ref(sys_dist_ks), std::ref(view_update_generator), std::ref(messaging), std::ref(mm), std::ref(gossiper), maintenance_scheduling_group).get();
+            stream_manager.start(std::ref(*cfg), std::ref(db), std::ref(view_builder), std::ref(messaging), std::ref(mm), std::ref(gossiper), maintenance_scheduling_group).get();
             auto stop_stream_manager = defer_verbose_shutdown("stream manager", [&stream_manager] {
                 // FIXME -- keep the instances alive, just call .stop on them
                 stream_manager.invoke_on_all(&streaming::stream_manager::stop).get();
@@ -1546,29 +1906,15 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             }
             view_hints_dir_initializer.ensure_rebalanced().get();
 
-            proxy.invoke_on_all([&lifecycle_notifier, &gossiper] (service::storage_proxy& local_proxy) {
+            proxy.invoke_on_all([&lifecycle_notifier] (service::storage_proxy& local_proxy) {
                 lifecycle_notifier.local().register_subscriber(&local_proxy);
-                return local_proxy.start_hints_manager(gossiper.local().shared_from_this());
             }).get();
 
-            auto drain_proxy = defer_verbose_shutdown("drain storage proxy", [&proxy, &lifecycle_notifier] {
+            auto unsubscribe_proxy = defer_verbose_shutdown("unsubscribe storage proxy", [&proxy, &lifecycle_notifier] {
                 proxy.invoke_on_all([&lifecycle_notifier] (service::storage_proxy& local_proxy) mutable {
-                    return lifecycle_notifier.local().unregister_subscriber(&local_proxy).finally([&local_proxy] {
-                        return local_proxy.drain_on_shutdown();
-                    });
+                    return lifecycle_notifier.local().unregister_subscriber(&local_proxy);
                 }).get();
             });
-
-            // ATTN -- sharded repair reference already sits on storage_service and if
-            // it calls repair.local() before this place it'll crash (now it doesn't do
-            // both)
-            supervisor::notify("starting repair service");
-            auto max_memory_repair = memory::stats().total_memory() * 0.1;
-            repair.start(std::ref(gossiper), std::ref(messaging), std::ref(db), std::ref(proxy), std::ref(bm), std::ref(sys_dist_ks), std::ref(sys_ks), std::ref(view_update_generator), std::ref(task_manager), std::ref(mm), max_memory_repair).get();
-            auto stop_repair_service = defer_verbose_shutdown("repair service", [&repair] {
-                repair.stop().get();
-            });
-            repair.invoke_on_all(&repair_service::start).get();
 
             supervisor::notify("starting CDC Generation Management service");
             /* This service uses the system distributed keyspace.
@@ -1587,10 +1933,14 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             cdc_config.ring_delay = std::chrono::milliseconds(cfg->ring_delay_ms());
             cdc_config.dont_rewrite_streams = cfg->cdc_dont_rewrite_streams();
             cdc_generation_service.start(std::move(cdc_config), std::ref(gossiper), std::ref(sys_dist_ks), std::ref(sys_ks),
-                    std::ref(stop_signal.as_sharded_abort_source()), std::ref(token_metadata), std::ref(feature_service), std::ref(db)).get();
+                    std::ref(stop_signal.as_sharded_abort_source()), std::ref(token_metadata), std::ref(feature_service), std::ref(db),
+                    [&ss] () -> bool { return ss.local().raft_topology_change_enabled(); }).get();
             auto stop_cdc_generation_service = defer_verbose_shutdown("CDC Generation Management service", [] {
                 cdc_generation_service.stop().get();
             });
+
+            utils::get_local_injector().inject("stop_after_starting_cdc_generation_service",
+                [] { std::raise(SIGSTOP); });
 
             auto get_cdc_metadata = [] (cdc::generation_service& svc) { return std::ref(svc.get_cdc_metadata()); };
 
@@ -1603,36 +1953,6 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
 
             supervisor::notify("starting storage service", true);
 
-            api::set_server_messaging_service(ctx, messaging).get();
-            auto stop_messaging_api = defer_verbose_shutdown("messaging service API", [&ctx] {
-                api::unset_server_messaging_service(ctx).get();
-            });
-            api::set_server_repair(ctx, repair).get();
-            auto stop_repair_api = defer_verbose_shutdown("repair API", [&ctx] {
-                api::unset_server_repair(ctx).get();
-            });
-
-            api::set_server_task_manager(ctx, task_manager, cfg).get();
-            auto stop_tm_api = defer_verbose_shutdown("task manager API", [&ctx] {
-                api::unset_server_task_manager(ctx).get();
-            });
-#ifndef SCYLLA_BUILD_MODE_RELEASE
-            api::set_server_task_manager_test(ctx, task_manager).get();
-            auto stop_tm_test_api = defer_verbose_shutdown("task manager API", [&ctx] {
-                api::unset_server_task_manager_test(ctx).get();
-            });
-#endif
-            supervisor::notify("starting sstables loader");
-            sst_loader.start(std::ref(db), std::ref(sys_dist_ks), std::ref(view_update_generator), std::ref(messaging)).get();
-            auto stop_sst_loader = defer_verbose_shutdown("sstables loader", [&sst_loader] {
-                sst_loader.stop().get();
-            });
-            api::set_server_sstables_loader(ctx, sst_loader).get();
-            auto stop_sstl_api = defer_verbose_shutdown("sstables loader API", [&ctx] {
-                api::unset_server_sstables_loader(ctx).get();
-            });
-
-
             gossiper.local().register_(ss.local().shared_from_this());
             auto stop_listening = defer_verbose_shutdown("storage service notifications", [&gossiper, &ss] {
                 gossiper.local().unregister_(ss.local().shared_from_this()).get();
@@ -1643,100 +1963,50 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 gossiper.local().unregister_(mm.local().shared_from_this()).get();
             });
 
-            sys_dist_ks.start(std::ref(qp), std::ref(mm), std::ref(proxy)).get();
-            auto stop_sdks = defer_verbose_shutdown("system distributed keyspace", [] {
-                sys_dist_ks.invoke_on_all(&db::system_distributed_keyspace::stop).get();
-            });
-
-            // Register storage_service to migration_notifier so we can update
-            // pending ranges when keyspace is changed
-            mm_notifier.local().register_listener(&ss.local());
-            auto stop_mm_listener = defer_verbose_shutdown("storage service notifications", [&mm_notifier, &ss] {
-                mm_notifier.local().unregister_listener(&ss.local()).get();
-            });
-
-            /*
-             * FIXME. In bb07678346 commit the API toggle for autocompaction was
-             * (partially) delayed until system prepared to join the ring. Probably
-             * it was an overkill and it can be enabled earlier, even as early as
-             * 'by default'. E.g. the per-table toggle was 'enabled' right after
-             * the system keyspace started and nobody seemed to have any troubles.
-             */
-            db.local().enable_autocompaction_toggle();
-
-            group0_service.start().get();
-            auto stop_group0_service = defer_verbose_shutdown("group 0 service", [&group0_service] {
-                group0_service.abort().get();
-            });
-
-            load_address_map(sys_ks.local(), raft_address_map.local()).get();
-
-            // Set up group0 service earlier since it is needed by group0 setup just below
-            ss.local().set_group0(group0_service, raft_topology_change_enabled);
-
-            // Need to make sure storage service does not use group0 before running group0_service.abort()
-            auto stop_group0_usage_in_storage_service = defer_verbose_shutdown("group 0 usage in local storage", [&ss] {
-                ss.local().wait_for_group0_stop().get();
-            });
-
-            // Setup group0 early in case the node is bootstrapped already and the group exists.
-            // Need to do it before allowing incoming messaging service connections since
-            // storage proxy's and migration manager's verbs may access group0.
-            // This will also disable migration manager schema pulls if needed.
-            group0_service.setup_group0_if_exist(sys_ks.local(), ss.local(), qp.local(), mm.local(), raft_topology_change_enabled).get();
-
-            with_scheduling_group(maintenance_scheduling_group, [&] {
-                return messaging.invoke_on_all(&netw::messaging_service::start_listen, std::ref(token_metadata));
-            }).get();
-
-            with_scheduling_group(maintenance_scheduling_group, [&] {
-                return ss.local().join_cluster(sys_dist_ks, proxy);
-            }).get();
-
-            sl_controller.invoke_on_all([&lifecycle_notifier] (qos::service_level_controller& controller) {
-                controller.set_distributed_data_accessor(::static_pointer_cast<qos::service_level_controller::service_level_distributed_data_accessor>(
-                        ::make_shared<qos::standard_service_level_distributed_data_accessor>(sys_dist_ks.local())));
-                lifecycle_notifier.local().register_subscriber(&controller);
-            }).get();
-
-            supervisor::notify("starting tracing");
-            tracing.invoke_on_all(&tracing::tracing::start, std::ref(qp), std::ref(mm)).get();
-            auto stop_tracing = defer_verbose_shutdown("tracing", [&tracing] {
-                tracing.invoke_on_all(&tracing::tracing::shutdown).get();
-            });
-
-            startlog.info("SSTable data integrity checker is {}.",
-                    cfg->enable_sstable_data_integrity_check() ? "enabled" : "disabled");
-
-
-            supervisor::notify("starting auth service");
             utils::loading_cache_config perm_cache_config;
             perm_cache_config.max_size = cfg->permissions_cache_max_entries();
             perm_cache_config.expiry = std::chrono::milliseconds(cfg->permissions_validity_in_ms());
             perm_cache_config.refresh = std::chrono::milliseconds(cfg->permissions_update_interval_in_ms());
 
-            const qualified_name qualified_authorizer_name(auth::meta::AUTH_PACKAGE_NAME, cfg->authorizer());
-            const qualified_name qualified_authenticator_name(auth::meta::AUTH_PACKAGE_NAME, cfg->authenticator());
-            const qualified_name qualified_role_manager_name(auth::meta::AUTH_PACKAGE_NAME, cfg->role_manager());
+            auto start_auth_service = [&mm] (sharded<auth::service>& auth_service, std::any& stop_auth_service, const char* what) {
+                supervisor::notify(fmt::format("starting {}", what));
+                auth_service.invoke_on_all(&auth::service::start, std::ref(mm), std::ref(sys_ks)).get();
 
-            auth::service_config auth_config;
-            auth_config.authorizer_java_name = qualified_authorizer_name;
-            auth_config.authenticator_java_name = qualified_authenticator_name;
-            auth_config.role_manager_java_name = qualified_role_manager_name;
+                stop_auth_service = defer_verbose_shutdown(what, [&auth_service] {
+                    auth_service.stop().get();
+                });
+            };
 
-            auth_service.start(std::move(perm_cache_config), std::ref(qp), std::ref(mm_notifier), std::ref(mm), auth_config).get();
+            auto start_cql = [] (cql_transport::controller& controller, std::any& stop_cql, const char* what) {
+                supervisor::notify(fmt::format("starting {}", what));
+                controller.start_server().get();
+                // FIXME -- this should be done via client hooks instead
+                stop_cql = defer_verbose_shutdown(what, [&controller] {
+                    controller.stop_server().get();
+                });
+            };
 
-            auth_service.invoke_on_all(&auth::service::start, std::ref(mm)).get();
-            auto stop_auth_service = defer_verbose_shutdown("auth service", [] {
-                auth_service.stop().get();
-            });
+            auth::service_config maintenance_auth_config;
+            maintenance_auth_config.authorizer_java_name = sstring{auth::allow_all_authorizer_name};
+            maintenance_auth_config.authenticator_java_name = sstring{auth::allow_all_authenticator_name};
+            maintenance_auth_config.role_manager_java_name = sstring{auth::maintenance_socket_role_manager_name};
 
-            api::set_server_authorization_cache(ctx, auth_service).get();
-            auto stop_authorization_cache_api = defer_verbose_shutdown("authorization cache api", [&ctx] {
-                api::unset_server_authorization_cache(ctx).get();
-            });
+            maintenance_auth_service.start(perm_cache_config, std::ref(qp), std::ref(group0_client),  std::ref(mm_notifier), std::ref(mm), maintenance_auth_config, maintenance_socket_enabled::yes).get();
 
-            snapshot_ctl.start(std::ref(db)).get();
+            cql_transport::controller cql_maintenance_server_ctl(maintenance_auth_service, mm_notifier, gossiper, qp, service_memory_limiter, sl_controller, lifecycle_notifier, *cfg, maintenance_cql_sg_stats_key, maintenance_socket_enabled::yes, dbcfg.statement_scheduling_group);
+
+            std::any stop_maintenance_auth_service;
+            std::any stop_maintenance_cql;
+
+            if (cfg->maintenance_socket() != "ignore") {
+                start_auth_service(maintenance_auth_service, stop_maintenance_auth_service, "maintenance auth service");
+                start_cql(cql_maintenance_server_ctl, stop_maintenance_cql, "maintenance native server");
+            }
+
+            db::snapshot_ctl::config snap_cfg = {
+                .backup_sched_group = dbcfg.streaming_scheduling_group,
+            };
+            snapshot_ctl.start(std::ref(db), std::ref(task_manager), std::ref(sstm), snap_cfg).get();
             auto stop_snapshot_ctl = defer_verbose_shutdown("snapshots", [&snapshot_ctl] {
                 snapshot_ctl.stop().get();
             });
@@ -1751,11 +2021,209 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 api::unset_server_tasks_compaction_module(ctx).get();
             });
 
+            api::set_server_cache(ctx).get();
+            auto stop_cache_api = defer_verbose_shutdown("cache API", [&ctx] {
+                api::unset_server_cache(ctx).get();
+            });
+
+            api::set_server_commitlog(ctx, db).get();
+            auto stop_commitlog_api = defer_verbose_shutdown("commitlog API", [&ctx] {
+                api::unset_server_commitlog(ctx).get();
+            });
+
+            if (cfg->maintenance_mode()) {
+                startlog.info("entering maintenance mode.");
+
+                ss.local().start_maintenance_mode().get();
+
+                seastar::set_abort_on_ebadf(cfg->abort_on_ebadf());
+                api::set_server_done(ctx).get();
+                {
+                    auto do_drain = defer_verbose_shutdown("local storage", [&ss] {
+                        // Flush all memtables and stop ongoing compactions
+                        ss.local().drain_on_shutdown().get();
+                    });
+
+                    startlog.info("Scylla version {} initialization completed (maintenance mode).", scylla_version());
+                    stop_signal.wait().get();
+                    startlog.info("Signal received; shutting down");
+                }
+                startlog.info("Scylla version {} shutdown complete.", scylla_version());
+                _exit(0);
+                return 0;
+            }
+
+            // Register storage_service to migration_notifier so we can update
+            // pending ranges when keyspace is changed
+            mm_notifier.local().register_listener(&ss.local());
+            auto stop_mm_listener = defer_verbose_shutdown("storage service notifications", [&mm_notifier, &ss] {
+                mm_notifier.local().unregister_listener(&ss.local()).get();
+            });
+
+            supervisor::notify("starting sstables loader");
+            sst_loader.start(std::ref(db), std::ref(messaging), std::ref(view_builder), std::ref(task_manager), std::ref(sstm), maintenance_scheduling_group).get();
+            auto stop_sst_loader = defer_verbose_shutdown("sstables loader", [&sst_loader] {
+                sst_loader.stop().get();
+            });
+            api::set_server_sstables_loader(ctx, sst_loader).get();
+            auto stop_sstl_api = defer_verbose_shutdown("sstables loader API", [&ctx] {
+                api::unset_server_sstables_loader(ctx).get();
+            });
+
+            /*
+             * FIXME. In bb07678346 commit the API toggle for autocompaction was
+             * (partially) delayed until system prepared to join the ring. Probably
+             * it was an overkill and it can be enabled earlier, even as early as
+             * 'by default'. E.g. the per-table toggle was 'enabled' right after
+             * the system keyspace started and nobody seemed to have any troubles.
+             */
+            db.local().enable_autocompaction_toggle();
+
+            group0_service.start().get();
+            auto stop_group0_service = defer_verbose_shutdown("group 0 service", [&group0_service] {
+                sl_controller.local().abort_group0_operations();
+                group0_service.abort().get();
+            });
+
+            utils::get_local_injector().inject("stop_after_starting_group0_service",
+                [] { std::raise(SIGSTOP); });
+
+            // Set up group0 service earlier since it is needed by group0 setup just below
+            ss.local().set_group0(group0_service);
+
+            // Load address_map from system.peers and subscribe to gossiper events to keep it updated.
+            ss.local().init_address_map(gossip_address_map.local()).get();
+            auto cancel_address_map_subscription = defer_verbose_shutdown("storage service uninit address map", [&ss] {
+                ss.local().uninit_address_map().get();
+            });
+
+            // Need to make sure storage service stopped using group0 before running group0_service.abort()
+            // Normally it is done in storage_service::do_drain(), but in case start up fail we need to do it
+            // here as well
+            auto stop_group0_usage_in_storage_service = defer_verbose_shutdown("group 0 usage in local storage", [&ss] {
+               ss.local().wait_for_group0_stop().get();
+            });
+
+            // Setup group0 early in case the node is bootstrapped already and the group exists.
+            // Need to do it before allowing incoming messaging service connections since
+            // storage proxy's and migration manager's verbs may access group0.
+            // This will also disable migration manager schema pulls if needed.
+            group0_service.setup_group0_if_exist(sys_ks.local(), ss.local(), qp.local(), mm.local()).get();
+
+            with_scheduling_group(maintenance_scheduling_group, [&] {
+                return messaging.invoke_on_all([&] (auto& ms) {
+                        return ms.start_listen(token_metadata.local(), [&gossiper] (gms::inet_address ip)  {
+                            if (ip == gossiper.local().get_broadcast_address()) {
+                                return gossiper.local().my_host_id();
+                            }
+                            try {
+                                return gossiper.local().get_host_id(ip);
+                            } catch (...) {
+                                return locator::host_id{};
+                            }
+                        });
+                    });
+            }).get();
+
+            const auto generation_number = gms::generation_type(sys_ks.local().increment_and_get_generation().get());
+
+            with_scheduling_group(maintenance_scheduling_group, [&] {
+                return ss.local().join_cluster(proxy, service::start_hint_manager::yes, generation_number);
+            }).get();
+
+            dictionary_service dict_service(
+                dict_sampler,
+                sys_ks.local(),
+                rpc_dict_training_worker,
+                group0_client,
+                group0_service,
+                stop_signal.as_local_abort_source(),
+                feature_service.local(),
+                dictionary_service::config{
+                    .our_host_id = host_id,
+                    .rpc_dict_training_min_time_seconds = cfg->rpc_dict_training_min_time_seconds,
+                    .rpc_dict_training_min_bytes = cfg->rpc_dict_training_min_bytes,
+                    .rpc_dict_training_when = cfg->rpc_dict_training_when,
+                }
+            );
+            auto stop_dict_service = defer_verbose_shutdown("dictionary training", [&] {
+                dict_service.stop().get();
+            });
+
+            supervisor::notify("starting tracing");
+            tracing.invoke_on_all(&tracing::tracing::start, std::ref(qp), std::ref(mm)).get();
+            auto stop_tracing = defer_verbose_shutdown("tracing", [&tracing] {
+                tracing.invoke_on_all(&tracing::tracing::shutdown).get();
+            });
+
+            startlog.info("SSTable data integrity checker is {}.",
+                    cfg->enable_sstable_data_integrity_check() ? "enabled" : "disabled");
+
+            // This implicitly depends on node joining the cluster (join_cluster())
+            // with raft leader elected as only then service level mutation is put
+            // into scylla_local table. Calling it here avoids starting new cluster with
+            // older version only to immediately migrate it to the latest in the background.
+            sl_controller.invoke_on_all([&qp, &group0_client] (qos::service_level_controller& controller) -> future<> {
+                return controller.reload_distributed_data_accessor(
+                        qp.local(), group0_client, sys_ks.local(), sys_dist_ks.local());
+            }).get();
+
+            sl_controller.local().maybe_start_legacy_update_from_distributed_data([cfg] () {
+                return std::chrono::duration_cast<steady_clock_type::duration>(std::chrono::milliseconds(cfg->service_levels_interval()));
+            }, ss.local(), group0_client);
+
+            // Initialize virtual table in system_distributed keyspace after joining the cluster, so
+            // that the keyspace is ready
+            view_builder.invoke_on_all([] (db::view::view_builder& vb) {
+                vb.init_virtual_table();
+            }).get();
+
+            const qualified_name qualified_authorizer_name(auth::meta::AUTH_PACKAGE_NAME, cfg->authorizer());
+            const qualified_name qualified_authenticator_name(auth::meta::AUTH_PACKAGE_NAME, cfg->authenticator());
+            const qualified_name qualified_role_manager_name(auth::meta::AUTH_PACKAGE_NAME, cfg->role_manager());
+
+            auth::service_config auth_config;
+            auth_config.authorizer_java_name = qualified_authorizer_name;
+            auth_config.authenticator_java_name = qualified_authenticator_name;
+            auth_config.role_manager_java_name = qualified_role_manager_name;
+
+            auth_service.start(std::move(perm_cache_config), std::ref(qp), std::ref(group0_client), std::ref(mm_notifier), std::ref(mm), auth_config, maintenance_socket_enabled::no).get();
+
+            std::any stop_auth_service;
+            // Has to be called after node joined the cluster (join_cluster())
+            // with raft leader elected as only then auth version mutation is put
+            // in scylla_local table. This allows to know the version at auth service
+            // startup also when creating a new cluster.
+            start_auth_service(auth_service, stop_auth_service, "auth service");
+
+            utils::get_local_injector().inject("stop_after_starting_auth_service",
+                [] { std::raise(SIGSTOP); });
+
+            api::set_server_authorization_cache(ctx, auth_service).get();
+            auto stop_authorization_cache_api = defer_verbose_shutdown("authorization cache api", [&ctx] {
+                api::unset_server_authorization_cache(ctx).get();
+            });
+
+            // update the service level cache after the SL data accessor and auth service are initialized.
+            if (sl_controller.local().is_v2()) {
+                sl_controller.local().update_cache(qos::update_both_cache_levels::yes).get();
+            }
+
+            sl_controller.invoke_on_all([&lifecycle_notifier] (qos::service_level_controller& controller) {
+                lifecycle_notifier.local().register_subscriber(&controller);
+            }).get();
+            auto unsubscribe_sl_controller = defer_verbose_shutdown("service level controller subscription", [&lifecycle_notifier] {
+                sl_controller.invoke_on_all([&lifecycle_notifier] (qos::service_level_controller& controller) {
+                    return lifecycle_notifier.local().unregister_subscriber(&controller);
+                }).get();
+            });
+
             supervisor::notify("starting batchlog manager");
             db::batchlog_manager_config bm_cfg;
             bm_cfg.write_request_timeout = cfg->write_request_timeout_in_ms() * 1ms;
             bm_cfg.replay_rate = cfg->batchlog_replay_throttle_in_kb() * 1000;
             bm_cfg.delay = std::chrono::milliseconds(cfg->ring_delay_ms());
+            bm_cfg.replay_cleanup_after_replays = cfg->batchlog_replay_cleanup_after_replays();
 
             bm.start(std::ref(qp), std::ref(sys_ks), bm_cfg).get();
             auto stop_batchlog_manager = defer_verbose_shutdown("batchlog manager", [&bm] {
@@ -1766,6 +2234,11 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             load_meter.init(db, gossiper.local()).get();
             auto stop_load_meter = defer_verbose_shutdown("load meter", [&load_meter] {
                 load_meter.exit().get();
+            });
+
+            api::set_load_meter(ctx, load_meter).get();
+            auto stop_load_meter_api = defer_verbose_shutdown("load meter API", [&ctx] {
+                api::unset_load_meter(ctx).get();
             });
 
             supervisor::notify("starting cf cache hit rate calculator");
@@ -1785,98 +2258,42 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 view_backlog_broker.stop().get();
             });
 
-            //FIXME: discarded future
-            (void)api::set_server_cache(ctx);
-            startlog.info("Waiting for gossip to settle before accepting client requests...");
-            gossiper.local().wait_for_gossip_to_settle().get();
-            api::set_server_gossip_settle(ctx, gossiper).get();
+            if (!ss.local().raft_topology_change_enabled()) {
+                startlog.info("Waiting for gossip to settle before accepting client requests...");
+                gossiper.local().wait_for_gossip_to_settle().get();
+            }
 
             supervisor::notify("allow replaying hints");
             proxy.invoke_on_all(&service::storage_proxy::allow_replaying_hints).get();
 
-            api::set_hinted_handoff(ctx, proxy).get();
+            api::set_hinted_handoff(ctx, proxy, gossiper).get();
             auto stop_hinted_handoff_api = defer_verbose_shutdown("hinted handoff API", [&ctx] {
                 api::unset_hinted_handoff(ctx).get();
             });
 
             if (cfg->view_building()) {
                 supervisor::notify("Launching generate_mv_updates for non system tables");
-                view_update_generator.invoke_on_all(&db::view::view_update_generator::start).get();
+                with_scheduling_group(maintenance_scheduling_group, [] {
+                    return view_update_generator.invoke_on_all(&db::view::view_update_generator::start);
+                }).get();
             }
 
-            static sharded<db::view::view_builder> view_builder;
             if (cfg->view_building()) {
-                supervisor::notify("starting the view builder");
-                view_builder.start(std::ref(db), std::ref(sys_ks), std::ref(sys_dist_ks), std::ref(mm_notifier), std::ref(view_update_generator)).get();
-                view_builder.invoke_on_all(&db::view::view_builder::start, std::ref(mm)).get();
+                view_builder.invoke_on_all(&db::view::view_builder::start, std::ref(mm), utils::cross_shard_barrier()).get();
             }
-            auto stop_view_builder = defer_verbose_shutdown("view builder", [cfg] {
-                if (cfg->view_building()) {
-                    view_builder.stop().get();
-                }
+            auto drain_view_builder = defer_verbose_shutdown("draining view builders", [&] {
+                view_builder.invoke_on_all(&db::view::view_builder::drain).get();
             });
 
-            api::set_server_view_builder(ctx, view_builder).get();
+            api::set_server_view_builder(ctx, view_builder, gossiper).get();
             auto stop_vb_api = defer_verbose_shutdown("view builder API", [&ctx] {
                 api::unset_server_view_builder(ctx).get();
             });
 
-            db.invoke_on_all(&replica::database::revert_initial_system_read_concurrency_boost).get();
-
-            notify_set.notify_all(configurable::system_state::started).get();
-
-            scheduling_group_key_config cql_sg_stats_cfg = make_scheduling_group_key_config<cql_transport::cql_sg_stats>();
-            cql_transport::controller cql_server_ctl(auth_service, mm_notifier, gossiper, qp, service_memory_limiter, sl_controller, lifecycle_notifier, *cfg, scheduling_group_key_create(cql_sg_stats_cfg).get0());
-
-            ss.local().register_protocol_server(cql_server_ctl);
-
-            std::any stop_cql;
-            if (cfg->start_native_transport()) {
-                supervisor::notify("starting native transport");
-                with_scheduling_group(dbcfg.statement_scheduling_group, [&cql_server_ctl] {
-                    return cql_server_ctl.start_server();
-                }).get();
-
-                // FIXME -- this should be done via client hooks instead
-                stop_cql = defer_verbose_shutdown("native transport", [&cql_server_ctl] {
-                    cql_server_ctl.stop_server().get();
-                });
-            }
-
-            api::set_transport_controller(ctx, cql_server_ctl).get();
-            auto stop_transport_controller = defer_verbose_shutdown("transport controller API", [&ctx] {
-                api::unset_transport_controller(ctx).get();
-            });
-
-            ::thrift_controller thrift_ctl(db, auth_service, qp, service_memory_limiter, ss, proxy);
-
-            ss.local().register_protocol_server(thrift_ctl);
-
-            std::any stop_rpc;
-            if (cfg->start_rpc()) {
-                with_scheduling_group(dbcfg.statement_scheduling_group, [&thrift_ctl] {
-                    return thrift_ctl.start_server();
-                }).get();
-
-                // FIXME -- this should be done via client hooks instead
-                stop_rpc = defer_verbose_shutdown("rpc server", [&thrift_ctl] {
-                    thrift_ctl.stop_server().get();
-                });
-            }
-
-            api::set_rpc_controller(ctx, thrift_ctl).get();
-            auto stop_rpc_controller = defer_verbose_shutdown("rpc controller API", [&ctx] {
-                api::unset_rpc_controller(ctx).get();
-            });
-
-            alternator::controller alternator_ctl(gossiper, proxy, mm, sys_dist_ks, cdc_generation_service, service_memory_limiter, auth_service, sl_controller, *cfg);
             sharded<alternator::expiration_service> es;
             std::any stop_expiration_service;
 
             if (cfg->alternator_port() || cfg->alternator_https_port()) {
-                with_scheduling_group(dbcfg.statement_scheduling_group, [&alternator_ctl] () mutable {
-                    return alternator_ctl.start_server();
-                }).get();
                 // Start the expiration service on all shards.
                 // Currently we only run it if Alternator is enabled, because
                 // only Alternator uses it for its TTL feature. But in the
@@ -1892,39 +2309,66 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                     return es.invoke_on_all(&alternator::expiration_service::start);
                 }).get();
             }
-            ss.local().register_protocol_server(alternator_ctl);
 
-            redis::controller redis_ctl(proxy, auth_service, mm, *cfg, gossiper);
-            if (cfg->redis_port() || cfg->redis_ssl_port()) {
-                with_scheduling_group(dbcfg.statement_scheduling_group, [&redis_ctl] {
-                    return redis_ctl.start_server();
-                }).get();
-            }
-            ss.local().register_protocol_server(redis_ctl);
-
+            db.invoke_on_all(&replica::database::revert_initial_system_read_concurrency_boost).get();
+            notify_set.notify_all(configurable::system_state::started).get();
             seastar::set_abort_on_ebadf(cfg->abort_on_ebadf());
             api::set_server_done(ctx).get();
-            supervisor::notify("serving");
-            // Register at_exit last, so that storage_service::drain_on_shutdown will be called first
 
-            auto drain_sl_controller = defer_verbose_shutdown("service level controller update loop", [&lifecycle_notifier] {
-                sl_controller.invoke_on_all([&lifecycle_notifier] (qos::service_level_controller& controller) {
-                    return lifecycle_notifier.local().unregister_subscriber(&controller);
-                }).get();
-                sl_controller.invoke_on_all(&qos::service_level_controller::drain).get();
+            audit::audit::start_audit(*cfg, qp, mm).get();
+            auto audit_stop = defer([] {
+                audit::audit::stop_audit().get();
             });
 
+            // Create controllers before drain_on_shutdown() below, so that it destructs
+            // after drain stops them in stop_transport()
+            // Register controllers after drain_on_shutdown() below, so that even on start
+            // failure drain is called and stops controllers
+            cql_transport::controller cql_server_ctl(auth_service, mm_notifier, gossiper, qp, service_memory_limiter, sl_controller, lifecycle_notifier, *cfg, cql_sg_stats_key, maintenance_socket_enabled::no, dbcfg.statement_scheduling_group);
+
+            api::set_server_service_levels(ctx, cql_server_ctl, qp).get();
+
+            alternator::controller alternator_ctl(gossiper, proxy, mm, sys_dist_ks, cdc_generation_service, service_memory_limiter, auth_service, sl_controller, *cfg, dbcfg.statement_scheduling_group);
+            redis::controller redis_ctl(proxy, auth_service, mm, *cfg, gossiper, dbcfg.statement_scheduling_group);
+
+            // Register at_exit last, so that storage_service::drain_on_shutdown will be called first
             auto do_drain = defer_verbose_shutdown("local storage", [&ss] {
                 ss.local().drain_on_shutdown().get();
             });
 
-            auto drain_view_builder = defer_verbose_shutdown("view builder ops", [cfg] {
-                if (cfg->view_building()) {
-                    view_builder.invoke_on_all(&db::view::view_builder::drain).get();
-                }
+            auth_service.local().ensure_superuser_is_created().get();
+            ss.local().register_protocol_server(cql_server_ctl, cfg->start_native_transport()).get();
+            api::set_transport_controller(ctx, cql_server_ctl).get();
+            auto stop_transport_controller = defer_verbose_shutdown("transport controller API", [&ctx] {
+                api::unset_transport_controller(ctx).get();
             });
 
+            api::set_thrift_controller(ctx).get();
+            auto stop_thrift_controller = defer_verbose_shutdown("thrift controller API", [&ctx] {
+                api::unset_thrift_controller(ctx).get();
+            });
+
+#ifndef SCYLLA_BUILD_MODE_RELEASE
+            api::set_server_cql_server_test(ctx, cql_server_ctl).get();
+            auto stop_cql_server_test_api = defer_verbose_shutdown("cql server API", [&ctx] {
+                api::unset_server_cql_server_test(ctx).get();
+            });
+#endif
+
+            if (bool enabled = cfg->alternator_port() || cfg->alternator_https_port()) {
+                ss.local().register_protocol_server(alternator_ctl, enabled).get();
+            }
+
+            if (bool enabled = cfg->redis_port() || cfg->redis_ssl_port()) {
+                ss.local().register_protocol_server(redis_ctl, enabled).get();
+            }
+
+            supervisor::notify("serving");
+
             startlog.info("Scylla version {} initialization completed.", scylla_version());
+            if (after_init_func) {
+                after_init_func(cfg);
+            }
             stop_signal.wait().get();
             startlog.info("Signal received; shutting down");
 	    // At this point, all objects destructors and all shutdown hooks registered with defer() are executed
@@ -1948,6 +2392,12 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             return 1;
           }
           startlog.info("Scylla version {} shutdown complete.", scylla_version());
+
+          // With -fprofile-generate, LLVM inserts an exit hook which saves the profile counters to disk.
+          // So does BOLT's instrumentation.
+          // But since we exit abruptly and skip those hooks, we have to trigger the dump manually.
+          dump_performance_profiles();
+
           // We should be returning 0 here, but the system is not yet prepared for orderly rollback of main() objects
           // and thread_local variables.
           _exit(0);
@@ -1983,11 +2433,14 @@ int main(int ac, char** av) {
         {"types", tools::scylla_types_main, "a command-line tool to examine values belonging to scylla types"},
         {"sstable", tools::scylla_sstable_main, "a multifunctional command-line tool to examine the content of sstables"},
         {"nodetool", tools::scylla_nodetool_main, "a command-line tool to administer local or remote ScyllaDB nodes"},
+        {"local-file-key-generator", tools::scylla_local_file_key_generator_main, "a command-line tool to generate encryption at rest keys"},
         {"perf-fast-forward", perf::scylla_fast_forward_main, "run performance tests by fast forwarding the reader on this server"},
         {"perf-row-cache-update", perf::scylla_row_cache_update_main, "run performance tests by updating row cache on this server"},
         {"perf-tablets", perf::scylla_tablets_main, "run performance tests of tablet metadata management"},
+        {"perf-load-balancing", perf::scylla_tablet_load_balancing_main, "run tablet load balancer tests"},
         {"perf-simple-query", perf::scylla_simple_query_main, "run performance tests by sending simple queries to this server"},
         {"perf-sstable", perf::scylla_sstable_main, "run performance tests by exercising sstable related operations on this server"},
+        {"perf-alternator", perf::alternator(scylla_main, &after_init_func), "run performance tests on full alternator stack"}
     };
 
     main_func_type main_func;
@@ -2036,6 +2489,21 @@ int main(int ac, char** av) {
             fmt::print("{} - {}\n", tool.name, tool.desc);
         }
         return 0;
+    }
+
+    // We have to override p11-kit config path before p11-kit initialization.
+    // And the initialization will invoke on seastar initialization, so it has to
+    // be before app.run()
+    // #3583 - need to potentially ensure this for tools as well, since at least
+    // sstable* might need crypto libraries.
+    auto scylla_path = fs::read_symlink(fs::path("/proc/self/exe")); // could just be argv[0] I guess...
+    auto p11_modules = scylla_path.parent_path().parent_path().append("share/p11-kit/modules");
+    // Note: must be in scope for application lifetime. p11_kit_override_system_files does _not_
+    // copy input strings.
+    auto p11_modules_str = p11_modules.string<char>();
+    // #3392 only do this if we are actually packaged and the path exists.
+    if (fs::exists(p11_modules)) {
+        ::p11_kit_override_system_files(NULL, NULL, p11_modules_str.c_str(), NULL, NULL);
     }
 
     return main_func(ac, av);

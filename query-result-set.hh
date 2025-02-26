@@ -3,13 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 
 #include <seastar/core/shared_ptr.hh>
+#include <fmt/ostream.h>
 #include "types/types.hh"
 #include "schema/schema.hh"
 
@@ -51,6 +52,12 @@ public:
         : _schema{schema}
         , _cells{std::move(cells)}
     { }
+    result_set_row(result_set_row&&) = default;
+    result_set_row(const result_set_row&) = delete;
+    result_set_row& operator=(const result_set_row&) = delete;
+    result_set_row copy() const {
+        return {_schema, std::unordered_map{_cells}};
+    }
     // Look up a deserialized row cell value by column name
     const data_value*
     get_data_value(const sstring& column_name) const {
@@ -129,3 +136,6 @@ inline bool operator==(const result_set& x, const result_set& y) {
 }
 
 }
+
+template <> struct fmt::formatter<query::result_set> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<query::result_set_row> : fmt::ostream_formatter {};
